@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+frontend/.env
+frontend/dist/
+frontend/node_modules/
+
+# Runtime queue and generated artifacts
+data/
+
+*.egg-info/
+dist/
+build/
+
+# Local config overrides (keep *.example tracked)
+config/acquisition.yaml
+config/processing.yaml
+config/calibrations/
+config/processing.local.json
+
+# Vendor GenTL producer — install from SICK SDK; see docs/acquisition.md
+vendor/
+
+# Un-ignore paths blocked by ~/.gitignore_global
+!.env.example
+!frontend/.env.example
+!frontend/package-lock.json
+!frontend/src/assets/
+!frontend/src/assets/*.png

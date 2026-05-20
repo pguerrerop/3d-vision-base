@@ -1,0 +1,33 @@
+# Contracts / validation
+pydantic>=2.0
+
+# Core
+numpy
+scipy
+
+# Image processing
+opencv-python
+pillow
+scikit-image
+
+# Point cloud / geometry
+open3d
+trimesh
+
+# GigE Vision / GenTL
+harvesters
+
+# Visualization
+matplotlib
+
+# Optional UI/API
+fastapi
+uvicorn
+
+# Utilities
+tqdm
+watchdog
+# filelock  # optional: cross-process state locking (future)
+
+# FTP support (if needed)
+pyftpdlib

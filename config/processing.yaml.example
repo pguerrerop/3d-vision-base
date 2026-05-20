@@ -1,0 +1,13 @@
+# Copy to processing.yaml and tune for your scene geometry.
+
+voxel_size: 1.0
+enable_outlier_removal: true
+outlier_nb_neighbors: 20
+outlier_std_ratio: 2.0
+calibration_crop_margin_mm: 20.0
+plane_distance_threshold: 1.5
+plane_ransac_n: 3
+plane_num_iterations: 1000
+dbscan_eps: 3.0
+dbscan_min_points: 30
+min_cluster_points: 100

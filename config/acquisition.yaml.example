@@ -1,0 +1,6 @@
+# Copy to acquisition.yaml and adjust paths for your environment.
+
+data_dir: data
+mode: offline_ply
+cti_path: vendor/sick/sdk_4_3/SICKGigEVisionTL.cti
+input_ply: samples/pointclouds/sample.ply

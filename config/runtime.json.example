@@ -1,0 +1,5 @@
+{
+  "default_calibration_file": null,
+  "require_calibration_for_demo": true,
+  "allow_auto_plane_without_calibration": true
+}
