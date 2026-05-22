@@ -2,6 +2,18 @@ import type { StageExecutionReport, TakeDetail } from "../api/client";
 import type { StudioArtifact } from "./studioWorkspaceModel";
 export function canonicalStageId(stageId: string, stageLabel?: string | null): string {
   const raw = `${stageId ?? ""} ${stageLabel ?? ""}`.toLowerCase();
+  if (raw.includes("normalize_heights_to_plane")) return "normalize_heights_to_plane";
+  if (raw.includes("detect_belt_plane")) return "detect_belt_plane";
+  if (raw.includes("remove_belt_segment_objects")) return "remove_belt_segment_objects";
+  if (raw.includes("loadheightmapcapture") || raw.includes("heightmap capture")) return "load_heightmap";
+  if (raw.includes("detectbeltplane") || raw.includes("estimatebeltplane") || raw.includes("belt plane")) return "detect_belt_plane";
+  if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized height")) return "normalize_heights_to_plane";
+  if (raw.includes("removebeltandsegmentobjects") || raw.includes("heightsegmentation")) return "remove_belt_segment_objects";
+  if (raw.includes("extractconnectedcomponents")) return "connected_components";
+  if (raw.includes("fitobjectgeometry")) return "fit_object_geometry";
+  if (raw.includes("computeheightmetrics")) return "compute_height_metrics";
+  if (raw.includes("classifyminingball25d")) return "classify_25d";
+  if (raw.includes("generate25doverlays")) return "overlays_25d";
   if (
     raw.includes("blob_detection")
     || raw.includes("blob/contour")
@@ -33,7 +45,7 @@ export type StageViewDefinition = {
   rendererType: StageViewRendererType;
 };
 
-export type StageSemanticCategory = "input" | "segmentation" | "geometry" | "measurement" | "classification" | "fusion";
+export type StageSemanticCategory = "input" | "plane_qa" | "segmentation" | "geometry" | "measurement" | "classification" | "fusion";
 
 export type StageSemanticDefinition = {
   stageId: string;
@@ -50,6 +62,11 @@ export type StageSemanticDefinition = {
 
 function stageKind(stageId: string): StageSemanticCategory {
   const id = canonicalStageId(stageId).toLowerCase();
+  if (id.includes("detect_belt_plane") || id.includes("normalize_heights_to_plane")) return "plane_qa";
+  if (id.includes("remove_belt_segment_objects") || id.includes("height_segmentation") || id.includes("connected_components")) return "segmentation";
+  if (id.includes("fit_object_geometry")) return "geometry";
+  if (id.includes("compute_height_metrics")) return "measurement";
+  if (id.includes("classify_25d") || id.includes("overlays_25d")) return "classification";
   if (id.includes("input") || id.includes("crop") || id.includes("gray") || id.includes("normalize")) return "input";
   if (id.includes("threshold") || id.includes("morph") || id.includes("segment")) return "segmentation";
   if (id.includes("blob") || id.includes("contour") || id.includes("ellipse") || id.includes("circle") || id.includes("detect")) return "geometry";
@@ -63,6 +80,11 @@ const VIEWS_BY_CATEGORY: Record<StageSemanticCategory, StageViewDefinition[]> = 
     { id: "image", label: "Image", rendererType: "image", priority: 1, emptyState: { title: "No source image available yet." } },
     { id: "metadata", label: "Metadata", rendererType: "table", priority: 2, emptyState: { title: "No source metadata available." } },
     { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 3, emptyState: { title: "No image histogram available yet." } },
+    { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+  ],
+  plane_qa: [
+    { id: "image", label: "Image", rendererType: "image", priority: 1, emptyState: { title: "No 25D QA image available yet." } },
+    { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 2, emptyState: { title: "No normalized-height histogram available yet." } },
     { id: "json", label: "JSON", rendererType: "json", priority: 99 },
   ],
   segmentation: [
@@ -86,10 +108,11 @@ const VIEWS_BY_CATEGORY: Record<StageSemanticCategory, StageViewDefinition[]> = 
     { id: "json", label: "JSON", rendererType: "json", priority: 99 },
   ],
   classification: [
-    { id: "classification", label: "Classification", rendererType: "table", priority: 1, emptyState: { title: "No classification summary available yet." } },
-    { id: "summary", label: "Summary", rendererType: "metrics", priority: 2 },
-    { id: "rejected", label: "Rejected objects", rendererType: "table", priority: 3 },
-    { id: "export", label: "Export", rendererType: "table", priority: 4 },
+    { id: "overlay", label: "Overlay", rendererType: "overlay", priority: 1, emptyState: { title: "No classification overlay available yet." } },
+    { id: "classification", label: "Classification", rendererType: "table", priority: 2, emptyState: { title: "No classification summary available yet." } },
+    { id: "summary", label: "Summary", rendererType: "metrics", priority: 3 },
+    { id: "rejected", label: "Rejected objects", rendererType: "table", priority: 4 },
+    { id: "export", label: "Export", rendererType: "table", priority: 5 },
     { id: "json", label: "Result JSON", rendererType: "json", priority: 99 },
   ],
   fusion: [
@@ -100,6 +123,96 @@ const VIEWS_BY_CATEGORY: Record<StageSemanticCategory, StageViewDefinition[]> = 
 
 export function stageSemanticDefinition(stageId: string): StageSemanticDefinition {
   const canonical = canonicalStageId(stageId || "");
+  if (canonical === "load_heightmap") {
+    return {
+      stageId: canonical,
+      category: "input",
+      defaultViewId: "height_preview",
+      views: [
+        { id: "height_preview", label: "Height preview", rendererType: "image", priority: 1, emptyState: { title: "No height preview available yet." } },
+        { id: "heightmap", label: "Heightmap (raw)", rendererType: "image", priority: 2, emptyState: { title: "No heightmap preview available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "normalize_heights_to_plane" || canonical === "normalized_height") {
+    return {
+      stageId: canonical,
+      category: "plane_qa",
+      defaultViewId: "normalized_height",
+      views: [
+        { id: "normalized_height", label: "Normalized height", rendererType: "image", priority: 1, emptyState: { title: "No normalized height preview available yet." } },
+        { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 2, emptyState: { title: "No normalized-height histogram available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "detect_belt_plane" || canonical === "belt_plane") {
+    return {
+      stageId: canonical,
+      category: "plane_qa",
+      defaultViewId: "selected_surface",
+      views: [
+        { id: "raw_heightmap", label: "Raw heightmap", rendererType: "image", priority: 1, emptyState: { title: "No raw heightmap preview available yet." } },
+        { id: "depth_gradient", label: "Depth gradient", rendererType: "image", priority: 2, emptyState: { title: "No depth gradient preview available yet." } },
+        { id: "low_gradient_mask", label: "Low-gradient mask", rendererType: "image", priority: 3, emptyState: { title: "No low-gradient mask available yet." } },
+        { id: "surface_candidates", label: "Surface candidates", rendererType: "json", priority: 4, emptyState: { title: "No reference-surface candidates available yet." } },
+        { id: "selected_surface", label: "Selected surface", rendererType: "image", priority: 5, emptyState: { title: "No selected surface mask available yet." } },
+        { id: "valid_mask", label: "Valid mask", rendererType: "image", priority: 6, emptyState: { title: "No valid mask available yet." } },
+        { id: "plane_inliers", label: "Plane inliers", rendererType: "image", priority: 7, emptyState: { title: "No plane inlier mask available yet." } },
+        { id: "residual_heatmap", label: "Residual heatmap", rendererType: "image", priority: 8, emptyState: { title: "No residual heatmap available yet." } },
+        { id: "depth_plot", label: "Depth plot", rendererType: "image", priority: 9, emptyState: { title: "No depth plot available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "remove_belt_segment_objects" || canonical === "height_segmentation" || canonical === "connected_components") {
+    return {
+      stageId: canonical,
+      category: "segmentation",
+      defaultViewId: "overlay",
+      views: [
+        { id: "threshold_mask", label: "Threshold mask", rendererType: "image", priority: 1, emptyState: { title: "No threshold mask generated yet." } },
+        { id: "cleaned_mask", label: "Cleaned mask", rendererType: "image", priority: 2, emptyState: { title: "No cleaned object mask generated yet." } },
+        { id: "segmentation", label: "Connected components", rendererType: "table", priority: 3, emptyState: { title: "No connected components found yet." } },
+        { id: "overlay", label: "Overlay", rendererType: "overlay", priority: 4, emptyState: { title: "No segmentation overlay available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "fit_object_geometry" || canonical === "compute_height_metrics") {
+    return {
+      stageId: canonical,
+      category: "measurement",
+      defaultViewId: "measurements_25d",
+      views: [
+        { id: "measurements_25d", label: "Measurements", rendererType: "table", priority: 1, emptyState: { title: "No 25D measurements available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "classify_25d") {
+    return {
+      stageId: canonical,
+      category: "classification",
+      defaultViewId: "classification_25d",
+      views: [
+        { id: "classification_25d", label: "Classification", rendererType: "table", priority: 1, emptyState: { title: "No 25D classifications available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "overlays_25d") {
+    return {
+      stageId: canonical,
+      category: "classification",
+      defaultViewId: "overlays_25d",
+      views: [
+        { id: "overlays_25d", label: "Overlays", rendererType: "overlay", priority: 1, emptyState: { title: "No 25D overlays available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
   if (canonical === "ellipse_fitting") {
     return {
       stageId: canonical,
@@ -131,6 +244,31 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
 
 export function stageSemanticSummary(stageId: string, detail: TakeDetail | null, artifacts: StudioArtifact[], execStage: StageExecutionReport | null | undefined): string {
   const category = stageKind(canonicalStageId(stageId || ""));
+  const canonical = canonicalStageId(stageId || "");
+  if (canonical === "detect_belt_plane" || canonical === "belt_plane") {
+    const debug = artifacts.find((item) => item.artifact_id === "plane_fit_debug");
+    const meta = (debug?.metadata ?? {}) as Record<string, unknown>;
+    const status = String(meta.status ?? "unknown");
+    const inlier = Number(meta.inlier_ratio ?? 0) * 100.0;
+    const p95 = Number(meta.residual_p95_mm ?? 0);
+    const sel = (meta.background_selection as Record<string, unknown> | undefined) ?? {};
+    const seedCov = Number(sel.seed_coverage_percent ?? sel.candidate_coverage_percent ?? 0);
+    const expCov = Number(sel.expanded_plane_coverage_percent ?? 0);
+    return `${status} • seed ${seedCov.toFixed(1)}% • expanded ${expCov.toFixed(1)}% • residual p95 ${p95.toFixed(1)} mm`;
+  }
+  if (canonical === "normalize_heights_to_plane" || canonical === "normalized_height") {
+    const debug = artifacts.find((item) => item.artifact_id === "normalization_debug" || item.artifact_id === "normalized_height_debug");
+    const meta = (debug?.metadata ?? {}) as Record<string, unknown>;
+    const bg = Number(meta.background_height_p95_abs_after_normalization_mm ?? 0);
+    return `background p95 abs ${bg.toFixed(1)} mm`;
+  }
+  if (canonical === "remove_belt_segment_objects") {
+    const debug = artifacts.find((item) => item.artifact_id === "segmentation_debug");
+    const meta = (debug?.metadata ?? {}) as Record<string, unknown>;
+    const cc = Number(meta.connected_component_count ?? 0);
+    const fg = Number(meta.foreground_coverage_percent ?? 0);
+    return `${cc} component${cc === 1 ? "" : "s"} • foreground ${fg.toFixed(1)}%`;
+  }
   const objects = detail?.result?.objects ?? [];
   const rejected = detail?.result?.rejected_objects ?? [];
   if (category === "segmentation") {

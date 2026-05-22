@@ -61,6 +61,12 @@ def test_take_detail_exposes_process_run_artifacts(tmp_path: Path) -> None:
     assert by_id["threshold_mask"]["stage_id"] == "segmentation"
     assert by_id["cleaned_mask"]["stage_id"] == "segmentation"
     assert by_id["overlay_image"]["stage_id"] == "segmentation"
+    object_candidates = detail.result.get("object_candidates")
+    assert isinstance(object_candidates, list)
+    assert len(object_candidates) >= 1
+    first_candidate = object_candidates[0]
+    assert first_candidate.get("source_modality") == "rgb"
+    assert "geometry" in first_candidate
 
 
 def test_safe_take_file_allows_process_run_nested_paths(tmp_path: Path) -> None:
@@ -87,4 +93,3 @@ def test_safe_take_file_allows_process_run_nested_paths(tmp_path: Path) -> None:
     resolved = safe_take_file(settings, take_id, path)
     assert resolved is not None
     assert resolved.is_file()
-

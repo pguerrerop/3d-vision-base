@@ -32,12 +32,18 @@ def main() -> int:
         type=Path,
         help="Data root (incoming/, processed/, state/)",
     )
+    parser.add_argument(
+        "--acquisition-group-id",
+        default=None,
+        type=str,
+        help="Optional acquisition group id to associate this take with.",
+    )
     args = parser.parse_args()
 
     try:
         publisher = AcquisitionPublisher(args.data_dir)
         acquisition = OfflinePlyAcquisition(publisher)
-        take_id, folder = acquisition.acquire(args.ply)
+        take_id, folder = acquisition.acquire(args.ply, acquisition_group_id=args.acquisition_group_id)
     except (FileNotFoundError, ValueError, FileExistsError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

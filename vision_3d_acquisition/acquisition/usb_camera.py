@@ -55,6 +55,56 @@ class UsbFrameCapture:
     timestamp: str
 
 
+CONTROL_PROP_MAP: dict[str, str] = {
+    "exposure": "CAP_PROP_EXPOSURE",
+    "focus": "CAP_PROP_FOCUS",
+    "gain": "CAP_PROP_GAIN",
+    "brightness": "CAP_PROP_BRIGHTNESS",
+    "contrast": "CAP_PROP_CONTRAST",
+    "sharpness": "CAP_PROP_SHARPNESS",
+    "saturation": "CAP_PROP_SATURATION",
+    "white_balance": "CAP_PROP_WHITE_BALANCE_BLUE_U",
+}
+
+CONTROL_AUTO_PROP_MAP: dict[str, str] = {
+    "exposure": "CAP_PROP_AUTO_EXPOSURE",
+    "focus": "CAP_PROP_AUTOFOCUS",
+}
+
+CONTROL_DEFAULT_RANGES: dict[str, tuple[float, float]] = {
+    "exposure": (-13.0, 0.0),
+    "focus": (0.0, 255.0),
+    "gain": (0.0, 255.0),
+    "brightness": (0.0, 255.0),
+    "contrast": (0.0, 255.0),
+    "sharpness": (0.0, 255.0),
+    "saturation": (0.0, 255.0),
+    "white_balance": (2000.0, 9000.0),
+}
+
+CONTROL_DEFAULT_STEPS: dict[str, float] = {
+    "exposure": 0.1,
+    "focus": 1.0,
+    "gain": 1.0,
+    "brightness": 1.0,
+    "contrast": 1.0,
+    "sharpness": 1.0,
+    "saturation": 1.0,
+    "white_balance": 100.0,
+}
+
+CONTROL_UNITS: dict[str, str | None] = {
+    "exposure": "ev",
+    "focus": "level",
+    "gain": "level",
+    "brightness": "level",
+    "contrast": "level",
+    "sharpness": "level",
+    "saturation": "level",
+    "white_balance": "kelvin",
+}
+
+
 def discover_cameras(max_index: int = 8, cv2_module: Any | None = None) -> list[CameraInfo]:
     cv2 = _cv2(cv2_module)
     cameras: list[CameraInfo] = []
@@ -105,6 +155,7 @@ def capture_image(
     preview_window: bool = False,
     preview_interval_ms: int = 250,
     output_name: str | None = None,
+    acquisition_group_id: str | None = None,
     cv2_module: Any | None = None,
 ) -> tuple[str, Path]:
     cv2 = _cv2(cv2_module)
@@ -139,6 +190,7 @@ def capture_image(
                 frame_count=1,
                 modalities=["rgb"],  # type: ignore[arg-type]
                 session_id=session_id,
+                acquisition_group_id=acquisition_group_id,
                 frameset=FrameSet(
                     frameset_id=f"{take_id}_fs0",
                     timestamp=created_at,
@@ -173,6 +225,7 @@ def capture_image(
                 cap=cap,
                 created_at=created_at,
                 session_id=session_id,
+                acquisition_group_id=acquisition_group_id,
                 frame_count=1,
                 files=FileReferences(rgb="rgb.png"),
                 modalities=["rgb"],
@@ -227,6 +280,7 @@ def record_video(
     preview_window: bool = False,
     preview_interval_ms: int = 250,
     output_name: str | None = None,
+    acquisition_group_id: str | None = None,
     cv2_module: Any | None = None,
 ) -> tuple[str, Path]:
     cv2 = _cv2(cv2_module)
@@ -271,6 +325,7 @@ def record_video(
                 cap=cap,
                 created_at=created_at,
                 session_id=session_id,
+                acquisition_group_id=acquisition_group_id,
                 frame_count=max(frame_count, 1),
                 files=FileReferences(rgb="preview.png", rgb_video=video_path.name),
                 modalities=["rgb", "rgb_video"],
@@ -446,6 +501,7 @@ def _metadata(
     cap: Any,
     created_at: str,
     session_id: str | None,
+    acquisition_group_id: str | None,
     frame_count: int,
     files: FileReferences,
     modalities: list[str],
@@ -471,6 +527,7 @@ def _metadata(
         frame_count=frame_count,
         modalities=modalities,  # type: ignore[arg-type]
         session_id=session_id,
+        acquisition_group_id=acquisition_group_id,
         frameset=FrameSet(
             frameset_id=f"{take_id}_fs0",
             timestamp=created_at,
@@ -524,3 +581,141 @@ def _frame_resolution(frame: Any) -> tuple[int | None, int | None]:
         return None, None
     height, width = frame.shape[:2]
     return int(width), int(height)
+
+
+def camera_controls_snapshot(camera_index: int, cv2_module: Any | None = None) -> dict[str, Any]:
+    cv2 = _cv2(cv2_module)
+    cap = cv2.VideoCapture(camera_index)
+    if not cap or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        raise RuntimeError(f"Camera index {camera_index} is unavailable.")
+    try:
+        backend = _backend_name(cap)
+        controls: dict[str, Any] = {}
+        raw_get: dict[str, Any] = {}
+        unsupported: list[str] = []
+        for name, prop_name in CONTROL_PROP_MAP.items():
+            prop_id = getattr(cv2, prop_name, None)
+            auto_prop_name = CONTROL_AUTO_PROP_MAP.get(name)
+            auto_prop_id = getattr(cv2, auto_prop_name, None) if auto_prop_name else None
+            min_v, max_v = _range_for_control(name, backend)
+            step = CONTROL_DEFAULT_STEPS.get(name, 1.0)
+            entry = {
+                "supported": False,
+                "readable": False,
+                "writable": False,
+                "value": None,
+                "min": min_v,
+                "max": max_v,
+                "step": step,
+                "default": min_v,
+                "unit": CONTROL_UNITS.get(name),
+                "auto_supported": auto_prop_id is not None,
+                "auto_value": None,
+                "backend_property": prop_name,
+                "range_source": "default_profile",
+            }
+            if prop_id is None:
+                entry["warning"] = "property_not_exposed_by_opencv"
+                unsupported.append(name)
+                controls[name] = entry
+                continue
+            try:
+                value = float(cap.get(prop_id))
+                raw_get[name] = value
+                supported = not (value != value) and value not in (-1e9, 1e9)
+                entry["supported"] = bool(supported)
+                entry["readable"] = bool(supported)
+                entry["writable"] = bool(supported)
+                entry["value"] = value if supported else None
+            except Exception:
+                entry["warning"] = "read_failed"
+                unsupported.append(name)
+                controls[name] = entry
+                continue
+            if auto_prop_id is not None:
+                try:
+                    auto_raw = float(cap.get(auto_prop_id))
+                    entry["auto_value"] = auto_raw >= 1.0 or abs(auto_raw - 0.75) < 1e-3
+                    raw_get[f"{name}_auto"] = auto_raw
+                except Exception:
+                    entry["auto_value"] = None
+                    entry["warning"] = "auto_read_failed"
+            controls[name] = entry
+        return {
+            "camera_index": camera_index,
+            "backend": backend,
+            "controls": controls,
+            "diagnostics": {
+                "raw_get": raw_get,
+                "unsupported_properties": unsupported,
+                "last_apply_errors": [],
+            },
+        }
+    finally:
+        cap.release()
+
+
+def apply_camera_controls(camera_index: int, updates: dict[str, Any], cv2_module: Any | None = None) -> dict[str, Any]:
+    cv2 = _cv2(cv2_module)
+    cap = cv2.VideoCapture(camera_index)
+    if not cap or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        raise RuntimeError(f"Camera index {camera_index} is unavailable.")
+    try:
+        applied: dict[str, Any] = {}
+        errors: list[str] = []
+        for name, payload in updates.items():
+            if name not in CONTROL_PROP_MAP:
+                applied[name] = {"requested": payload, "applied": False, "warnings": ["unsupported_property"]}
+                continue
+            if not isinstance(payload, dict):
+                applied[name] = {"requested": payload, "applied": False, "warnings": ["invalid_payload"]}
+                continue
+            prop_id = getattr(cv2, CONTROL_PROP_MAP[name], None)
+            auto_prop_name = CONTROL_AUTO_PROP_MAP.get(name)
+            auto_prop_id = getattr(cv2, auto_prop_name, None) if auto_prop_name else None
+            item_result = {"requested": payload, "applied": False, "warnings": []}
+            if prop_id is None:
+                item_result["warnings"].append("unsupported_property")
+                errors.append(f"{name}:unsupported_property")
+                applied[name] = item_result
+                continue
+            if "auto" in payload and auto_prop_id is not None:
+                try:
+                    auto_value = payload.get("auto")
+                    if auto_value is not None:
+                        # AVFoundation/others can use 0/1; some use 0.25/0.75 semantics.
+                        cap.set(auto_prop_id, 1.0 if bool(auto_value) else 0.0)
+                except Exception:
+                    item_result["warnings"].append("auto_apply_failed")
+                    errors.append(f"{name}:auto_apply_failed")
+            if "value" in payload and payload.get("value") is not None:
+                try:
+                    ok = bool(cap.set(prop_id, float(payload["value"])))
+                    item_result["applied"] = ok
+                    if not ok:
+                        item_result["warnings"].append("set_returned_false")
+                        errors.append(f"{name}:set_returned_false")
+                except Exception:
+                    item_result["warnings"].append("value_apply_failed")
+                    errors.append(f"{name}:value_apply_failed")
+            applied[name] = item_result
+        snapshot = camera_controls_snapshot(camera_index, cv2_module=cv2)
+        snapshot["applied"] = applied
+        diagnostics = snapshot.get("diagnostics") if isinstance(snapshot.get("diagnostics"), dict) else {}
+        diagnostics["last_apply_errors"] = errors
+        snapshot["diagnostics"] = diagnostics
+        return snapshot
+    finally:
+        cap.release()
+
+
+def _range_for_control(name: str, backend: str | None) -> tuple[float | None, float | None]:
+    if name == "exposure":
+        if (backend or "").upper() == "AVFOUNDATION":
+            return (-13.0, 0.0)
+        return (-20.0, 20.0)
+    return CONTROL_DEFAULT_RANGES.get(name, (None, None))

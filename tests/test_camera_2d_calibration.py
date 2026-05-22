@@ -73,3 +73,12 @@ def test_charuco_generation_and_exports(tmp_path: Path) -> None:
     pdf = save_charuco_pdf(tmp_path / "charuco.pdf", board)
     assert png.is_file()
     assert pdf.is_file()
+
+
+def test_target_dictionary_and_dimensions_validation() -> None:
+    cfg = Camera2DTargetConfig(dictionary="DICT_6X6_250", square_length_mm=30.0, marker_length_mm=20.0)
+    assert cfg.dictionary == "DICT_6X6_250"
+    with pytest.raises(ValueError):
+        Camera2DTargetConfig(dictionary="DICT_7X7_50")
+    with pytest.raises(ValueError):
+        Camera2DTargetConfig(square_length_mm=20.0, marker_length_mm=20.0)

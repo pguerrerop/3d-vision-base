@@ -93,9 +93,35 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, runArtifacts);
     const artifacts = context.resolvedArtifacts.filter((artifact) => {
       if (artifact.kind !== "image") return false;
+      if (props.view.id === "height_preview") {
+        return artifact.artifact_id === "source_heightmap_preview"
+          || /heightmap_preview/i.test(String(artifact.path ?? ""))
+          || artifact.artifact_id === "heightmap"
+          || artifact.artifact_id === "input_preview";
+      }
+      if (props.view.id === "heightmap" || props.view.id === "raw_heightmap") return artifact.artifact_id === "heightmap" || artifact.artifact_id === "input_preview" || artifact.artifact_id === "raw_heightmap_preview";
+      if (props.view.id === "depth_gradient") return artifact.artifact_id === "depth_gradient_magnitude" || /depth_gradient_magnitude/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "low_gradient_mask") return artifact.artifact_id === "low_gradient_mask" || /low_gradient_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "selected_surface") return artifact.artifact_id === "reference_surface_selected_mask" || artifact.artifact_id === "expanded_plane_mask" || /reference_surface_selected_mask|expanded_plane_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "normalized_height") return artifact.artifact_id === "normalized_heightmap" || /normalized_heightmap/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "valid_mask") return artifact.artifact_id === "valid_mask" || /valid_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "background_candidates" || props.view.id === "background_seeds") return artifact.artifact_id === "background_seed_mask" || artifact.artifact_id === "background_candidate_mask" || /background_(seed|candidate)_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "expanded_plane") return artifact.artifact_id === "expanded_plane_mask" || /expanded_plane_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "depth_plot") return artifact.artifact_id === "background_depth_plot" || /background_depth_plot/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "plane_inliers") return artifact.artifact_id === "final_plane_inlier_mask" || artifact.artifact_id === "plane_inlier_mask" || /final_plane_inlier_mask|plane_inlier_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "residual_heatmap" || props.view.id === "belt_plane") {
+        return artifact.artifact_id === "raw_heightmap_preview"
+          || artifact.artifact_id === "valid_mask"
+          || artifact.artifact_id === "plane_fit_roi_mask"
+          || artifact.artifact_id === "plane_inlier_mask"
+          || artifact.artifact_id === "belt_plane_residuals"
+          || artifact.artifact_id === "belt_plane_overlay"
+          || /belt_plane_(residuals|overlay)/i.test(String(artifact.path ?? ""))
+          || /raw_heightmap_preview|valid_mask|plane_fit_roi_mask|plane_inlier_mask/i.test(String(artifact.path ?? ""));
+      }
       if (semantic.category !== "segmentation") return true;
-      if (props.view.id === "threshold_mask") return artifact.artifact_id === "threshold_mask";
-      if (props.view.id === "cleaned_mask") return artifact.artifact_id === "cleaned_mask";
+      if (props.view.id === "threshold_mask") return artifact.artifact_id === "foreground_before_plane_suppression" || artifact.artifact_id === "normalized_height_threshold_mask" || artifact.artifact_id === "threshold_mask";
+      if (props.view.id === "cleaned_mask") return artifact.artifact_id === "final_object_mask" || artifact.artifact_id === "plane_suppressed_mask" || artifact.artifact_id === "cleaned_object_mask" || artifact.artifact_id === "cleaned_mask";
       return true;
     });
     if (semantic.category === "geometry" && props.view.id === "labels") {
@@ -123,6 +149,26 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     const runArtifacts = artifactsForStage(props.detail, props.stageId);
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, runArtifacts);
     let artifacts = context.resolvedArtifacts.filter((artifact) => artifact.kind === "overlay" || artifact.kind === "image");
+    if (semantic.category === "segmentation" && props.view.id === "overlay") {
+      artifacts = artifacts.filter((artifact) =>
+        artifact.artifact_id === "connected_components_overlay"
+        || artifact.artifact_id === "height_segmentation_overlay"
+        || artifact.artifact_id === "height_segmentation"
+        || /connected_components_overlay/i.test(String(artifact.path ?? ""))
+        || /height_segmentation_overlay/i.test(String(artifact.path ?? ""))
+        || /segmentation_overlay/i.test(String(artifact.path ?? ""))
+      );
+    }
+    if (props.view.id === "overlays_25d") {
+      artifacts = artifacts.filter((artifact) =>
+        artifact.artifact_id === "height_overlay"
+        || artifact.artifact_id === "measurement_overlay"
+        || artifact.artifact_id === "classification_overlay"
+        || artifact.artifact_id === "height_segmentation"
+        || /overlay/i.test(String(artifact.artifact_id ?? ""))
+        || /overlay/i.test(String(artifact.path ?? ""))
+      );
+    }
     if (semantic.category === "geometry" && props.view.id === "candidate_overlay") {
       const normalized = normalizeBlobDetectionArtifacts(context.runArtifacts);
       const source = context.resolvedArtifacts.find((item) => item.artifact_id === "source_rgb_image" && item.path)
@@ -156,12 +202,38 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         || artifact.kind === "overlay"
       );
     }
+    if (semantic.category === "classification" && props.view.id === "overlay") {
+      const overlayImage = context.runArtifacts.find((artifact) => artifact.artifact_id === "classification_overlay_image");
+      const overlayMetaArtifact = context.runArtifacts.find((artifact) => artifact.artifact_id === "classification_overlay_metadata");
+      const overlayMeta = (overlayMetaArtifact?.metadata ?? {}) as Record<string, unknown>;
+      const overlayObjects = Array.isArray(overlayMeta.objects) ? overlayMeta.objects as Array<Record<string, unknown>> : [];
+      if (overlayImage?.path && overlayObjects.length) {
+        return (
+          <ClassificationOverlayWorkspace
+            src={fileUrl(props.detail!.take_id, overlayImage.path)}
+            objects={overlayObjects}
+            selectedObjectId={props.selectedObjectId}
+            hoveredObjectId={props.hoveredObjectId}
+            onSelectObject={props.onSelectObject}
+            onHoverObject={props.onHoverObject}
+          />
+        );
+      }
+      artifacts = artifacts.filter((artifact) =>
+        artifact.artifact_id === "classification_overlay_image"
+        || artifact.artifact_id === "classification_overlay_metadata"
+        || artifact.artifact_id === "classification_result"
+        || artifact.artifact_id === "classification_result_artifact"
+        || artifact.artifact_id === "source_rgb_image"
+        || artifact.kind === "overlay"
+      );
+    }
     return explore(artifacts, props);
   },
   table: (props) => {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
     const semantic = stageSemanticDefinition(props.stageId);
-    if (semantic.category === "input" && props.view.id === "metadata") {
+    if ((semantic.category === "input" || semantic.category === "plane_qa") && props.view.id === "metadata") {
       return <pre className="json-block">{JSON.stringify({ modalities: props.detail.modalities, created_at: props.detail.created_at, metadata: props.detail.metadata, frameset: props.detail.frameset, assets: props.detail.assets }, null, 2)}</pre>;
     }
     if (semantic.category === "segmentation" && props.view.id === "params") {
@@ -212,6 +284,30 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         },
       };
       return <pre className="json-block">{JSON.stringify(payload, null, 2)}</pre>;
+    }
+    if ((semantic.category === "input" || semantic.category === "plane_qa") && props.view.id === "json") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const planeDebug = stageArtifacts.find((item) => item.artifact_id === "plane_fit_debug");
+      const normHist = stageArtifacts.find((item) => item.artifact_id === "normalized_height_histogram");
+      const normDebug = stageArtifacts.find((item) => item.artifact_id === "normalization_debug" || item.artifact_id === "normalized_height_debug");
+      const bgHist = stageArtifacts.find((item) => item.artifact_id === "background_depth_histogram");
+      const bgDebug = stageArtifacts.find((item) => item.artifact_id === "background_selection_debug");
+      return (
+        <pre className="json-block">
+          {JSON.stringify(
+            {
+              plane_fit_debug: planeDebug?.metadata ?? null,
+              background_depth_histogram: bgHist?.metadata ?? null,
+              background_selection_debug: bgDebug?.metadata ?? null,
+              normalized_height_histogram: normHist?.metadata ?? null,
+              normalization_debug: normDebug?.metadata ?? null,
+              result_summary: props.detail.result?.summary ?? null,
+            },
+            null,
+            2
+          )}
+        </pre>
+      );
     }
     if (semantic.category === "geometry" && (props.view.id === "blob_metrics" || props.view.id === "candidates_table")) {
       const stageArtifacts = artifactsForStage(props.detail, props.stageId);
@@ -445,10 +541,29 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       return <pre className="json-block">{JSON.stringify(rows, null, 2)}</pre>;
     }
     const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
+    const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+    const classificationArtifact = firstArtifactByAlias(stageArtifacts, ["classification_result", "classification_result_artifact"]);
+    const classificationMeta = (classificationArtifact?.metadata ?? {}) as Record<string, unknown>;
+    const byClass = {
+      "Bola buena": objects.filter((item) => item.class_name === "Bola buena"),
+      "Scrap de Bola": objects.filter((item) => item.class_name === "Scrap de Bola"),
+      "Chatarra": objects.filter((item) => item.class_name === "Chatarra"),
+    };
     return (
       <div className="studio-object-workspace">
         <StudioObjectList objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelect={props.onSelectObject} onHover={props.onHoverObject} />
         <div className="studio-table-pane">
+          {!objects.length && Number(classificationMeta.candidates_from_ellipse_fitting ?? 0) > 0 && (
+            <div className="empty-state">
+              <strong>Ellipse candidates found, but classification consumed 0 candidates.</strong>
+              <small>Candidates from ellipse fitting: {String(classificationMeta.candidates_from_ellipse_fitting ?? "-")}.</small>
+            </div>
+          )}
+          <div className="pipeline-status-grid">
+            <div><span>Bola buena</span><strong>{byClass["Bola buena"].length}</strong></div>
+            <div><span>Scrap de Bola</span><strong>{byClass["Scrap de Bola"].length}</strong></div>
+            <div><span>Chatarra</span><strong>{byClass["Chatarra"].length}</strong></div>
+          </div>
           <ObjectTable objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelectObject={props.onSelectObject} onHoverObject={props.onHoverObject} />
           {explore(resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, artifactsForStage(props.detail, props.stageId)).resolvedArtifacts, props)}
         </div>
@@ -490,6 +605,12 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
   histogram: (props) => {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
     const semantic = stageSemanticDefinition(props.stageId);
+    if (semantic.category === "plane_qa") {
+      const runArtifacts = artifactsForStage(props.detail, props.stageId);
+      const histogram = runArtifacts.find((item) => item.artifact_id === "normalized_height_histogram");
+      if (!histogram?.metadata) return semanticEmpty(props.stageId, props.view.id);
+      return <pre className="json-block">{JSON.stringify(histogram.metadata, null, 2)}</pre>;
+    }
     if (semantic.category === "input") {
       const runArtifacts = artifactsForStage(props.detail, props.stageId);
       const context = resolveStageViewContext(props.detail, props.stageId, "image", semantic.category, runArtifacts);
@@ -520,17 +641,17 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
     const semantic = stageSemanticDefinition(props.stageId);
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, artifactsForStage(props.detail, props.stageId));
-    const payload = semantic.category === "input"
+    const payload = semantic.category === "input" || semantic.category === "plane_qa"
       ? { take: { take_id: props.detail.take_id, modalities: props.detail.modalities, metadata: props.detail.metadata, assets: props.detail.assets, frameset: props.detail.frameset }, stage: props.stageId, semantic, resolvedArtifacts: context.resolvedArtifacts }
       : semantic.category === "segmentation"
         ? {
           stage: props.stageId,
           semantic,
-          threshold_mask: context.runArtifacts.find((item) => item.artifact_id === "threshold_mask") ?? null,
-          cleaned_mask: context.runArtifacts.find((item) => item.artifact_id === "cleaned_mask") ?? null,
+          threshold_mask: context.runArtifacts.find((item) => item.artifact_id === "normalized_height_threshold_mask" || item.artifact_id === "threshold_mask") ?? null,
+          cleaned_mask: context.runArtifacts.find((item) => item.artifact_id === "cleaned_object_mask" || item.artifact_id === "cleaned_mask") ?? null,
+          connected_components_overlay: context.runArtifacts.find((item) => item.artifact_id === "connected_components_overlay") ?? null,
           overlay_image: context.runArtifacts.find((item) => item.artifact_id === "overlay_image") ?? null,
-          morphology_metrics: context.runArtifacts.find((item) => item.artifact_id === "morphology_metrics")?.metadata ?? null,
-          morphology_debug_json: context.runArtifacts.find((item) => item.artifact_id === "morphology_debug_json")?.metadata ?? null,
+          segmentation_debug: context.runArtifacts.find((item) => item.artifact_id === "segmentation_debug")?.metadata ?? null,
         }
         : semantic.category === "geometry"
           ? {
@@ -544,6 +665,11 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
             blob_rejected: firstArtifactByAlias(context.runArtifacts, ["blob_rejected"])?.metadata ?? null,
           }
           : { stage: props.stageId, semantic, artifacts: context.runArtifacts, result: props.detail.result };
+    if (semantic.category === "plane_qa" && props.view.id === "surface_candidates") {
+      const surfaceCandidates = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_candidates");
+      const gradientDebug = context.runArtifacts.find((item) => item.artifact_id === "gradient_debug");
+      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null }, null, 2)}</pre>;
+    }
     return <pre className="json-block">{JSON.stringify(payload, null, 2)}</pre>;
   },
   gallery: (props) => {
@@ -556,7 +682,7 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
 export function renderStageSemanticView(props: RendererProps): ReactElement {
   if (!props.detail) return <div className="empty-state">Select a take to inspect stage outputs.</div>;
   const semantic = stageSemanticDefinition(props.stageId);
-  if (semantic.category !== "input" && (!props.compatible || !props.processed)) return semanticEmpty(props.stageId, props.view.id);
+  if (semantic.category !== "input" && semantic.category !== "plane_qa" && (!props.compatible || !props.processed)) return semanticEmpty(props.stageId, props.view.id);
   return (renderers[props.view.rendererType] ?? renderers.json)(props);
 }
 
@@ -581,6 +707,7 @@ function fmtNum(value: unknown, decimals: number): string {
 }
 
 type OverlayMode = "contours" | "labels" | "bbox" | "filled" | "rejected_only";
+type ClassificationOverlayFlags = "ids" | "labels" | "confidence" | "contours" | "geometry";
 
 function BlobCandidateOverlayWorkspace({
   src,
@@ -754,6 +881,87 @@ function BlobCandidateOverlayWorkspace({
           <small>Try lowering `min_area`, lowering `min_circularity`, disabling border rejection, or reducing segmentation cleanup.</small>
         </div>
       )}
+    </section>
+  );
+}
+
+function ClassificationOverlayWorkspace({
+  src,
+  objects,
+  selectedObjectId,
+  hoveredObjectId,
+  onSelectObject,
+  onHoverObject,
+}: {
+  src: string;
+  objects: Array<Record<string, unknown>>;
+  selectedObjectId: number | null;
+  hoveredObjectId: number | null;
+  onSelectObject: (id: number) => void;
+  onHoverObject: (id: number | null) => void;
+}) {
+  const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null);
+  const [flags, setFlags] = useState<Record<ClassificationOverlayFlags, boolean>>({
+    ids: true,
+    labels: true,
+    confidence: true,
+    contours: true,
+    geometry: true,
+  });
+  return (
+    <section className="image-panel overlay-image-panel blob-overlay-workspace">
+      <div className="overlay-controls">
+        <button className={flags.ids ? "active" : ""} onClick={() => setFlags((v) => ({ ...v, ids: !v.ids }))} type="button">IDs</button>
+        <button className={flags.labels ? "active" : ""} onClick={() => setFlags((v) => ({ ...v, labels: !v.labels }))} type="button">Labels</button>
+        <button className={flags.confidence ? "active" : ""} onClick={() => setFlags((v) => ({ ...v, confidence: !v.confidence }))} type="button">Confidence</button>
+        <button className={flags.contours ? "active" : ""} onClick={() => setFlags((v) => ({ ...v, contours: !v.contours }))} type="button">Contours</button>
+        <button className={flags.geometry ? "active" : ""} onClick={() => setFlags((v) => ({ ...v, geometry: !v.geometry }))} type="button">Geometry</button>
+      </div>
+      <div className="overlay-frame blob-overlay-frame">
+        <img
+          alt="Classification overlay"
+          className="artifact-image"
+          draggable={false}
+          onLoad={(event) => setImgSize({ width: event.currentTarget.naturalWidth || 1, height: event.currentTarget.naturalHeight || 1 })}
+          src={src}
+        />
+        {imgSize && (
+          <svg className="artifact-overlay-layer" viewBox={`0 0 ${imgSize.width} ${imgSize.height}`}>
+            {objects.map((row) => {
+              const sourceObjectId = Number(row.source_object_id ?? 0);
+              const id = Number.isFinite(sourceObjectId) && sourceObjectId > 0 ? sourceObjectId : Number(String(row.object_id ?? "").replace(/\D/g, ""));
+              if (!Number.isFinite(id) || id <= 0) return null;
+              const status = String(row.status ?? "suspicious");
+              const color = status === "accepted" ? "#22c55e" : status === "rejected" ? "#ef4444" : "#f59e0b";
+              const selected = selectedObjectId != null && selectedObjectId === id;
+              const hovered = hoveredObjectId != null && hoveredObjectId === id;
+              const width = selected ? 4 : hovered ? 3 : 2;
+              const contour = Array.isArray(row.contour) ? row.contour as Array<[number, number]> : [];
+              const bbox = row.bounding_box && typeof row.bounding_box === "object" ? row.bounding_box as Record<string, unknown> : {};
+              const ellipse = row.ellipse && typeof row.ellipse === "object" ? row.ellipse as Record<string, unknown> : null;
+              const x = Number(bbox.x ?? 0);
+              const y = Number(bbox.y ?? 0);
+              const w = Number(bbox.width ?? 0);
+              const h = Number(bbox.height ?? 0);
+              const labelText = [flags.ids ? String(row.object_id ?? `object_${id.toString().padStart(3, "0")}`) : "", flags.labels ? String(row.label ?? "") : "", flags.confidence ? `${Number(row.confidence ?? 0).toFixed(2)}` : ""].filter(Boolean).join(" • ");
+              return (
+                <g
+                  key={`classification_obj_${id}`}
+                  onClick={() => onSelectObject(id)}
+                  onMouseEnter={() => onHoverObject(id)}
+                  onMouseLeave={() => onHoverObject(null)}
+                >
+                  {flags.contours && contour.length >= 2 ? <polyline points={contour.map((p) => `${Number(p[0])},${Number(p[1])}`).join(" ")} stroke={color} strokeWidth={width} fill="none" opacity={0.95} /> : null}
+                  {flags.geometry && w > 0 && h > 0 ? <rect x={x} y={y} width={w} height={h} stroke={color} strokeWidth={selected ? 2.5 : 1.5} fill="none" opacity={0.85} /> : null}
+                  {flags.geometry && ellipse ? <ellipse cx={Number(ellipse.cx ?? 0)} cy={Number(ellipse.cy ?? 0)} rx={Number(ellipse.rx ?? 0)} ry={Number(ellipse.ry ?? 0)} transform={`rotate(${Number(ellipse.rotation_deg ?? 0)} ${Number(ellipse.cx ?? 0)} ${Number(ellipse.cy ?? 0)})`} stroke={color} strokeWidth={1.2} fill="none" opacity={0.9} /> : null}
+                  {labelText ? <text className={`artifact-overlay-text ${selected ? "selected" : ""}`} x={Math.max(8, x)} y={Math.max(16, y - 6)} fill={selected ? "#111827" : "#0f172a"}>{labelText}</text> : null}
+                </g>
+              );
+            })}
+          </svg>
+        )}
+      </div>
+      {!objects.length ? <div className="empty-state"><strong>No classification overlay objects available.</strong></div> : null}
     </section>
   );
 }

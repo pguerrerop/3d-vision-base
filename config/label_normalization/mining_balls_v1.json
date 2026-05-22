@@ -1,0 +1,40 @@
+{
+  "version": "v1",
+  "mappings": {
+    "ok": {"semantic_labels": ["BALL_GOOD_STANDARD"], "superclass_labels": ["BALL_GOOD"]},
+    "ok 1": {"semantic_labels": ["BALL_GOOD_SMALL"], "superclass_labels": ["BALL_GOOD"]},
+    "ok 2": {"semantic_labels": ["BALL_GOOD_MEDIUM"], "superclass_labels": ["BALL_GOOD"]},
+    "ok 2 (2,5\")": {
+      "aliases": ["ok 2 (2.5\")", "ok 2 2.5", "ok 2 (2", "5\")"],
+      "semantic_labels": ["BALL_GOOD_MEDIUM"],
+      "superclass_labels": ["BALL_GOOD"]
+    },
+    "ok 3": {"semantic_labels": ["BALL_GOOD_LARGE"], "superclass_labels": ["BALL_GOOD"]},
+    "chica": {"semantic_labels": ["BALL_GOOD_SMALL"], "superclass_labels": ["BALL_GOOD"]},
+    "chica 2": {"semantic_labels": ["BALL_GOOD_SMALL"], "superclass_labels": ["BALL_GOOD"]},
+    "mitad": {"semantic_labels": ["BALL_BROKEN"], "superclass_labels": ["BALL_DEFECT"]},
+    "mitad 2": {"semantic_labels": ["BALL_BROKEN"], "superclass_labels": ["BALL_DEFECT"]},
+    "80%": {"semantic_labels": ["BALL_WORN"], "superclass_labels": ["BALL_DEFECT"]},
+    "ahuevada": {"semantic_labels": ["BALL_DEFORMED"], "superclass_labels": ["BALL_DEFECT"]},
+    "bola chip": {"semantic_labels": ["BALL_CHIPPED"], "superclass_labels": ["BALL_DEFECT"]},
+    "bola quebrada": {"semantic_labels": ["BALL_BROKEN"], "superclass_labels": ["BALL_DEFECT"]},
+    "bola defectuosa": {"semantic_labels": ["BALL_DEFECT_GENERIC"], "superclass_labels": ["BALL_DEFECT"]},
+    "perno": {"semantic_labels": ["SCRAP_BOLT"], "superclass_labels": ["SCRAP"]},
+    "planchuela": {"semantic_labels": ["SCRAP_FLAT_BAR"], "superclass_labels": ["SCRAP"]},
+    "alicate": {"semantic_labels": ["SCRAP_PLIERS"], "superclass_labels": ["SCRAP_TOOL"]},
+    "golilla": {"semantic_labels": ["SCRAP_WASHER"], "superclass_labels": ["SCRAP"]},
+    "tuerca": {"semantic_labels": ["SCRAP_NUT"], "superclass_labels": ["SCRAP"]},
+    "arandela": {"semantic_labels": ["SCRAP_WASHER"], "superclass_labels": ["SCRAP"]},
+    "tarro curry": {"semantic_labels": ["SCRAP_CAN"], "superclass_labels": ["SCRAP"]},
+    "tarro spray": {"semantic_labels": ["SCRAP_CAN"], "superclass_labels": ["SCRAP"]},
+    "zoquete": {"semantic_labels": ["SCRAP_UNKNOWN_BLOCK"], "superclass_labels": ["SCRAP"]},
+    "chatarra": {"semantic_labels": ["SCRAP_GENERIC"], "superclass_labels": ["SCRAP"]},
+    "cubo": {"semantic_labels": ["CALIBRATION_CUBE"], "superclass_labels": ["CALIBRATION_OBJECT"]},
+    "encoder": {"semantic_labels": ["EQUIPMENT_ENCODER"], "superclass_labels": ["EQUIPMENT"]},
+    "cámara": {"semantic_labels": ["EQUIPMENT_CAMERA"], "superclass_labels": ["EQUIPMENT"]},
+    "camara": {"semantic_labels": ["EQUIPMENT_CAMERA"], "superclass_labels": ["EQUIPMENT"]},
+    "piedra": {"semantic_labels": ["ROCK"], "superclass_labels": ["FOREIGN_OBJECT"]},
+    "metal": {"semantic_labels": ["METAL_FRAGMENT"], "superclass_labels": ["FOREIGN_OBJECT"]},
+    "otro": {"semantic_labels": ["OPEN_SET_OTHER"], "superclass_labels": ["OPEN_SET"]}
+  }
+}

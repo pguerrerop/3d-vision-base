@@ -13,12 +13,17 @@ export type ProfilingBadge = {
 };
 
 const CATEGORY_LABELS: Record<ProfilingCategory, string> = {
+  input: "Input",
   io: "IO",
+  calibration: "Calibration",
   preprocessing: "Preprocessing",
   calibration_filtering: "Calibration",
+  segmentation: "Segmentation",
   clustering: "Clustering",
+  geometry: "Geometry",
   measurement: "Measurement",
   classification: "Classification",
+  overlay: "Overlay",
   debug_artifacts: "Debug artifacts",
   output: "Output",
 };

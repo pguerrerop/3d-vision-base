@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "node --test --experimental-strip-types tests/profiling.test.ts tests/objectSelectionModel.test.ts tests/calibration2dSourceModel.test.ts tests/datasetSidebarModel.test.ts tests/captureWorkflowModel.test.ts",
+    "test": "node --test --experimental-strip-types tests/profiling.test.ts tests/objectSelectionModel.test.ts tests/calibration2dSourceModel.test.ts tests/datasetSidebarModel.test.ts tests/captureWorkflowModel.test.ts tests/takeActionsModel.test.ts tests/stageParameterModel.test.ts tests/objectTableRender.test.ts tests/operatorInspectionHelpers.test.ts tests/runtimeWorkerUi.test.ts tests/processingLabRuntimeBadges.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

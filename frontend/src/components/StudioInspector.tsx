@@ -20,6 +20,7 @@ type Props = {
 
 export default function StudioInspector({ detail, pipeline, stageId, compatible, selectedObjectId, selectedArtifact, overlayDebug, onUpsertObjectAnnotation }: Props) {
   const objects = [...(detail?.result?.objects ?? []), ...(detail?.result?.rejected_objects ?? [])];
+  const objectCandidates = detail?.result?.object_candidates ?? [];
   const artifacts = detail?.result?.artifacts ?? [];
   const object = selectedObject(objects, selectedObjectId);
   const summary = stageInspectorSummary(detail, pipeline, stageId);
@@ -27,13 +28,20 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
   const lineage = artifactLineage(artifacts, selectedArtifact);
   const producingStages = objectGeneratingStages(artifacts, object?.object_id ?? null);
   const stageArtifacts = artifactsForStageLocal(artifacts, stageId);
+  const beltPlaneArtifact = artifacts.find((item) => item.artifact_id === "belt_plane");
+  const segmentationArtifact = artifacts.find((item) => item.artifact_id === "height_segmentation");
+  const componentsArtifact = artifacts.find((item) => item.artifact_id === "connected_components");
   const normalizedBlobs = normalizeBlobDetectionArtifacts(stageArtifacts);
   const blobCandidates = normalizedBlobs.candidates;
   const selectedBlob = blobCandidates.find((item) => Number(item.id) === selectedObjectId) ?? null;
   const blobRejected = normalizedBlobs.summary.rejectedCount;
   const ellipseArtifact = stageArtifacts.find((item) => item.artifact_id === "ellipse_metrics");
+  const ellipseDebugArtifact = stageArtifacts.find((item) => item.artifact_id === "ellipse_debug_json");
   const ellipseRows = (((ellipseArtifact?.metadata as Record<string, unknown> | undefined)?.entries ?? []) as unknown[])
     .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+  const ellipseEffectiveParams = ((ellipseDebugArtifact?.metadata as Record<string, unknown> | undefined)?.effective_params as Record<string, unknown> | undefined)
+    ?? ((ellipseArtifact?.metadata as Record<string, unknown> | undefined)?.effective_params as Record<string, unknown> | undefined)
+    ?? {};
   const selectedEllipse = ellipseRows.find((row) => Number(row.candidate_id ?? 0) === selectedObjectId) ?? null;
   const annotationMap = useMemo(() => {
     const map = new Map<string, Record<string, unknown>>();
@@ -53,18 +61,29 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
   const morphMetrics = stageArtifacts.find((item) => item.artifact_id === "morphology_metrics");
   const morphDebug = stageArtifacts.find((item) => item.artifact_id === "morphology_debug_json");
   const thresholdMask = stageArtifacts.find((item) => item.artifact_id === "threshold_mask");
+  const planeFitDebugArtifact = stageArtifacts.find((item) => item.artifact_id === "plane_fit_debug");
+  const normalizationDebugArtifact = stageArtifacts.find((item) => item.artifact_id === "normalization_debug" || item.artifact_id === "normalized_height_debug");
+  const planeFitDebug = (planeFitDebugArtifact?.metadata ?? {}) as Record<string, unknown>;
+  const normalizationDebug = (normalizationDebugArtifact?.metadata ?? {}) as Record<string, unknown>;
+  const bgSelection = ((planeFitDebug.background_selection as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
   const morphMetricsMeta = (morphMetrics?.metadata ?? {}) as Record<string, unknown>;
   const morphDebugMeta = (morphDebug?.metadata ?? {}) as Record<string, unknown>;
   const thresholdMeta = (thresholdMask?.metadata ?? {}) as Record<string, unknown>;
   const morphSection = (morphDebugMeta.morphology as Record<string, unknown> | undefined) ?? {};
   const roiSection = (morphDebugMeta.roi as Record<string, unknown> | undefined) ?? {};
+  const effectiveParams = (morphDebugMeta.effective_params as Record<string, unknown> | undefined)
+    ?? (morphMetricsMeta.effective_params as Record<string, unknown> | undefined)
+    ?? {};
   const inspectorTitle = object
     ? `Object #${object.object_id}`
     : selectedArtifact?.title
       ? selectedArtifact.title
-      : detail?.result
-        ? stageId || "Stage"
-        : "No result selected";
+        : detail?.result
+          ? stageId || "Stage"
+          : "No result selected";
+  const selectedCandidate = selectedObjectId == null
+    ? null
+    : objectCandidates.find((item) => Number(item.local_object_index) === selectedObjectId) ?? null;
   return (
     <aside className="studio-inspector">
       <div className="studio-sidebar-title">
@@ -86,11 +105,26 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
       <div className="inspector-section">
         <span>Stage semantics</span>
         <strong>{semantic.category}</strong>
-        {semantic.category === "segmentation" && <small>Mask coverage and morphology outputs are emphasized for this stage.</small>}
+        {semantic.category === "segmentation" && <small>Primary visualization uses height preview overlays; masks/morphology are diagnostics.</small>}
         {semantic.category === "geometry" && <small>Contour and ellipse candidate geometry metrics are emphasized for this stage.</small>}
         {semantic.category === "measurement" && <small>Diameter and circularity measurements are emphasized for this stage.</small>}
         {semantic.category === "classification" && <small>Class distribution and rejection reasons are emphasized for this stage.</small>}
-        {semantic.category === "input" && <small>Input image quality and preprocessing metadata are emphasized for this stage.</small>}
+        {semantic.category === "input" && <small>Primary visualization prefers human-readable source previews (height preview for 2.5D).</small>}
+        {semantic.category === "plane_qa" && <small>Plane-fit quality and near-zero normalization diagnostics are prioritized.</small>}
+      </div>
+      <div className="inspector-section">
+        <span>Object candidates</span>
+        <strong>{objectCandidates.length}</strong>
+        {selectedCandidate ? (
+          <>
+            <small>ID: {selectedCandidate.id}</small>
+            <small>Source modality: {selectedCandidate.source_modality}</small>
+            <small>Confidence: {selectedCandidate.confidence == null ? "-" : String(selectedCandidate.confidence)}</small>
+            <small>BBox: {Array.isArray(selectedCandidate.bbox_px) ? selectedCandidate.bbox_px.join(", ") : "-"}</small>
+          </>
+        ) : (
+          <small>Select an object to inspect candidate details.</small>
+        )}
       </div>
       {semantic.category === "segmentation" && (
         <div className="inspector-section">
@@ -105,9 +139,11 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Invert: {String(thresholdMeta.invert ?? "-")}</small>
           <small>Blur kernel: {String(thresholdMeta.blur_kernel ?? "-")}</small>
           <small>Morph op: {String(morphSection.operation ?? "-")}</small>
-          <small>Open/Close kernel: {String(morphSection.open_kernel ?? "-")} / {String(morphSection.close_kernel ?? "-")}</small>
-          <small>Area min/max: {String(morphSection.min_component_area ?? "-")} / {String(morphSection.max_component_area ?? "-")}</small>
+          <small>Erode/Dilate/Close kernels: {String(morphSection.erode_kernel_size ?? "-")} / {String(morphSection.dilate_kernel_size ?? "-")} / {String(morphSection.close_kernel_size ?? "-")}</small>
+          <small>Erode/Dilate iterations: {String(morphSection.erode_iterations ?? "-")} / {String(morphSection.dilate_iterations ?? "-")}</small>
+          <small>Area min/max: {String(morphSection.min_area_px ?? "-")} / {String(morphSection.max_area_px ?? "-")}</small>
           <small>ROI: {String(roiSection.enabled ?? false)} ({String(roiSection.x ?? "-")}, {String(roiSection.y ?? "-")}, {String(roiSection.width ?? "-")}x{String(roiSection.height ?? "-")})</small>
+          {!!Object.keys(effectiveParams).length && <small>Effective params: {JSON.stringify(effectiveParams)}</small>}
         </div>
       )}
       {semantic.category === "input" && (
@@ -117,6 +153,37 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Timestamp: {detail?.created_at ?? "-"}</small>
           <small>Source image: {primarySourceImageUrl(detail) ?? "-"}</small>
           <small>Metadata keys: {Object.keys((detail?.metadata ?? {}) as Record<string, unknown>).join(", ") || "-"}</small>
+        </div>
+      )}
+      {semantic.category === "plane_qa" && (
+        <div className={`inspector-section ${(Array.isArray(planeFitDebug.warnings) && planeFitDebug.warnings.length) || (Array.isArray(normalizationDebug.warnings) && normalizationDebug.warnings.length) ? "warning" : ""}`}>
+          <span>Plane QA</span>
+          <strong>{String(planeFitDebug.status ?? "unknown")}</strong>
+          <small>Selection mode: {String(bgSelection.background_selection_mode ?? "-")}</small>
+          <small>Inferred convention: {String(bgSelection.inferred_depth_convention ?? "-")}</small>
+          <small>Candidate coverage: {String(bgSelection.candidate_coverage_percent ?? "-")}%</small>
+          <small>Border-connected: {String((((bgSelection.border_connected_filtering as Record<string, unknown> | undefined) ?? {}).enabled) ?? "-")}</small>
+          <small>Failure reason: {String(planeFitDebug.failure_reason ?? "-")}</small>
+          <small>Inlier ratio: {String(planeFitDebug.inlier_ratio ?? "-")}</small>
+          <small>Residual p95/mm: {String(planeFitDebug.residual_p95_mm ?? "-")}</small>
+          <small>Residual max abs/mm: {String(planeFitDebug.residual_max_abs_mm ?? "-")}</small>
+          <small>Background mean/mm: {String(normalizationDebug.background_height_mean_after_normalization_mm ?? "-")}</small>
+          <small>Background std/mm: {String(normalizationDebug.background_height_std_after_normalization_mm ?? "-")}</small>
+          <small>Background p95 abs/mm: {String(normalizationDebug.background_height_p95_abs_after_normalization_mm ?? "-")}</small>
+          <small>Foreground mean/mm: {String(normalizationDebug.foreground_mean_height_mm ?? "-")}</small>
+          {Array.isArray(planeFitDebug.warnings) && planeFitDebug.warnings.length ? <small>Fit warnings: {planeFitDebug.warnings.map(String).join(" | ")}</small> : null}
+          {Array.isArray(normalizationDebug.warnings) && normalizationDebug.warnings.length ? <small>Normalization warnings: {normalizationDebug.warnings.map(String).join(" | ")}</small> : null}
+          <small>Convention: height_above_belt_mm = raw_z_mm - plane_z_at_xy</small>
+        </div>
+      )}
+      {(beltPlaneArtifact || segmentationArtifact || componentsArtifact) && (
+        <div className="inspector-section">
+          <span>25D diagnostics</span>
+          <strong>Belt plane + segmentation</strong>
+          <small>Plane coefficients: {JSON.stringify(((beltPlaneArtifact?.metadata as Record<string, unknown> | undefined)?.plane_coefficients) ?? detail?.result?.plane_model ?? "-")}</small>
+          <small>Plane residual stats: {JSON.stringify(((beltPlaneArtifact?.metadata as Record<string, unknown> | undefined)?.residual_stats_mm) ?? "-")}</small>
+          <small>Height threshold config: {JSON.stringify(((segmentationArtifact?.metadata as Record<string, unknown> | undefined)?.height_threshold_config) ?? "-")}</small>
+          <small>Connected components: {String(((componentsArtifact?.metadata as Record<string, unknown> | undefined)?.component_count) ?? detail?.result?.objects?.length ?? "-")}</small>
         </div>
       )}
       <ObjectInspector object={object} producingStages={producingStages} />
@@ -159,11 +226,14 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
               <small>Circularity: {String(selectedEllipse.circularity ?? "-")}</small>
               <small>Solidity: {String(selectedEllipse.solidity ?? "-")}</small>
               <small>RMSE / max error: {String(selectedEllipse.fit_rmse ?? "-")} / {String(selectedEllipse.fit_max_error ?? "-")}</small>
+              <small>Initial/refined mean error: {String(selectedEllipse.initial_mean_error ?? "-")} / {String(selectedEllipse.refined_mean_error ?? "-")}</small>
+              <small>Refine iters/converged: {String(selectedEllipse.refinement_iterations ?? "-")} / {Boolean(selectedEllipse.refinement_converged) ? "yes" : "no"}</small>
               <small>Valid fit: {Boolean(selectedEllipse.valid_fit) ? "yes" : "no"}</small>
             </>
           ) : (
             <small>Select a candidate from the table/overlay to inspect fit quality metrics.</small>
           )}
+          {!!Object.keys(ellipseEffectiveParams).length && <small>Effective params: {JSON.stringify(ellipseEffectiveParams)}</small>}
         </div>
       )}
       {(semantic.category === "geometry" || semantic.stageId === "ellipse_fitting") && selectedCandidateId && (
@@ -373,11 +443,21 @@ function ObjectInspector({ object, producingStages }: { object: StudioObject | n
     <div className="inspector-section">
       <span>Selected object</span>
       <strong>{object.class_name}</strong>
+      <small>Subclass: {object.subclass_label ?? "-"}</small>
+      <small>Class label: {String((object as Record<string, unknown>).label ?? "-")}</small>
       <small>Confidence: {object.confidence == null ? "-" : `${Math.round(object.confidence * 100)}%`}</small>
       <small>Diameter: {object.diameter_mm ?? object.diameter_estimate_mm ?? "-"} mm</small>
+      <small>Major/minor diameter: {String((object as Record<string, unknown>).major_axis_mm ?? "-")} / {String((object as Record<string, unknown>).minor_axis_mm ?? "-")} mm</small>
       <small>Sphericity: {object.sphericity_score ?? "-"}</small>
+      <small>Roundness: {String((object as Record<string, unknown>).feature_eccentricity != null ? (1 - Number((object as Record<string, unknown>).feature_eccentricity)).toFixed(4) : "-")}</small>
       <small>Fit RMSE: {object.fit_rmse_mm ?? "-"}</small>
+      <small>Max/mean/p95 height: {String((object.height_above_belt_mm as Record<string, unknown> | undefined)?.max_height_mm ?? "-")} / {String((object.height_above_belt_mm as Record<string, unknown> | undefined)?.mean_height_mm ?? "-")} / {String((object.height_above_belt_mm as Record<string, unknown> | undefined)?.p95_height_mm ?? "-")} mm</small>
+      <small>Footprint area: {String((object as Record<string, unknown>).footprint_area_mm2 ?? "-")} mm²</small>
+      <small>Volume proxy: {String((object as Record<string, unknown>).feature_volume_proxy_mm3 ?? "-")} mm³</small>
+      <small>Deformation score: {String((object as Record<string, unknown>).feature_local_curvature_proxy ?? "-")}</small>
+      <small>Class hint/group: {String((object as Record<string, unknown>).class_group ?? "-")}</small>
       <small>Rejection: {object.filter_reason ?? "none"}</small>
+      <small>Reasons: {Array.isArray((object as Record<string, unknown>).decision_reasons) ? ((object as Record<string, unknown>).decision_reasons as string[]).join(", ") : "-"}</small>
       <small>Generating stages: {producingStages.length ? producingStages.join(" -> ") : "-"}</small>
     </div>
   );

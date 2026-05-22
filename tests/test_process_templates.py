@@ -69,8 +69,12 @@ def test_mining_2d_template_pipeline_executes_end_to_end(tmp_path: Path) -> None
     assert "ellipse_overlay" in ids
     assert "ellipse_metrics" in ids
     assert "ellipse_summary" in ids
+    assert "ellipse_candidates" in ids
     assert "measurement_table_artifact" in ids
     assert "classification_result_artifact" in ids
+    assert "classification_result" in ids
+    assert "classification_overlay_image" in ids
+    assert "classification_overlay_metadata" in ids
     assert any(item["kind"] == "overlay" and item["coordinate_space"] == "image_pixel" for item in run["artifacts"])
     assert len(run["measurements"]) >= 1
     by_id = {artifact["artifact_id"]: artifact for artifact in run["artifacts"]}
@@ -85,6 +89,24 @@ def test_mining_2d_template_pipeline_executes_end_to_end(tmp_path: Path) -> None
     ellipse_summary = by_id["ellipse_summary"].get("metadata") or {}
     assert int(ellipse_summary.get("candidate_count", 0)) >= 1
     assert int(ellipse_summary.get("fitted_count", 0)) >= 1
+    classification = by_id["classification_result"].get("metadata") or {}
+    assert int(classification.get("candidates_from_ellipse_fitting", 0)) >= 1
+    assert int(classification.get("candidates_classified", 0)) >= 1
+    entries = classification.get("entries") or []
+    assert isinstance(entries, list)
+    if entries:
+        first = entries[0]
+        assert first.get("class_label") in {"Bola buena", "Scrap de Bola", "Chatarra"}
+        if first.get("class_label") == "Bola buena":
+            assert first.get("subclass_label") in {None, ""}
+    overlay_meta = by_id["classification_overlay_metadata"].get("metadata") or {}
+    assert overlay_meta.get("artifact_kind") == "overlay"
+    assert overlay_meta.get("overlay_type") == "classification"
+    assert overlay_meta.get("overlay_coordinate_space") == "image_pixel"
+    assert overlay_meta.get("target_artifact_id") == "source_rgb_image"
+    assert isinstance(overlay_meta.get("objects"), list)
+    object_candidates = run.get("summary", {}).get("object_candidates") if isinstance(run.get("summary"), dict) else None
+    assert object_candidates is None or isinstance(object_candidates, list)
 
 
 def test_mining_rgb_pipeline_supports_parameter_override_and_rerun(tmp_path: Path) -> None:

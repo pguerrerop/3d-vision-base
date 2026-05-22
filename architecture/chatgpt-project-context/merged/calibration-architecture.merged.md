@@ -49,8 +49,22 @@ The model intentionally leaves room for:
 - multi-camera fusion
 - true sphere estimation with height-aware correction
 
-## Added source discovery + freshness gating
+## Added source discovery + capture-first workflow
 
-2D calibration no longer relies on manual source-id text input. It uses discovered sources with friendly labels and explicit freshness metadata, and gates detect/calibrate actions on fresh captured frames and valid target configuration.
+2D calibration no longer relies on manual source-id text input. It uses discovered sources with friendly labels and explicit freshness metadata.
 
 Capture-first refactor: 2D calibration no longer depends on preview freshness. Calibration operates on persisted capture IDs stored in `data/calibration/captures/`, and capture acquisition fetches a fresh source frame directly.
+
+Detect corners now runs on selected capture by default, with explicit `Detect all captures` as a secondary action.
+
+Supported ChArUco dictionaries:
+
+- `DICT_4X4_50`
+- `DICT_4X4_100`
+- `DICT_5X5_50`
+- `DICT_5X5_100`
+- `DICT_6X6_250`
+
+Runtime camera controls are exposed for USB sources via `/api/sources/{source_id}/controls` (get/set) and persisted in `camera_runtime_settings` inside `camera_2d` calibrations.
+
+2D Camera UX is split into manager + Camera Controls modal + ChArUco Calibration modal, with realtime MJPEG streaming isolated to camera runtime tuning.

@@ -439,7 +439,11 @@ def _derive_object_crop_projection(
     y = max(0, int(float(bbox.get("y", 0.0))))
     w = max(16, int(float(bbox.get("width", 32.0))))
     h = max(16, int(float(bbox.get("height", 32.0))))
-    crop = image.crop((x, y, min(image.width, x + w), min(image.height, y + h)))
+    right = min(image.width, x + w)
+    bottom = min(image.height, y + h)
+    if right <= x or bottom <= y:
+        return None
+    crop = image.crop((x, y, right, bottom))
     filename = f"projection_object_{object_id}.png"
     crop.save(output_dir / filename)
     return _artifact(

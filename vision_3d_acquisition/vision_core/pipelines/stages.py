@@ -11,6 +11,7 @@ from vision_3d_acquisition.calibration.calibration_storage import load_calibrati
 from vision_3d_acquisition.contracts.artifacts import normalize_processing_artifacts
 from vision_3d_acquisition.contracts.execution import build_pipeline_execution_trace
 from vision_3d_acquisition.contracts.modalities import CaptureModality
+from vision_3d_acquisition.contracts.object_candidates import normalize_object_candidates
 from vision_3d_acquisition.contracts.result import ProcessingProfiling, ProcessingResult, ProcessingTiming
 from vision_3d_acquisition.processing.calibrated_filtering import (
     evaluate_clusters_with_calibration,
@@ -503,7 +504,11 @@ class SerializeProcessingResultStage:
                 },
             ]
         )
-        pipeline_info = default_pipeline_info()
+        pipeline_name = str(context.get_artifact("pipeline_name", "3d_ball_inspection"))
+        try:
+            pipeline_info = default_pipeline_info(pipeline_name)
+        except KeyError:
+            pipeline_info = default_pipeline_info()
         result = ProcessingResult(
             take_id=take_id,
             session_id=metadata.get("session_id") if isinstance(metadata, dict) else None,
@@ -519,7 +524,7 @@ class SerializeProcessingResultStage:
             output_modalities=["point_cloud", "debug_image"],
             processing_pipeline={
                 **pipeline_info,
-                "name": context.get_artifact("pipeline_name", "inspection"),
+                "name": context.get_artifact("pipeline_name", pipeline_info.get("name", "inspection")),
                 "required_modalities": list(context.get_artifact("pipeline_required_modalities", ["point_cloud"])),
             },
             stage_outputs=[],
@@ -565,6 +570,7 @@ class SerializeProcessingResultStage:
             result_status=result_payload.get("status"),
             result_error=result_payload.get("error"),
         )
+        result_payload["object_candidates"] = normalize_object_candidates(result_payload)
         for item in result_payload.get("objects", []):
             object_id = item.get("object_id")
             if isinstance(object_id, int):

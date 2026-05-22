@@ -62,7 +62,22 @@ export type StageViewTabId =
   | "measurements"
   | "classification"
   | "summary"
-  | "export";
+  | "export"
+  | "heightmap"
+  | "raw_heightmap"
+  | "valid_mask"
+  | "plane_inliers"
+  | "background_candidates"
+  | "background_seeds"
+  | "expanded_plane"
+  | "depth_plot"
+  | "residual_heatmap"
+  | "normalized_height"
+  | "belt_plane"
+  | "segmentation"
+  | "measurements_25d"
+  | "classification_25d"
+  | "overlays_25d";
 
 export function tabForStage(stageId: string): StudioWorkspaceTab {
   if (stageId.includes("segment")) return "segmentation";
@@ -103,20 +118,25 @@ export function chooseBestPipelineForTake(
     const remembered = groups.compatible.find((item) => item.id === lastUsedPipelineId);
     if (remembered) return remembered;
   }
-  const preferred = groups.compatible.find((item) => item.id === "3d_ball_inspection" || item.id === "mining_steel_ball_classification_2d");
+  const preferred = groups.compatible.find((item) =>
+    item.id === "mining_steel_ball_classification_25d"
+    || item.id === "3d_ball_inspection"
+    || item.id === "mining_steel_ball_classification_2d"
+  );
   if (preferred) return preferred;
   if (groups.compatible.length) return groups.compatible[0];
   return pipelines[0];
 }
 
 export function compactTakeFamilyStatus(
-  processingByFamily: Array<{ family: "3d" | "2d" | "generic"; hasCompletedOutput: boolean; status: string }> | undefined,
+  processingByFamily: Array<{ family: "3d" | "2d" | "25d" | "generic"; hasCompletedOutput: boolean; status: string }> | undefined,
   modalities: CaptureModality[] | string[] | undefined
 ): string {
   const items = processingByFamily ?? [];
   const available = new Set(modalities ?? []);
   const status2d = items.find((item) => item.family === "2d");
   const status3d = items.find((item) => item.family === "3d");
+  const status25d = items.find((item) => item.family === "25d");
   const tags: string[] = [];
   if (status2d) {
     tags.push(`2D: ${status2d.hasCompletedOutput ? "done" : status2d.status === "never_processed" ? "not run" : status2d.status}`);
@@ -124,6 +144,10 @@ export function compactTakeFamilyStatus(
   if (status3d) {
     const unavailable3d = !available.has("point_cloud");
     tags.push(`3D: ${unavailable3d ? "unavailable" : status3d.hasCompletedOutput ? "done" : status3d.status === "never_processed" ? "not run" : status3d.status}`);
+  }
+  if (status25d) {
+    const unavailable25d = !available.has("heightmap");
+    tags.push(`25D: ${unavailable25d ? "unavailable" : status25d.hasCompletedOutput ? "done" : status25d.status === "never_processed" ? "not run" : status25d.status}`);
   }
   return tags.join(" • ");
 }

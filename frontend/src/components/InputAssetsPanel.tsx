@@ -12,7 +12,7 @@ type Props = {
 
 const LABELS: Record<CaptureModality | "metadata", string> = {
   point_cloud: "Point cloud",
-  heightmap: "Heightmap",
+  heightmap: "Heightmap (Primary)",
   reflectance: "Reflectance",
   rgb: "RGB",
   rgb_video: "RGB video",
@@ -69,6 +69,7 @@ export default function InputAssetsPanel({ detail, result, compact = false }: Pr
 
 function firstAssetUrl(takeId: string, assetGroup: Record<string, string> | undefined): string | null {
   if (!assetGroup) return null;
+  if (assetGroup.heightmap_preview) return fileUrl(takeId, assetGroup.heightmap_preview);
   for (const key of IMAGE_KEYS) {
     const filename = assetGroup[key];
     if (filename) return fileUrl(takeId, filename);

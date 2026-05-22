@@ -26,7 +26,7 @@ MODALITY_ORDER: tuple[CaptureModality, ...] = (
 POINT_CLOUD_FILE_KEYS = {"point_cloud", "point_cloud_npz"}
 MODALITY_FILE_KEYS: dict[CaptureModality, tuple[str, ...]] = {
     "point_cloud": ("point_cloud", "point_cloud_npz"),
-    "heightmap": ("heightmap", "height"),
+    "heightmap": ("heightmap", "height", "heightmap_preview"),
     "reflectance": ("reflectance",),
     "rgb": ("rgb",),
     "rgb_video": ("rgb_video",),

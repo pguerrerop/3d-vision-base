@@ -85,6 +85,36 @@ def test_detect_enabled_after_capture_and_captures_persist(tmp_path: Path, monke
     assert detect["capture_count"] == 1
 
 
+def test_selected_capture_detection_does_not_process_all(tmp_path: Path, monkeypatch) -> None:
+    settings = make_settings(tmp_path / "data")
+    monkeypatch.setattr("vision_3d_acquisition.api.calibration._update_preview_from_capture", lambda *_args, **_kwargs: {"status": "live"})
+    monkeypatch.setattr(
+        "vision_3d_acquisition.api.calibration._acquire_capture_frame",
+        lambda *_args, **_kwargs: {
+            "frame": np.zeros((40, 60, 3), dtype=np.uint8),
+            "acquisition_mode": "direct_usb_camera",
+            "frame_timestamp": "2026-01-01T00:00:00+00:00",
+            "frame_age_seconds": 0.0,
+            "freshness_status": "fresh",
+        },
+    )
+    c1 = capture_2d_frame(Capture2DFrameRequest(source_id="usb_camera_0"), settings)
+    c2 = capture_2d_frame(Capture2DFrameRequest(source_id="usb_camera_0"), settings)
+
+    calls: list[str] = []
+    def fake_detect(path: Path, _target):
+        calls.append(path.name)
+        from vision_3d_acquisition.calibration.camera_2d import DetectedFrame
+        return DetectedFrame(str(path), 60, 40, False, 0, None, None, np.zeros((40, 60, 3), dtype=np.uint8), [], success=False, error_code="NO_CORNERS_DETECTED")
+
+    monkeypatch.setattr("vision_3d_acquisition.api.calibration.detect_target_in_image", fake_detect)
+    with pytest.raises(HTTPException):
+        detect_2d_corners(Detect2DCornersRequest(capture_id=c1["capture_id"], target=Camera2DTargetConfig()), settings)
+    assert len(calls) == 1
+    assert c1["capture_id"] in calls[0]
+    assert all(c2["capture_id"] not in name for name in calls)
+
+
 def test_capture_uses_preview_cache_when_direct_unavailable(tmp_path: Path, monkeypatch) -> None:
     settings = make_settings(tmp_path / "data")
 

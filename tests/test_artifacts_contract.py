@@ -114,3 +114,31 @@ def test_projection_overlay_target_uses_projection_pixel_for_projection_artifact
     bbox = next(item for item in artifacts if item["artifact_id"] == "segmentation_overlay_bbox_5")
     assert bbox["target_artifact_id"] == "xy_topdown"
     assert bbox["coordinate_space"] == "projection_pixel"
+
+
+def test_classification_overlay_metadata_artifact_is_preserved() -> None:
+    result = {
+        "take_id": "take_class_overlay",
+        "processed_at": "2026-05-16T00:00:00Z",
+        "artifacts": [
+            {
+                "artifact_id": "classification_overlay_metadata",
+                "stage_id": "classification",
+                "kind": "json",
+                "title": "Classification overlay metadata",
+                "preview_available": True,
+                "metadata": {
+                    "artifact_kind": "overlay",
+                    "overlay_type": "classification",
+                    "target_artifact_id": "source_rgb_image",
+                    "overlay_coordinate_space": "image_pixel",
+                    "objects": [{"object_id": "object_007", "label": "accepted", "confidence": 0.91}],
+                },
+            }
+        ],
+    }
+    artifacts = normalize_processing_artifacts(result, output_dir=Path("/tmp"))
+    overlay_meta = next(item for item in artifacts if item["artifact_id"] == "classification_overlay_metadata")
+    assert overlay_meta["kind"] == "json"
+    assert overlay_meta["metadata"]["overlay_type"] == "classification"
+    assert overlay_meta["metadata"]["target_artifact_id"] == "source_rgb_image"

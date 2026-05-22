@@ -17,6 +17,9 @@ class FileReferences(BaseModel):
     rgb: str | None = None
     rgb_video: str | None = None
     laser_rgb: str | None = None
+    raw_upload: str | None = None
+    parser_metadata: str | None = None
+    heightmap_preview: str | None = None
 
 
 class FrameSetAssets(BaseModel):
@@ -83,6 +86,7 @@ class AcquisitionMetadata(BaseModel):
     frame_count: int = Field(ge=1)
     modalities: list[CaptureModality] = Field(default_factory=list)
     session_id: str | None = None
+    acquisition_group_id: str | None = None
     frameset: FrameSet | None = None
     files: FileReferences
     units: Units = Field(default_factory=Units)

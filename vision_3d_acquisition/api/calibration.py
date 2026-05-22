@@ -23,7 +23,13 @@ from vision_3d_acquisition.calibration.calibration_models import (
     PlaneLabel,
     SystemCalibration,
 )
-from vision_3d_acquisition.calibration.camera_2d import aruco_runtime_diagnostics, calibrate_from_detections, detect_target_in_image
+from vision_3d_acquisition.calibration.camera_2d import (
+    aruco_runtime_diagnostics,
+    calibrate_from_detections,
+    detect_target_in_image,
+    image_diagnostics,
+    test_charuco_dictionaries,
+)
 from vision_3d_acquisition.calibration.charuco import generate_charuco_board, save_charuco_pdf, save_charuco_png
 from vision_3d_acquisition.calibration.compatibility import evaluate_calibration_compatibility, pick_recommended_calibration
 from vision_3d_acquisition.calibration.calibration_storage import (
@@ -61,7 +67,9 @@ class Refresh2DSourceRequest(BaseModel):
 
 
 class Detect2DCornersRequest(BaseModel):
-    capture_ids: list[str]
+    capture_ids: list[str] = []
+    capture_id: str | None = None
+    detect_all: bool = False
     target: Camera2DTargetConfig
 
 
@@ -78,6 +86,7 @@ class Save2DCalibrationRequest(BaseModel):
     target: Camera2DTargetConfig
     intrinsics: Camera2DIntrinsics
     belt_plane: Camera2DBeltPlane
+    camera_runtime_settings: dict[str, float | bool | None] | None = None
 
 
 class GenerateCharucoTargetRequest(BaseModel):
@@ -86,6 +95,9 @@ class GenerateCharucoTargetRequest(BaseModel):
     square_length_mm: float = 25.0
     marker_length_mm: float = 18.0
     dictionary: str = "DICT_4X4_50"
+
+
+SUPPORTED_CHARUCO_DICTIONARIES = ["DICT_4X4_50", "DICT_4X4_100", "DICT_5X5_50", "DICT_5X5_100", "DICT_6X6_250"]
 
 
 @router.get("/reference-takes")
@@ -203,7 +215,7 @@ def capture_2d_frame(request: Capture2DFrameRequest, settings: ApiSettings = Dep
     }
     _capture_record_path(settings, capture_id).write_text(_json(capture_record), encoding="utf-8")
     _update_preview_from_capture(settings, request.source_id, frame)
-    return {
+    payload = {
         "capture_id": capture_id,
         "image_path": str(capture_image_path),
         "timestamp": capture_record["timestamp"],
@@ -219,6 +231,8 @@ def capture_2d_frame(request: Capture2DFrameRequest, settings: ApiSettings = Dep
         "direct_capture_success": bool(acquired.get("direct_capture_success", False)),
         "image_url": _capture_image_url(capture_id),
     }
+    payload["image_diagnostics"] = image_diagnostics(frame)
+    return payload
 
 
 @router.get("/camera-2d/captures")
@@ -253,10 +267,15 @@ def refresh_2d_source(request: Refresh2DSourceRequest, settings: ApiSettings = D
 
 @router.post("/camera-2d/detect-corners")
 def detect_2d_corners(request: Detect2DCornersRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
-    if not request.capture_ids:
-        raise HTTPException(status_code=400, detail="capture_ids must not be empty")
+    capture_ids = list(request.capture_ids)
+    if request.capture_id and request.capture_id not in capture_ids:
+        capture_ids = [request.capture_id]
+    if request.detect_all and not capture_ids:
+        capture_ids = [str(item.get("id")) for item in _list_capture_records(settings) if str(item.get("id") or "")]
+    if not capture_ids:
+        raise HTTPException(status_code=400, detail="capture_id or capture_ids must not be empty")
     detections: list[dict[str, Any]] = []
-    for capture_id in request.capture_ids:
+    for capture_id in capture_ids:
         record = _load_capture_record(settings, capture_id)
         image_path = str(record.get("image_path") or "")
         if not image_path:
@@ -269,13 +288,34 @@ def detect_2d_corners(request: Detect2DCornersRequest, settings: ApiSettings = D
             continue
         debug_path = Path(image_path).with_name(f"{Path(image_path).stem}_corners.png")
         cv2.imwrite(str(debug_path), detection.debug_image)
+        debug_capture_path = Path(image_path).with_name(f"{Path(image_path).stem}_capture_debug.png")
+        cv2.imwrite(str(debug_capture_path), detection.debug_image)
+        threshold_path = Path(image_path).with_name(f"{Path(image_path).stem}_threshold.png")
+        image_color = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if gray is not None:
+            threshold = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+            cv2.imwrite(str(threshold_path), threshold)
         record["detected_corners"] = {
             "corners_found": detection.corners_found,
             "corner_count": detection.corner_count,
             "debug_image_path": str(debug_path),
+            "debug_image_url": _capture_debug_image_url(capture_id),
+            "threshold_image_path": str(threshold_path),
+            "threshold_image_url": _capture_threshold_image_url(capture_id),
             "detected_at": datetime.now(UTC).isoformat(),
+            "dictionary_name": request.target.dictionary,
+            "marker_count": detection.marker_count,
+            "marker_ids": detection.marker_ids or [],
+            "charuco_corner_count": detection.corner_count,
+            "api_mode": detection.api_mode,
+            "sharpness": detection.sharpness,
+            "board_coverage": detection.board_coverage,
+            "failure_reason": detection.failure_reason,
+            "image_diagnostics": image_diagnostics(image_color) if image_color is not None else {},
         }
         record["target_type"] = request.target.type
+        record["dictionary_name"] = request.target.dictionary
         _capture_record_path(settings, capture_id).write_text(_json(record), encoding="utf-8")
         detections.append(
             {
@@ -286,11 +326,20 @@ def detect_2d_corners(request: Detect2DCornersRequest, settings: ApiSettings = D
                 "corners_found": detection.corners_found,
                 "corner_count": detection.corner_count,
                 "marker_count": detection.marker_count,
+                "marker_ids": detection.marker_ids or [],
+                "rejected_count": detection.rejected_count,
                 "charuco_corner_count": detection.corner_count,
                 "api_mode": detection.api_mode,
                 "image_width": detection.image_width,
                 "image_height": detection.image_height,
                 "debug_image_path": str(debug_path),
+                "debug_image_url": _capture_debug_image_url(capture_id),
+                "threshold_image_url": _capture_threshold_image_url(capture_id),
+                "dictionary_name": request.target.dictionary,
+                "sharpness": detection.sharpness,
+                "board_coverage": detection.board_coverage,
+                "failure_reason": detection.failure_reason,
+                "image_diagnostics": record["detected_corners"].get("image_diagnostics"),
                 "warnings": detection.warnings,
             }
         )
@@ -314,7 +363,23 @@ def detect_2d_corners(request: Detect2DCornersRequest, settings: ApiSettings = D
 
 @router.get("/camera-2d/aruco-diagnostics")
 def camera_2d_aruco_diagnostics() -> dict[str, Any]:
-    return aruco_runtime_diagnostics()
+    payload = aruco_runtime_diagnostics()
+    payload["supported_dictionaries"] = SUPPORTED_CHARUCO_DICTIONARIES
+    return payload
+
+
+@router.post("/camera-2d/test-dictionaries")
+def camera_2d_test_dictionaries(request: Detect2DCornersRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    capture_id = request.capture_id or (request.capture_ids[0] if request.capture_ids else None)
+    if not capture_id:
+        raise HTTPException(status_code=400, detail="capture_id required")
+    record = _load_capture_record(settings, capture_id)
+    image_path = Path(str(record.get("image_path") or ""))
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Capture image not found")
+    rows = test_charuco_dictionaries(image_path, request.target, SUPPORTED_CHARUCO_DICTIONARIES)
+    best = rows[0] if rows else None
+    return {"capture_id": capture_id, "results": rows, "best_candidate": best}
 
 
 @router.post("/camera-2d/calibrate")
@@ -364,6 +429,7 @@ def save_2d_calibration(request: Save2DCalibrationRequest) -> dict[str, str]:
         target=request.target,
         intrinsics=request.intrinsics,
         belt_plane=request.belt_plane,
+        camera_runtime_settings=request.camera_runtime_settings,
         created_at=datetime.now(UTC),
     )
     path = save_calibration(calibration)
@@ -374,7 +440,7 @@ def save_2d_calibration(request: Save2DCalibrationRequest) -> dict[str, str]:
 def generate_charuco_target(
     request: GenerateCharucoTargetRequest,
     settings: ApiSettings = Depends(get_settings),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     output_dir = settings.data_dir / "calibration" / "targets"
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"charuco_{request.squares_x}x{request.squares_y}_{int(round(request.square_length_mm))}mm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -389,7 +455,17 @@ def generate_charuco_target(
     )
     save_charuco_png(png_path, image)
     save_charuco_pdf(pdf_path, image)
-    return {"png_path": str(png_path), "pdf_path": str(pdf_path)}
+    return {
+        "png_path": str(png_path),
+        "pdf_path": str(pdf_path),
+        "squares_x": request.squares_x,
+        "squares_y": request.squares_y,
+        "square_length_mm": request.square_length_mm,
+        "marker_length_mm": request.marker_length_mm,
+        "dictionary_name": request.dictionary,
+        "generated_file_path": str(pdf_path),
+        "printable_size_mm": [float(request.squares_x) * float(request.square_length_mm), float(request.squares_y) * float(request.square_length_mm)],
+    }
 
 
 @router.get("/list")
@@ -555,6 +631,46 @@ def _public_capture_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _capture_image_url(capture_id: str) -> str:
     return f"/api/calibration/camera-2d/captures/{capture_id}/image"
+
+
+def _capture_debug_image_url(capture_id: str) -> str:
+    return f"/api/calibration/camera-2d/captures/{capture_id}/debug-image"
+
+
+def _capture_threshold_image_url(capture_id: str) -> str:
+    return f"/api/calibration/camera-2d/captures/{capture_id}/threshold-image"
+
+
+@router.get("/camera-2d/captures/{capture_id}/debug-image")
+def capture_2d_debug_image(capture_id: str, settings: ApiSettings = Depends(get_settings)) -> FileResponse:
+    record = _load_capture_record(settings, capture_id)
+    detected = record.get("detected_corners") if isinstance(record.get("detected_corners"), dict) else {}
+    debug_path = Path(str(detected.get("debug_image_path") or ""))
+    if not debug_path.is_file():
+        raise HTTPException(status_code=404, detail={"code": "NO_PREVIEW_FRAME_AVAILABLE", "message": f"Debug image missing: {capture_id}"})
+    base = _captures_dir(settings).resolve()
+    resolved = debug_path.resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail={"code": "SOURCE_NOT_AVAILABLE", "message": "Debug image path is outside calibration captures directory"}) from exc
+    return FileResponse(resolved, media_type="image/png")
+
+
+@router.get("/camera-2d/captures/{capture_id}/threshold-image")
+def capture_2d_threshold_image(capture_id: str, settings: ApiSettings = Depends(get_settings)) -> FileResponse:
+    record = _load_capture_record(settings, capture_id)
+    detected = record.get("detected_corners") if isinstance(record.get("detected_corners"), dict) else {}
+    threshold_path = Path(str(detected.get("threshold_image_path") or ""))
+    if not threshold_path.is_file():
+        raise HTTPException(status_code=404, detail={"code": "NO_PREVIEW_FRAME_AVAILABLE", "message": f"Threshold image missing: {capture_id}"})
+    base = _captures_dir(settings).resolve()
+    resolved = threshold_path.resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail={"code": "SOURCE_NOT_AVAILABLE", "message": "Threshold image path is outside calibration captures directory"}) from exc
+    return FileResponse(resolved, media_type="image/png")
 
 
 def _acquire_fresh_source_frame(source_id: str, settings: ApiSettings) -> Any:

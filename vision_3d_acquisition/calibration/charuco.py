@@ -34,7 +34,14 @@ def generate_charuco_board(
     px_per_mm: float = 6.0,
 ) -> np.ndarray:
     aruco = _aruco_module()
-    board = aruco.CharucoBoard((int(squares_x), int(squares_y)), float(square_length_mm), float(marker_length_mm), _dictionary_by_name(dictionary))
+    dictionary_obj = _dictionary_by_name(dictionary)
+    if hasattr(aruco, "CharucoBoard"):
+        board = aruco.CharucoBoard((int(squares_x), int(squares_y)), float(square_length_mm), float(marker_length_mm), dictionary_obj)
+    else:
+        creator = getattr(aruco, "CharucoBoard_create", None)
+        if not callable(creator):
+            raise RuntimeError("ChArUco board creation unavailable in this OpenCV build.")
+        board = creator(int(squares_x), int(squares_y), float(square_length_mm), float(marker_length_mm), dictionary_obj)
     width_px = max(32, int(round(squares_x * square_length_mm * px_per_mm)))
     height_px = max(32, int(round(squares_y * square_length_mm * px_per_mm)))
     image = board.generateImage((width_px, height_px), marginSize=max(0, int(margin_px)), borderBits=1)

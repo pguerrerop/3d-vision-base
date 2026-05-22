@@ -32,6 +32,17 @@ class PlaneCalibration(BaseModel):
     roi_polygon_xy_mm: list[tuple[float, float]] = Field(default_factory=list)
 
 
+class HeightmapCalibration(BaseModel):
+    x_resolution_mm: float = Field(gt=0)
+    y_resolution_mm: float = Field(gt=0)
+    z_scale: float = 1.0
+    z_offset: float = 0.0
+    coordinate_system: str = "sensor_xy_z_mm"
+    tilt_correction: dict[str, float] | None = None
+    belt_reference_plane: tuple[float, float, float, float] | None = None
+    roi: dict[str, object] | None = None
+
+
 class Camera2DTargetConfig(BaseModel):
     type: Camera2DTargetType = "charuco"
     squares_x: int = Field(default=7, ge=2)
@@ -39,6 +50,20 @@ class Camera2DTargetConfig(BaseModel):
     square_length_mm: float = Field(default=25.0, gt=0)
     marker_length_mm: float = Field(default=18.0, gt=0)
     dictionary: str = "DICT_4X4_50"
+
+    @field_validator("dictionary")
+    @classmethod
+    def validate_dictionary(cls, value: str) -> str:
+        allowed = {"DICT_4X4_50", "DICT_4X4_100", "DICT_5X5_50", "DICT_5X5_100", "DICT_6X6_250"}
+        if value not in allowed:
+            raise ValueError(f"Unsupported dictionary: {value}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_board_dimensions(self) -> "Camera2DTargetConfig":
+        if self.marker_length_mm >= self.square_length_mm:
+            raise ValueError("marker_length_mm must be smaller than square_length_mm")
+        return self
 
 
 class Camera2DIntrinsics(BaseModel):
@@ -66,12 +91,14 @@ class SystemCalibration(BaseModel):
     reference_take_id: str | None = None
     planes: list[PlaneCalibration] = Field(default_factory=list)
     object_filter: ObjectFilterConfig = Field(default_factory=ObjectFilterConfig)
+    heightmap: HeightmapCalibration | None = None
 
     # camera_2d payload
     source_id: str | None = None
     target: Camera2DTargetConfig | None = None
     intrinsics: Camera2DIntrinsics | None = None
     belt_plane: Camera2DBeltPlane | None = None
+    camera_runtime_settings: dict[str, float | bool | None] | None = None
 
     @field_validator("calibration_id")
     @classmethod

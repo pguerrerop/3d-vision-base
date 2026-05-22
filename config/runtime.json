@@ -1,0 +1,5 @@
+{
+  "default_calibration_file": "config/calibrations/belt_setup_2026_05_16_235739_2026-05-17T034808_001.json",
+  "require_calibration_for_demo": true,
+  "allow_auto_plane_without_calibration": true
+}

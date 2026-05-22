@@ -140,6 +140,50 @@ Suggested acceptance notes:
 - image viewer auto-centering to selected object is pending.
 - cross-run comparison UI remains a follow-up.
 
+## Segmentation preview tuning semantics (threshold controls)
+
+Implemented in this pass:
+
+- backend preview endpoint: `POST /api/pipelines/preview-segmentation`
+- payload: `take_id`, `pipeline_id`, `params.threshold`, `params.auto_threshold`, `params.invert`
+- uses process-service pipeline execution path and real threshold+morphology logic (no frontend-only pixel math)
+- preview artifacts include threshold mask, cleaned mask, segmentation overlay, and rejected-components overlay via existing artifact contract
+
+Preview override model:
+
+- preview params temporarily override threshold step behavior only:
+  - `mode=otsu` when `auto_threshold=true`
+  - `mode=fixed` + `value=<threshold>` when manual mode
+  - `invert=<bool>`
+- preview does not mutate saved recipe/pipeline instance configuration
+- saved recipe state changes only when user clicks `Apply to recipe` or `Apply + rerun`
+
+Frontend state split:
+
+- `persistedParams`: values currently stored in the threshold step config
+- `previewParams`: interactive values from slider/toggles
+- `dirtyPreviewState`: whether preview params diverge from persisted params
+
+UX behavior:
+
+- slider range: `0..255`
+- slider + numeric input are synchronized
+- `Auto (Otsu)` disables manual threshold value editing
+- preview requests are debounced (`~320ms`) to keep UI responsive and avoid unnecessary full reruns
+- `Preview` triggers immediate preview call
+- `Apply to recipe` persists threshold params only
+- `Apply + rerun` persists params then runs selected pipeline
+
+Future extensibility strategy:
+
+- controls panel is parameter-group oriented (not threshold-only widget logic)
+- backend preview contract already accepts structured `params` object and can be extended for:
+  - blur kernel
+  - morphology operation/kernel
+  - min component area
+  - ROI toggles
+  - adaptive threshold parameters
+
 ## Roadmap to production recipe
 
 1. unify process-run artifacts into a richer explorer route with direct image rendering and compare mode

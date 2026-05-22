@@ -73,10 +73,10 @@ Freshness threshold for calibration preview is 5 seconds. Stale previews are exp
 2D calibration capture flow:
 
 1. Select source from discovered list.
-2. If preview is stale, user is prompted to refresh.
-3. Refresh frame captures a new preview frame from the source when supported.
-4. Capture calibration frame persists only after freshness checks.
-5. Detect corners and calibrate remain disabled until at least one fresh capture exists and target parameters are valid.
+2. Capture calibration frame (primary action) acquires a fresh frame directly from source.
+3. Preview-cache fallback is secondary only and must satisfy freshness threshold.
+4. Detect corners runs on selected capture by default (`Detect all captures` is explicit secondary action).
+5. Calibrate remains gated by successful corner detections, not preview freshness.
 
 ## Capture-first 2D workflow (Option A)
 
@@ -94,4 +94,46 @@ Captured frames are persisted under:
 
 - `data/calibration/captures/`
 
-Each capture stores source id, timestamp, image path, resolution, freshness flag, and corner-detection metadata.
+Each capture stores source id, timestamp, image path, resolution, freshness flag, and corner-detection metadata, including dictionary used and detection diagnostics.
+
+Supported ChArUco dictionaries:
+
+- `DICT_4X4_50`
+- `DICT_4X4_100`
+- `DICT_5X5_50`
+- `DICT_5X5_100`
+- `DICT_6X6_250`
+
+## Camera runtime controls (calibration tuning)
+
+2D Camera tab now exposes runtime camera controls for USB sources:
+
+- auto exposure + exposure
+- auto focus + focus
+- gain, brightness
+- contrast, sharpness, saturation, white balance (when supported)
+
+API:
+
+- `GET /api/sources/{source_id}/controls`
+- `POST /api/sources/{source_id}/controls`
+
+Unsupported controls degrade gracefully and are shown as unavailable.
+
+Calibration persistence includes `camera_runtime_settings` so imaging conditions used during calibration can be restored later.
+
+## Modal architecture refactor
+
+2D Camera calibration UX is now split into three responsibilities:
+
+- Main Calibration Manager page: calibration assets, active/default assignment, summary metrics.
+- Camera Controls modal: realtime MJPEG stream, runtime camera tuning, snapshot capture.
+- ChArUco Calibration modal: board config, detection/debug overlays, calibration solve/save.
+
+Realtime viewing is moved out of the manager page to reduce stale/live preview confusion.
+
+MJPEG endpoint:
+
+- `GET /api/runtime/stream/mjpeg?source_id=<id>&fps=<n>`
+
+This stream is intended for low-latency operator tuning (5–15 FPS initial target), while calibration continues to be capture-first over persisted snapshots.

@@ -8,8 +8,10 @@ from pydantic import ValidationError
 
 from vision_3d_acquisition.api.schemas import RuntimeState, TakeDetail, TakeSummary
 from vision_3d_acquisition.api.settings import ApiSettings
+from vision_3d_acquisition.acquisition.processing_status import read_status as read_acquisition_processing_status
 from vision_3d_acquisition.contracts.artifacts import normalize_processing_artifacts
 from vision_3d_acquisition.contracts.execution import build_pipeline_execution_trace
+from vision_3d_acquisition.contracts.object_candidates import normalize_object_candidates
 from vision_3d_acquisition.contracts.modalities import assets_by_modality, infer_modalities
 from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.pipelines.registry import build_stage_outputs_from_artifacts, default_pipeline_info
@@ -78,6 +80,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     profiling_summary = poc_summary.get("profiling") if isinstance(poc_summary, dict) else {}
     warnings = poc_summary.get("warnings") if isinstance(poc_summary, dict) else []
     modalities = result.get("input_modalities") or infer_modalities(metadata, incoming_dir)
+    modality_labels = _modality_labels(modalities, metadata)
     assets = assets_by_modality(metadata, incoming_dir)
     frameset = metadata.get("frameset") if isinstance(metadata.get("frameset"), dict) else None
     frame_count = (frameset or {}).get("frame_count") or metadata.get("frame_count")
@@ -107,6 +110,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     process_entries = process_entries_for_take(settings.data_dir, take_id)
     if process_entries:
         latest_run_status = str(sorted(process_entries, key=lambda item: str(item.get("created_at") or ""), reverse=True)[0].get("status") or "")
+    acquisition_processing = read_acquisition_processing_status(settings.data_dir, take_id)
     return TakeSummary(
         take_id=take_id,
         status=status,
@@ -125,6 +129,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         calibration_file=result.get("calibration_file"),
         calibration_resolution_source=result.get("calibration_resolution_source"),
         modalities=modalities,
+        modality_labels=modality_labels,
         assets=assets,
         frame_count=int(frame_count) if frame_count else None,
         frameset=frameset,
@@ -134,6 +139,10 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         processing_by_family=processing_by_family,
         friendly_name=str(take_management.get("friendly_name") or take_id),
         tags=[str(item) for item in (take_management.get("tags") or []) if str(item)],
+        semantic_labels=[str(item) for item in (take_management.get("semantic_labels") or []) if str(item)],
+        superclass_labels=[str(item) for item in (take_management.get("superclass_labels") or []) if str(item)],
+        normalized_class=(str(take_management.get("normalized_class")) if take_management.get("normalized_class") is not None else None),
+        normalization_version=(str(take_management.get("normalization_version")) if take_management.get("normalization_version") is not None else None),
         validation_status=str(take_management.get("validation_status") or "unreviewed"),
         expected_class=(str(take_management.get("expected_class")) if take_management.get("expected_class") is not None else None),
         expected_diameter_mm=float(take_management["expected_diameter_mm"]) if isinstance(take_management.get("expected_diameter_mm"), (int, float)) else None,
@@ -143,6 +152,8 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         experiment_session_id=(str(experiment_session_id) if experiment_session_id else None),
         experiment_session_name=experiment_session_name,
         latest_run_status=latest_run_status,
+        archived=bool(take_management.get("archived")),
+        acquisition_processing_status=acquisition_processing,
     )
 
 
@@ -152,7 +163,10 @@ def list_takes(
     dataset_id: str | None = None,
     validation_status: str | None = None,
     tag: str | None = None,
+    semantic_label: str | None = None,
+    superclass_label: str | None = None,
     search: str | None = None,
+    include_archived: bool = False,
 ) -> list[TakeSummary]:
     takes = [get_take_summary(settings, take_id) for take_id in list_take_ids(settings)]
     if session_id:
@@ -163,9 +177,22 @@ def list_takes(
         takes = [take for take in takes if (take.validation_status or "").lower() == validation_status.lower()]
     if tag:
         takes = [take for take in takes if tag.lower() in {item.lower() for item in (take.tags or [])}]
+    if semantic_label:
+        takes = [take for take in takes if semantic_label.lower() in {item.lower() for item in (take.semantic_labels or [])}]
+    if superclass_label:
+        takes = [take for take in takes if superclass_label.lower() in {item.lower() for item in (take.superclass_labels or [])}]
     if search:
         q = search.lower()
         takes = [take for take in takes if q in take.take_id.lower() or q in (take.friendly_name or "").lower()]
+    if not include_archived:
+        dataset_service = DatasetService(settings.data_dir)
+        visible: list[TakeSummary] = []
+        for take in takes:
+            meta = dataset_service.load_take_metadata(take_id=take.take_id, source_metadata={})
+            if bool(meta.get("archived")):
+                continue
+            visible.append(take)
+        takes = visible
     return sorted(takes, key=lambda item: item.created_at or item.take_id, reverse=True)
 
 
@@ -204,8 +231,10 @@ def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
                 result_status=result.get("status"),
                 result_error=result.get("error"),
             )
+        result["object_candidates"] = normalize_object_candidates(result)
     labels = load_labels(settings.data_dir, take_id)
     modalities = (result or {}).get("input_modalities") or infer_modalities(metadata, settings.incoming_dir / take_id)
+    modality_labels = _modality_labels(modalities, metadata if isinstance(metadata, dict) else {})
     assets = assets_by_modality(metadata, settings.incoming_dir / take_id)
     frameset = metadata.get("frameset") if isinstance(metadata, dict) and isinstance(metadata.get("frameset"), dict) else None
     frame_count = (frameset or {}).get("frame_count") or (metadata or {}).get("frame_count")
@@ -227,6 +256,7 @@ def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
         result=result,
         labels=labels,
         modalities=modalities,
+        modality_labels=modality_labels,
         assets=assets,
         frame_count=int(frame_count) if frame_count else None,
         frameset=frameset,
@@ -237,6 +267,7 @@ def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
         take_metadata=take_management,
         run_history=_take_run_history(settings, take_id, result),
         object_annotations=matched_annotations,
+        acquisition_processing_status=summary.acquisition_processing_status,
     )
 
 
@@ -303,7 +334,49 @@ def _process_run_take_result(settings: ApiSettings, take_id: str) -> dict[str, A
         "error": None if str(run.get("status") or "") in {"success", "warning", "completed"} else "process_service_run_failed",
         "artifacts": artifacts,
         "processing_pipeline": default_pipeline_info("mining_steel_ball_classification_2d"),
+        "run_id": run_id,
     }
+    classification_artifact = next((item for item in artifacts if str(item.get("artifact_id") or "") in {"classification_result", "classification_result_artifact"}), None)
+    classification_meta = (classification_artifact or {}).get("metadata") if isinstance(classification_artifact, dict) else None
+    classification_entries = []
+    if isinstance(classification_meta, dict) and isinstance(classification_meta.get("entries"), list):
+        classification_entries = [entry for entry in classification_meta["entries"] if isinstance(entry, dict)]
+    mapped_objects: list[dict[str, Any]] = []
+    for entry in classification_entries:
+        object_id = int(entry.get("object_id") or 0)
+        geometry = entry.get("geometry") if isinstance(entry.get("geometry"), dict) else {}
+        mapped_objects.append(
+            {
+                "object_id": object_id,
+                "class_name": str(entry.get("class_label") or "unknown"),
+                "subclass_label": entry.get("subclass_label"),
+                "confidence": entry.get("confidence"),
+                "point_count": None,
+                "center_mm": None,
+                "dimensions_mm": None,
+                "diameter_estimate_mm": None,
+                "diameter_mm": None,
+                "sphericity_score": geometry.get("circularity"),
+                "fit_rmse_mm": entry.get("fit_rmse"),
+                "height_above_belt_mm": None,
+                "fraction_points_inside_belt": None,
+                "filter_status": "kept",
+                "filter_reason": None,
+                "artifact_ids": [],
+                "source_candidate_id": entry.get("source_candidate_id"),
+                "decision_reasons": entry.get("decision_reasons"),
+                "geometry": geometry,
+            }
+        )
+    result["objects"] = mapped_objects
+    if isinstance(classification_meta, dict):
+        result["classification_diagnostics"] = {
+            "candidates_from_ellipse_fitting": int(classification_meta.get("candidates_from_ellipse_fitting") or 0),
+            "candidates_classified": int(classification_meta.get("candidates_classified") or 0),
+            "skipped_reason": classification_meta.get("skipped_reason"),
+        }
+    if isinstance(result.get("summary"), dict):
+        result["summary"]["object_count"] = len(mapped_objects)
     step_reports = run.get("step_reports")
     if isinstance(step_reports, list):
         total = 0.0
@@ -340,6 +413,7 @@ def _process_run_take_result(settings: ApiSettings, take_id: str) -> dict[str, A
         result_error=result.get("error"),
     )
     result["stage_outputs"] = build_stage_outputs_from_artifacts(artifacts)
+    result["object_candidates"] = normalize_object_candidates(result)
     return result
 
 
@@ -436,16 +510,23 @@ def _take_thumbnail_path(
     metadata: dict[str, Any],
     result: dict[str, Any],
 ) -> str | None:
+    files = metadata.get("files") if isinstance(metadata.get("files"), dict) else {}
+    height_preview = files.get("heightmap_preview")
+    if isinstance(height_preview, str) and height_preview:
+        return height_preview
     assets = assets_by_modality(metadata, settings.incoming_dir / take_id)
-    for modality in ("rgb", "reflectance", "laser_rgb"):
+    for modality in ("reflectance", "rgb", "laser_rgb"):
         group = assets.get(modality)
         if isinstance(group, dict):
             for filename in group.values():
                 if filename:
                     return str(filename)
-    files = result.get("files") if isinstance(result.get("files"), dict) else {}
-    for key in ("overlay", "debug_segmentation", "debug_plane_segmentation"):
-        candidate = files.get(key)
+    result_files = result.get("files") if isinstance(result.get("files"), dict) else {}
+    raw_upload = files.get("raw_upload")
+    if isinstance(raw_upload, str) and raw_upload:
+        return raw_upload
+    for key in ("height_segmentation_overlay", "segmentation_overlay", "overlay", "debug_segmentation", "debug_plane_segmentation"):
+        candidate = result_files.get(key)
         if isinstance(candidate, str) and candidate:
             return candidate
     return None
@@ -531,3 +612,15 @@ def _extract_take_candidates(result: dict[str, Any] | None) -> list[dict[str, An
         seen.add(key)
         unique.append(row)
     return unique
+
+
+def _modality_labels(modalities: list[str], metadata: dict[str, Any]) -> list[str]:
+    source = metadata.get("source")
+    source_payload = source if isinstance(source, dict) else {}
+    labels: list[str] = []
+    for modality in modalities:
+        if modality == "heightmap" and str(source_payload.get("sensor") or "") == "trispector_2_5d":
+            labels.append("heightmap_2_5d")
+        else:
+            labels.append(modality)
+    return labels

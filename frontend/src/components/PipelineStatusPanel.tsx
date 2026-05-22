@@ -11,8 +11,8 @@ type Props = {
   onSelectPipeline?: (pipelineId: string) => void;
   pipelineSearch?: string;
   onPipelineSearchChange?: (value: string) => void;
-  pipelineFamilyFilter?: "all" | "2d" | "3d" | "generic";
-  onPipelineFamilyFilterChange?: (value: "all" | "2d" | "3d" | "generic") => void;
+  pipelineFamilyFilter?: "all" | "2d" | "3d" | "25d" | "fusion" | "generic";
+  onPipelineFamilyFilterChange?: (value: "all" | "2d" | "3d" | "25d" | "fusion" | "generic") => void;
   compact?: boolean;
 };
 
@@ -60,10 +60,12 @@ export default function PipelineStatusPanel({
           <div className="pipeline-selector-popover">
             <div className="pipeline-selector-toolbar">
               <input type="text" value={pipelineSearch} onChange={(event) => onPipelineSearchChange?.(event.target.value)} placeholder="Search pipelines..." />
-              <select value={pipelineFamilyFilter} onChange={(event) => onPipelineFamilyFilterChange?.(event.target.value as "all" | "2d" | "3d" | "generic")}>
+              <select value={pipelineFamilyFilter} onChange={(event) => onPipelineFamilyFilterChange?.(event.target.value as "all" | "2d" | "3d" | "25d" | "fusion" | "generic")}>
                 <option value="all">All</option>
                 <option value="2d">2D</option>
                 <option value="3d">3D</option>
+                <option value="25d">25D</option>
+                <option value="fusion">Fusion</option>
                 <option value="generic">Generic</option>
               </select>
             </div>

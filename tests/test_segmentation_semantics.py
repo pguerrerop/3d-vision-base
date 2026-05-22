@@ -104,6 +104,7 @@ def test_segmentation_artifacts_and_debug_payload(tmp_path: Path) -> None:
     payload = by_id["morphology_debug_json"]["metadata"]
     assert payload["stage"] == "segmentation"
     assert "threshold" in payload and "morphology" in payload and "roi" in payload and "artifacts" in payload
+    assert isinstance(payload.get("effective_params"), dict)
 
 
 def test_polygon_roi_masks_outside_polygon_and_metrics_are_coherent(tmp_path: Path) -> None:

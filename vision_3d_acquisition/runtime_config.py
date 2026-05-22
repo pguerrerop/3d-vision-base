@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 RUNTIME_CONFIG_PATH = Path("config/runtime.json")
@@ -23,6 +23,23 @@ class RuntimeConfig(BaseModel):
     default_calibration_file: str | None = None
     require_calibration_for_demo: bool = True
     allow_auto_plane_without_calibration: bool = True
+    runtime: "RuntimeProcessConfig" = Field(default_factory=lambda: RuntimeProcessConfig())
+
+
+class RuntimeTriSpectorFtpConfig(BaseModel):
+    enabled: bool = True
+    command: str = "python -m pyftpdlib -p 2121"
+    upload_dir: str = "data/acquisition/trispector_ftp/incoming"
+    poll_interval_sec: float = 1.0
+    stable_checks: int = 3
+    source_id: str = "trispector_ftp_0"
+    auth_mode: Literal["anonymous", "user_password"] = "anonymous"
+    username: str | None = None
+    password: str | None = None
+
+
+class RuntimeProcessConfig(BaseModel):
+    trispector_ftp: RuntimeTriSpectorFtpConfig = Field(default_factory=lambda: RuntimeTriSpectorFtpConfig())
 
 
 @dataclass(frozen=True)

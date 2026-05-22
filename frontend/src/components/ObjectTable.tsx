@@ -32,6 +32,7 @@ export default function ObjectTable({ objects, selectedObjectId = null, hoveredO
           <tr>
             <th>ID</th>
             <th>Class</th>
+            <th>Subclass</th>
             <th>Points</th>
             <th>Confidence</th>
             <th>Center (mm)</th>
@@ -57,6 +58,7 @@ export default function ObjectTable({ objects, selectedObjectId = null, hoveredO
             >
               <td>{objectDisplayId(object.object_id)}</td>
               <td>{object.class_name}</td>
+              <td>{object.subclass_label ?? "-"}</td>
               <td>{object.point_count?.toLocaleString() ?? "-"}</td>
               <td>{object.confidence == null ? "-" : `${Math.round(object.confidence * 100)}%`}</td>
               <td>{vector(object.center_mm)}</td>

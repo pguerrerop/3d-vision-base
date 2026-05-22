@@ -49,3 +49,37 @@ def test_processing_unit_registry_exposes_metadata() -> None:
     assert classification["display_name"] == "Ball classification"
     assert "overlay" in classification["produced_artifact_kinds"]
     assert classification["object_outputs"] is True
+
+
+def test_2d_segmentation_stage_exposes_parameter_schema() -> None:
+    pipeline = get_pipeline("mining_steel_ball_classification_2d")
+    assert pipeline is not None
+    segmentation = next(stage for stage in pipeline["stages"] if stage["id"] == "segmentation")
+    schema = segmentation.get("parameter_schema")
+    assert isinstance(schema, dict)
+    fields = schema.get("fields")
+    assert isinstance(fields, dict)
+    for key in ("threshold", "auto_threshold", "morph_op", "erode_kernel_size", "dilate_iterations", "min_area_px"):
+        assert key in fields
+
+
+def test_mining_rgb_pipeline_does_not_require_reflectance() -> None:
+    pipeline = get_pipeline("mining_steel_ball_classification_2d")
+    assert pipeline is not None
+    assert pipeline["required_modalities"] == ["rgb"]
+    for stage in pipeline["stages"]:
+        if stage["id"] in {"segmentation", "detection", "measurement", "classification"}:
+            assert stage["required_modalities"] == ["rgb"]
+
+
+def test_25d_pipeline_stage_order_exposes_plane_qa_split() -> None:
+    pipeline = get_pipeline("mining_steel_ball_classification_25d")
+    assert pipeline is not None
+    stage_ids = [stage["id"] for stage in pipeline["stages"]]
+    assert stage_ids[:4] == [
+        "input",
+        "detect_belt_plane",
+        "normalize_heights_to_plane",
+        "remove_belt_segment_objects",
+    ]
+    assert pipeline["composition"]["execution_order"][:4] == stage_ids[:4]

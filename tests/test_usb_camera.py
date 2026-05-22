@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vision_3d_acquisition.acquisition.usb_camera import capture_image, discover_cameras, record_video
+from vision_3d_acquisition.acquisition.usb_camera import apply_camera_controls, camera_controls_snapshot, capture_image, discover_cameras, record_video
 from vision_3d_acquisition.acquisition.preview import read_preview_metadata
 from vision_3d_acquisition.contracts.metadata import AcquisitionMetadata
 from vision_3d_acquisition.contracts.modalities import infer_modalities
@@ -64,6 +64,16 @@ class FakeCv2:
     FONT_HERSHEY_SIMPLEX = 0
     IMWRITE_JPEG_QUALITY = 1
     LINE_AA = 16
+    CAP_PROP_AUTO_EXPOSURE = 21
+    CAP_PROP_EXPOSURE = 15
+    CAP_PROP_AUTOFOCUS = 39
+    CAP_PROP_FOCUS = 28
+    CAP_PROP_GAIN = 14
+    CAP_PROP_BRIGHTNESS = 10
+    CAP_PROP_CONTRAST = 11
+    CAP_PROP_SHARPNESS = 20
+    CAP_PROP_SATURATION = 12
+    CAP_PROP_WHITE_BALANCE_BLUE_U = 17
 
     def __init__(self, opened: dict[int, bool] | None = None) -> None:
         self.opened = opened or {0: True}
@@ -178,3 +188,48 @@ def test_preview_metadata_reports_missing_and_stale(tmp_path: Path) -> None:
 
     stale = read_preview_metadata(tmp_path)
     assert stale["stale"] is True
+
+
+def test_camera_controls_snapshot_and_apply_roundtrip() -> None:
+    cv2 = FakeCv2({0: True})
+    snap = camera_controls_snapshot(0, cv2_module=cv2)
+    assert snap["backend"] == "FAKE"
+    assert snap["controls"]["exposure"]["supported"] is True
+    assert "readable" in snap["controls"]["exposure"]
+    assert "writable" in snap["controls"]["exposure"]
+    assert "backend_property" in snap["controls"]["exposure"]
+    assert "range_source" in snap["controls"]["exposure"]
+
+    applied = apply_camera_controls(0, {"exposure": {"value": -6, "auto": False}, "focus": {"value": 20, "auto": False}}, cv2_module=cv2)
+    assert applied["controls"]["exposure"]["supported"] is True
+    assert "applied" in applied
+
+
+def test_unsupported_controls_handled_gracefully() -> None:
+    class PartialCv2:
+        CAP_PROP_EXPOSURE = 15
+        CAP_PROP_FRAME_WIDTH = 3
+        CAP_PROP_FRAME_HEIGHT = 4
+        CAP_PROP_FPS = 5
+        FONT_HERSHEY_SIMPLEX = 0
+        IMWRITE_JPEG_QUALITY = 1
+        LINE_AA = 16
+
+        def __init__(self, opened: dict[int, bool] | None = None) -> None:
+            self.opened = opened or {0: True}
+
+        def VideoCapture(self, index: int) -> FakeCapture:
+            return FakeCapture(index, self.opened.get(index, False))
+
+    cv2 = PartialCv2({0: True})
+    snap = camera_controls_snapshot(0, cv2_module=cv2)
+    assert "gain" in snap["controls"]
+    assert snap["controls"]["gain"]["supported"] is False
+    assert snap["controls"]["gain"]["readable"] is False
+    assert snap["controls"]["gain"]["writable"] is False
+
+
+def test_apply_ignores_unsupported_controls_with_warning() -> None:
+    cv2 = FakeCv2({0: True})
+    applied = apply_camera_controls(0, {"unknown_control": {"value": 1}, "exposure": {"value": -5}}, cv2_module=cv2)
+    assert applied["controls"]["exposure"]["supported"] is True

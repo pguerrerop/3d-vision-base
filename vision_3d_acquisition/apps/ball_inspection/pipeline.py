@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 
 from vision_3d_acquisition.apps.ball_inspection.stages import (
@@ -45,6 +47,10 @@ def run_ball_inspection_flow(
     calibration_resolution_source: str | None = None,
     skip_debug_images: bool = False,
     prefer_fast_cloud: bool = True,
+    recipe_version_id: str | None = None,
+    source_id: str | None = None,
+    acquisition_group_id: str | None = None,
+    calibration_profile_id: str | None = None,
 ) -> BallInspectionResult:
     source = FileSource(data_dir)
     output_root = data_dir / "processed"
@@ -101,6 +107,13 @@ def run_ball_inspection_flow(
         engine="native",
     )
     result_payload = processing_result.model_dump(mode="json")
+    result_payload["recipe_version_id"] = recipe_version_id
+    result_payload["source_id"] = source_id
+    result_payload["acquisition_group_id"] = acquisition_group_id
+    result_payload["calibration_profile_id"] = calibration_profile_id
+    result_payload["config_snapshot_hash"] = hashlib.sha256(
+        json.dumps(config.__dict__, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     write_processing_outputs(
         data_dir,
         output_dir,

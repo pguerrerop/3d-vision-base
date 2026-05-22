@@ -9,13 +9,22 @@ import {
   type PipelineInstance,
   type ProcessTemplate,
   type RuntimeState,
+  type SegmentationPreviewResponse,
   type SessionSummary,
   type TakeDetail,
+  type FusionRunRecord,
+  type FusionRunResult,
+  type FusionInputBundle,
+  type FusionPreviewResult,
+  type InspectionPublishedResult,
+  type ProcessBinding,
+  type RuntimeWorkerStatus,
   type TakeSummary,
 } from "../api/client";
 import PipelineStatusPanel from "../components/PipelineStatusPanel";
 import PipelineExecutionGraph from "../components/PipelineExecutionGraph";
 import StudioInspector from "../components/StudioInspector";
+import StageParameterPanel from "../components/StageParameterPanel";
 import type { OverlayDebugInfo } from "../components/overlayModel";
 import {
   chooseBestPipelineForTake,
@@ -33,6 +42,7 @@ import { nextDatasetSelectionAfterCreate, nextSessionSelectionAfterCreate } from
 import { buildCapturePayload, captureDisabledReason, nextSelectedTakeAfterCapture } from "../components/captureWorkflowModel";
 
 type TakeFilter = "all" | "processed" | "unprocessed" | "warnings";
+type SegmentationTuningParams = Record<string, unknown>;
 
 export default function ProcessingLabPage() {
   const [takes, setTakes] = useState<TakeSummary[]>([]);
@@ -66,7 +76,7 @@ export default function ProcessingLabPage() {
   const [selectedPipelineInstanceId, setSelectedPipelineInstanceId] = useState<string>("");
   const [manualImagePath, setManualImagePath] = useState("");
   const [pipelineSearch, setPipelineSearch] = useState("");
-  const [pipelineFamilyFilter, setPipelineFamilyFilter] = useState<"all" | "2d" | "3d" | "generic">("all");
+  const [pipelineFamilyFilter, setPipelineFamilyFilter] = useState<"all" | "2d" | "3d" | "25d" | "fusion" | "generic">("all");
   const [lastUsedPipelineByTake, setLastUsedPipelineByTake] = useState<Record<string, string>>({});
   const [tabFallbackMessage, setTabFallbackMessage] = useState<string | null>(null);
   const [showDatasetCreate, setShowDatasetCreate] = useState(false);
@@ -87,15 +97,50 @@ export default function ProcessingLabPage() {
   const [captureNotes, setCaptureNotes] = useState("");
   const [captureLoading, setCaptureLoading] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [segmentationPreviewParams, setSegmentationPreviewParams] = useState<SegmentationTuningParams | null>(null);
+  const [segmentationPersistedParams, setSegmentationPersistedParams] = useState<SegmentationTuningParams | null>(null);
+  const [segmentationPreviewDirty, setSegmentationPreviewDirty] = useState(false);
+  const [segmentationPreview, setSegmentationPreview] = useState<SegmentationPreviewResponse | null>(null);
+  const [segmentationPreviewLoading, setSegmentationPreviewLoading] = useState(false);
+  const [segmentationPreviewError, setSegmentationPreviewError] = useState<string | null>(null);
+  const [ellipsePreviewParams, setEllipsePreviewParams] = useState<Record<string, unknown> | null>(null);
+  const [ellipsePersistedParams, setEllipsePersistedParams] = useState<Record<string, unknown> | null>(null);
+  const [ellipsePreviewDirty, setEllipsePreviewDirty] = useState(false);
+  const [ellipsePreviewLoading, setEllipsePreviewLoading] = useState(false);
+  const [ellipsePreviewError, setEllipsePreviewError] = useState<string | null>(null);
+  const [fusionInputs, setFusionInputs] = useState<FusionInputBundle | null>(null);
+  const [fusionPreview, setFusionPreview] = useState<FusionPreviewResult | null>(null);
+  const [fusionRuns, setFusionRuns] = useState<FusionRunRecord[]>([]);
+  const [latestFusionRun, setLatestFusionRun] = useState<FusionRunRecord | null>(null);
+  const [latestFusionResult, setLatestFusionResult] = useState<FusionRunResult | null>(null);
+  const [fusionLoading, setFusionLoading] = useState(false);
+  const [fusionError, setFusionError] = useState<string | null>(null);
+  const [runtimeWorkers, setRuntimeWorkers] = useState<RuntimeWorkerStatus[]>([]);
+  const [latestPublishedResult, setLatestPublishedResult] = useState<InspectionPublishedResult | null>(null);
+  const [processBindings, setProcessBindings] = useState<ProcessBinding[]>([]);
+  const [bindingPurpose, setBindingPurpose] = useState<"acquisition_inspection" | "fusion">("acquisition_inspection");
 
   const load = useCallback(async () => {
-    const [nextTakes, nextSessions, nextPipelines, nextRuntime, nextTemplates, nextInstances, nextDatasets] = await Promise.all([
+    const [
+      nextTakes,
+      nextSessions,
+      nextPipelines,
+      nextRuntime,
+      nextTemplates,
+      nextInstances,
+      nextDatasets,
+      nextWorkers,
+      nextBindings,
+      nextLatestPublished,
+    ] = await Promise.all([
       api.filteredTakes({
         session_id: selectedSession || undefined,
         dataset_id: selectedDataset || undefined,
         validation_status: validationFilter === "all" ? undefined : validationFilter,
         tag: tagFilter || undefined,
         search: takeSearch || undefined,
+        show_archived: showArchived,
       }),
       api.sessions(),
       api.pipelines(),
@@ -103,6 +148,9 @@ export default function ProcessingLabPage() {
       api.processTemplates(),
       api.pipelineInstances(),
       api.datasets(),
+      api.runtimeWorkers().catch(() => ({ workers: [] })),
+      api.processBindings().catch(() => [] as ProcessBinding[]),
+      api.latestPublishedInspectionResult().catch(() => null as InspectionPublishedResult | null),
     ]);
     const nextDatasetSessions = selectedDataset ? await api.datasetSessions(selectedDataset) : [];
     setTakes(nextTakes);
@@ -113,12 +161,15 @@ export default function ProcessingLabPage() {
     setRuntimeState(nextRuntime);
     setProcessTemplates(nextTemplates);
     setPipelineInstances(nextInstances);
+    setRuntimeWorkers(nextWorkers.workers ?? []);
+    setProcessBindings(nextBindings);
+    setLatestPublishedResult(nextLatestPublished);
     setSelectedPipelineInstanceId((current) => current || nextInstances[0]?.id || "");
     setSelectedPipelineId((current) => current || nextPipelines[0]?.id || "3d_ball_inspection");
     const nextTakeId = selectedTakeId || nextTakes[0]?.take_id || "";
     setSelectedTakeId(nextTakeId);
     setDetail(nextTakeId ? await api.take(nextTakeId) : null);
-  }, [selectedSession, selectedDataset, selectedTakeId, validationFilter, tagFilter, takeSearch]);
+  }, [selectedSession, selectedDataset, selectedTakeId, validationFilter, tagFilter, takeSearch, showArchived]);
 
   useEffect(() => {
     void load();
@@ -175,13 +226,10 @@ export default function ProcessingLabPage() {
     const fallbackLabel = stageTabs.find((tab) => tab.id === fallback)?.label ?? "default";
     setTabFallbackMessage(`Selected stage changed. Showing default view: ${fallbackLabel}.`);
   }, [activeTab, stageTabs, stageSemantic.defaultViewId, canonicalSelectedStageId]);
-  const allObjects = objectsForTake(detail);
-  const focusedObject = selectedObject(allObjects, selectedObjectId);
-  const allArtifacts = artifactsForStage(detail, canonicalSelectedStageId);
-  const currentArtifacts = artifactsForObject(allArtifacts, selectedObjectId);
-  const focusedArtifact = currentArtifacts.find((artifact) => artifact.artifact_id === selectedArtifactId) ?? currentArtifacts[0] ?? null;
   const templateById = useMemo(() => new Map(processTemplates.map((template) => [template.id, template])), [processTemplates]);
   const thresholdStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "threshold");
+  const morphologyStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "morphology");
+  const ellipseStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "ellipse_fitting");
   const blobStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "blob_detection");
   const roiEnabled = Boolean(thresholdStep?.params?.roi_enabled);
   const roiType = (String(thresholdStep?.params?.roi_type ?? "rectangle") === "polygon" ? "polygon" : "rectangle") as "rectangle" | "polygon";
@@ -197,10 +245,247 @@ export default function ProcessingLabPage() {
     ? (((thresholdStep?.params?.roi_polygon_points as Array<[number, number]> | undefined) ?? []).map((point) => [Number(point[0]), Number(point[1])] as [number, number]))
     : null;
   useEffect(() => {
+    if (!thresholdStep) {
+      setSegmentationPersistedParams(null);
+      setSegmentationPreviewParams(null);
+      setSegmentationPreviewDirty(false);
+      setSegmentationPreview(null);
+      return;
+    }
+    const mode = String(thresholdStep.params?.mode ?? thresholdStep.params?.threshold_mode ?? "fixed").toLowerCase();
+    const next: SegmentationTuningParams = {
+      threshold: Math.max(0, Math.min(255, Number(thresholdStep.params?.value ?? thresholdStep.params?.threshold_value ?? 125))),
+      auto_threshold: mode === "otsu",
+      invert: Boolean(thresholdStep.params?.invert),
+      roi_enabled: Boolean(thresholdStep.params?.roi_enabled),
+      morph_op: String(morphologyStep?.params?.morph_op ?? morphologyStep?.params?.operation ?? "open_close"),
+      erode_kernel_size: Number(morphologyStep?.params?.erode_kernel_size ?? morphologyStep?.params?.open_kernel ?? 3),
+      erode_iterations: Number(morphologyStep?.params?.erode_iterations ?? morphologyStep?.params?.iterations ?? 1),
+      dilate_kernel_size: Number(morphologyStep?.params?.dilate_kernel_size ?? morphologyStep?.params?.open_kernel ?? 3),
+      dilate_iterations: Number(morphologyStep?.params?.dilate_iterations ?? morphologyStep?.params?.iterations ?? 1),
+      close_kernel_size: Number(morphologyStep?.params?.close_kernel_size ?? morphologyStep?.params?.close_kernel ?? 5),
+      fill_holes: Boolean(morphologyStep?.params?.fill_holes ?? true),
+      min_area_px: Number(morphologyStep?.params?.min_area_px ?? morphologyStep?.params?.cleanup_min_area ?? 120),
+      max_area_px: morphologyStep?.params?.max_area_px ?? morphologyStep?.params?.cleanup_max_area ?? null,
+    };
+    setSegmentationPersistedParams(next);
+    setSegmentationPreviewParams(next);
+    setSegmentationPreviewDirty(false);
+    setSegmentationPreview(null);
+    setSegmentationPreviewError(null);
+  }, [selectedPipelineInstance?.id, thresholdStep?.params, morphologyStep?.params]);
+  useEffect(() => {
+    const schema = (selectedStage?.parameter_schema ?? {}) as { fields?: Record<string, { default?: unknown }> };
+    const defaults = Object.fromEntries(Object.entries(schema.fields ?? {}).map(([key, meta]) => [key, meta.default]));
+    const stepParams = ellipseStep?.params ?? {};
+    const next = {
+      ...defaults,
+      ...stepParams,
+      min_contour_points: stepParams.min_contour_points ?? stepParams.min_fit_points ?? defaults.min_contour_points,
+    };
+    setEllipsePersistedParams(next);
+    setEllipsePreviewParams(next);
+    setEllipsePreviewDirty(false);
+    setEllipsePreviewError(null);
+  }, [ellipseStep?.params, selectedStage?.parameter_schema]);
+
+  const previewEnabled = Boolean(
+    detail?.take_id
+    && selectedPipeline?.id
+    && selectedPipeline?.execution_backend === "process_service"
+    && thresholdStep
+    && segmentationPreviewParams
+  );
+  const activeAcquisitionGroupId = useMemo(() => {
+    const takeMeta = detail?.take_metadata as Record<string, unknown> | undefined;
+    const sourceMeta = detail?.metadata as Record<string, unknown> | undefined;
+    const fromTake = takeMeta?.acquisition_group_id;
+    if (typeof fromTake === "string" && fromTake) return fromTake;
+    const fromSource = sourceMeta?.acquisition_group_id;
+    if (typeof fromSource === "string" && fromSource) return fromSource;
+    return null;
+  }, [detail?.take_metadata, detail?.metadata]);
+  const selectedSourceId = useMemo(() => {
+    const sourceMeta = detail?.metadata as Record<string, unknown> | undefined;
+    const sourceFromMeta = sourceMeta?.source;
+    if (typeof sourceFromMeta === "string" && sourceFromMeta) return sourceFromMeta;
+    const sourceFromRuntime = runtimeState?.acquisition_source;
+    if (typeof sourceFromRuntime === "string" && sourceFromRuntime) return sourceFromRuntime;
+    return null;
+  }, [detail?.metadata, runtimeState?.acquisition_source]);
+  const selectedModalityForBinding = useMemo(() => {
+    if (bindingPurpose === "fusion") return "acquisition_group";
+    return detail?.modalities?.includes("rgb") ? "rgb" : detail?.modalities?.includes("heightmap") ? "heightmap" : "rgb";
+  }, [bindingPurpose, detail?.modalities]);
+  const selectedBindingSource = useMemo(() => {
+    if (bindingPurpose === "fusion") return activeAcquisitionGroupId || selectedSourceId;
+    return selectedSourceId;
+  }, [bindingPurpose, activeAcquisitionGroupId, selectedSourceId]);
+  const activeBinding = useMemo(() => {
+    if (!selectedBindingSource) return null;
+    return processBindings.find(
+      (binding) =>
+        binding.enabled
+        && binding.source_id === selectedBindingSource
+        && binding.modality === selectedModalityForBinding
+        && binding.purpose === bindingPurpose
+    ) ?? null;
+  }, [processBindings, selectedBindingSource, selectedModalityForBinding, bindingPurpose]);
+  const rgbWorkerStatus = useMemo(
+    () => runtimeWorkers.find((item) => item.worker_type.includes("rgb")) ?? null,
+    [runtimeWorkers]
+  );
+  const worker25dStatus = useMemo(
+    () => runtimeWorkers.find((item) => item.worker_type.includes("25d") || item.worker_type.includes("heightmap")) ?? null,
+    [runtimeWorkers]
+  );
+  const fusionWorkerStatus = useMemo(
+    () => runtimeWorkers.find((item) => item.worker_type.includes("fusion")) ?? null,
+    [runtimeWorkers]
+  );
+  useEffect(() => {
+    let active = true;
+    if (!activeAcquisitionGroupId) {
+      setFusionInputs(null);
+      setFusionPreview(null);
+      setFusionError(null);
+      return;
+    }
+    setFusionLoading(true);
+    setFusionError(null);
+    void Promise.all([
+      api.fusionInputs(activeAcquisitionGroupId),
+      api.fusionPreview(activeAcquisitionGroupId),
+      api.fusionRuns(activeAcquisitionGroupId),
+      api.latestFusionResult(activeAcquisitionGroupId),
+    ])
+      .then(([inputs, preview, runs, latest]) => {
+        if (!active) return;
+        setFusionInputs(inputs);
+        setFusionPreview(preview);
+        setFusionRuns(runs.runs ?? []);
+        setLatestFusionRun(latest.run ?? null);
+        setLatestFusionResult(latest.result ?? null);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setFusionInputs(null);
+        setFusionPreview(null);
+        setFusionRuns([]);
+        setLatestFusionRun(null);
+        setLatestFusionResult(null);
+        setFusionError(error instanceof Error ? error.message : "Failed to load fusion readiness.");
+      })
+      .finally(() => {
+        if (!active) return;
+        setFusionLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeAcquisitionGroupId]);
+  async function runFusionForGroup(force = false) {
+    if (!activeAcquisitionGroupId) return;
+    setFusionLoading(true);
+    setFusionError(null);
+    try {
+      const created = await api.createFusionRun(activeAcquisitionGroupId, { force });
+      const [runs, latest] = await Promise.all([
+        api.fusionRuns(activeAcquisitionGroupId),
+        api.latestFusionResult(activeAcquisitionGroupId),
+      ]);
+      setFusionRuns(runs.runs ?? []);
+      setLatestFusionRun(latest.run ?? null);
+      setLatestFusionResult(latest.result ?? created.result ?? null);
+    } catch (error) {
+      setFusionError(error instanceof Error ? error.message : "Fusion execution failed.");
+    } finally {
+      setFusionLoading(false);
+    }
+  }
+  async function publish25dForSelectedTake() {
+    if (!detail?.take_id) return;
+    setFusionLoading(true);
+    setFusionError(null);
+    try {
+      await api.publish25dResult(detail.take_id);
+      const latest = await api.latestPublishedInspectionResult().catch(() => null as InspectionPublishedResult | null);
+      setLatestPublishedResult(latest);
+    } catch (error) {
+      setFusionError(error instanceof Error ? error.message : "25D publish failed.");
+    } finally {
+      setFusionLoading(false);
+    }
+  }
+  const ellipsePreviewEnabled = Boolean(
+    detail?.take_id
+    && selectedPipeline?.id
+    && selectedPipeline?.execution_backend === "process_service"
+    && ellipsePreviewParams
+  );
+
+  const workspaceDetail = useMemo(() => {
+    if (!detail || !segmentationPreview || (canonicalSelectedStageId !== "segmentation" && canonicalSelectedStageId !== "ellipse_fitting")) return detail;
+    if (!detail.result) return detail;
+    return {
+      ...detail,
+      result: {
+        ...detail.result,
+        artifacts: segmentationPreview.artifacts,
+      },
+    };
+  }, [detail, segmentationPreview, canonicalSelectedStageId]);
+  const allObjects = objectsForTake(workspaceDetail);
+  const focusedObject = selectedObject(allObjects, selectedObjectId);
+  const allArtifacts = artifactsForStage(workspaceDetail, canonicalSelectedStageId);
+  const currentArtifacts = artifactsForObject(allArtifacts, selectedObjectId);
+  const focusedArtifact = currentArtifacts.find((artifact) => artifact.artifact_id === selectedArtifactId) ?? currentArtifacts[0] ?? null;
+  useEffect(() => {
     if (focusedArtifact?.object_id != null && focusedArtifact.object_id !== selectedObjectId) {
       setSelectedObjectId(focusedArtifact.object_id);
     }
-  }, [focusedArtifact?.artifact_id]);
+  }, [focusedArtifact?.artifact_id, selectedObjectId]);
+
+  useEffect(() => {
+    if (!previewEnabled || !segmentationPreviewDirty || !segmentationPreviewParams || !detail || !selectedPipeline) return;
+    const timer = window.setTimeout(() => {
+      setSegmentationPreviewLoading(true);
+      setSegmentationPreviewError(null);
+      void api.previewSegmentation({
+        take_id: detail.take_id,
+        pipeline_id: selectedPipeline.id,
+        params: segmentationPreviewParams,
+      }).then((response) => {
+        setSegmentationPreview(response);
+      }).catch((err: unknown) => {
+        setSegmentationPreviewError(err instanceof Error ? err.message : "Preview failed");
+      }).finally(() => {
+        setSegmentationPreviewLoading(false);
+      });
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [previewEnabled, segmentationPreviewDirty, segmentationPreviewParams, detail?.take_id, selectedPipeline?.id]);
+  useEffect(() => {
+    if (!ellipsePreviewEnabled || !ellipsePreviewDirty || !ellipsePreviewParams || !detail || !selectedPipeline) return;
+    if (canonicalSelectedStageId !== "ellipse_fitting") return;
+    const timer = window.setTimeout(() => {
+      setEllipsePreviewLoading(true);
+      setEllipsePreviewError(null);
+      void api.previewSegmentation({
+        take_id: detail.take_id,
+        pipeline_id: selectedPipeline.id,
+        stage_id: "ellipse_fitting",
+        params: ellipsePreviewParams,
+      }).then((response) => {
+        setSegmentationPreview(response);
+      }).catch((err: unknown) => {
+        setEllipsePreviewError(err instanceof Error ? err.message : "Preview failed");
+      }).finally(() => {
+        setEllipsePreviewLoading(false);
+      });
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [ellipsePreviewEnabled, ellipsePreviewDirty, ellipsePreviewParams, detail?.take_id, selectedPipeline?.id, canonicalSelectedStageId]);
   const filteredTakes = takes.filter((take) => {
     if (selectedExperimentSession && take.experiment_session_id !== selectedExperimentSession) return false;
     if (modalityFilter !== "all" && !(take.modalities ?? []).includes(modalityFilter)) return false;
@@ -377,6 +662,39 @@ export default function ProcessingLabPage() {
     setDetail(await api.take(detail.take_id));
   }
 
+  async function removeFromDataset() {
+    if (!detail) return;
+    await api.removeTakeFromDataset(detail.take_id);
+    await load();
+    setDetail(await api.take(detail.take_id));
+  }
+
+  async function archiveCurrentTake() {
+    if (!detail) return;
+    const reason = window.prompt("Archive reason (optional)", "");
+    await api.archiveTake(detail.take_id, reason);
+    await load();
+    setSelectedTakeId((current) => (current === detail.take_id ? "" : current));
+    setDetail(null);
+  }
+
+  async function restoreCurrentTake() {
+    if (!detail) return;
+    await api.restoreTake(detail.take_id);
+    await load();
+    setDetail(await api.take(detail.take_id));
+  }
+
+  async function permanentDeleteCurrentTake() {
+    if (!detail) return;
+    const confirmation = window.prompt(`Type the take id to permanently delete raw files, processed outputs, and linked metadata:\n${detail.take_id}`, "");
+    if (!confirmation) return;
+    await api.permanentDeleteTake(detail.take_id, confirmation, true);
+    await load();
+    setSelectedTakeId("");
+    setDetail(null);
+  }
+
   async function createDatasetInline() {
     if (!newDatasetName.trim()) return;
     setCreatingDataset(true);
@@ -537,6 +855,119 @@ export default function ProcessingLabPage() {
     }
   }
 
+  async function triggerSegmentationPreview() {
+    if (!previewEnabled || !detail || !selectedPipeline || !segmentationPreviewParams) return;
+    setSegmentationPreviewLoading(true);
+    setSegmentationPreviewError(null);
+    try {
+      const response = await api.previewSegmentation({
+        take_id: detail.take_id,
+        pipeline_id: selectedPipeline.id,
+        params: segmentationPreviewParams,
+      });
+      setSegmentationPreview(response);
+      setSegmentationPreviewDirty(false);
+    } catch (err) {
+      setSegmentationPreviewError(err instanceof Error ? err.message : "Preview failed");
+    } finally {
+      setSegmentationPreviewLoading(false);
+    }
+  }
+
+  async function applySegmentationParams(rerun = false) {
+    if (!selectedPipelineInstance || !segmentationPreviewParams) return;
+    const configured_steps = selectedPipelineInstance.configured_steps.map((step) => {
+      if (step.step_id === "threshold") {
+        return {
+          ...step,
+          params: {
+            ...step.params,
+            mode: Boolean(segmentationPreviewParams["auto_threshold"]) ? "otsu" : "fixed",
+            value: Number(segmentationPreviewParams["threshold"] ?? 125),
+            invert: Boolean(segmentationPreviewParams["invert"]),
+            roi_enabled: Boolean(segmentationPreviewParams["roi_enabled"]),
+          },
+        };
+      }
+      if (step.step_id === "morphology") {
+        const maxArea = segmentationPreviewParams["max_area_px"] == null || segmentationPreviewParams["max_area_px"] === ""
+          ? null
+          : Number(segmentationPreviewParams["max_area_px"]);
+        return {
+          ...step,
+          params: {
+            ...step.params,
+            morph_op: String(segmentationPreviewParams["morph_op"] ?? "open_close"),
+            operation: String(segmentationPreviewParams["morph_op"] ?? "open_close"),
+            erode_kernel_size: Number(segmentationPreviewParams["erode_kernel_size"] ?? 3),
+            erode_iterations: Number(segmentationPreviewParams["erode_iterations"] ?? 1),
+            dilate_kernel_size: Number(segmentationPreviewParams["dilate_kernel_size"] ?? 3),
+            dilate_iterations: Number(segmentationPreviewParams["dilate_iterations"] ?? 1),
+            close_kernel_size: Number(segmentationPreviewParams["close_kernel_size"] ?? 5),
+            fill_holes: Boolean(segmentationPreviewParams["fill_holes"] ?? true),
+            min_area_px: Number(segmentationPreviewParams["min_area_px"] ?? 120),
+            max_area_px: maxArea,
+            cleanup_min_area: Number(segmentationPreviewParams["min_area_px"] ?? 120),
+            cleanup_max_area: maxArea,
+          },
+        };
+      }
+      return step;
+    });
+    const next = await api.updatePipelineInstance(selectedPipelineInstance.id, { configured_steps });
+    setPipelineInstances((items) => items.map((item) => (item.id === next.id ? next : item)));
+    setSegmentationPersistedParams(segmentationPreviewParams);
+    setSegmentationPreviewDirty(false);
+    if (rerun && detail && selectedPipeline) {
+      await runSelectedPipeline(false);
+      setSegmentationPreview(null);
+    }
+  }
+
+  async function triggerEllipsePreview() {
+    if (!ellipsePreviewEnabled || !detail || !selectedPipeline || !ellipsePreviewParams) return;
+    setEllipsePreviewLoading(true);
+    setEllipsePreviewError(null);
+    try {
+      const response = await api.previewSegmentation({
+        take_id: detail.take_id,
+        pipeline_id: selectedPipeline.id,
+        stage_id: "ellipse_fitting",
+        params: ellipsePreviewParams,
+      });
+      setSegmentationPreview(response);
+      setEllipsePreviewDirty(false);
+    } catch (err) {
+      setEllipsePreviewError(err instanceof Error ? err.message : "Preview failed");
+    } finally {
+      setEllipsePreviewLoading(false);
+    }
+  }
+
+  async function applyEllipseParams(rerun = false) {
+    if (!selectedPipelineInstance || !ellipsePreviewParams) return;
+    const configured_steps = selectedPipelineInstance.configured_steps.map((step) =>
+      step.step_id === "ellipse_fitting"
+        ? { ...step, params: { ...step.params, ...ellipsePreviewParams } }
+        : step
+    );
+    const next = await api.updatePipelineInstance(selectedPipelineInstance.id, { configured_steps });
+    setPipelineInstances((items) => items.map((item) => (item.id === next.id ? next : item)));
+    setEllipsePersistedParams(ellipsePreviewParams);
+    setEllipsePreviewDirty(false);
+    if (rerun && detail && selectedPipeline) {
+      await runSelectedPipeline(false);
+      setSegmentationPreview(null);
+    }
+  }
+
+  function resetEllipseDefaults() {
+    const schema = (selectedStage?.parameter_schema ?? {}) as { fields?: Record<string, { default?: unknown }> };
+    const defaults = Object.fromEntries(Object.entries(schema.fields ?? {}).map(([key, meta]) => [key, meta.default]));
+    setEllipsePreviewParams(defaults);
+    setEllipsePreviewDirty(true);
+  }
+
   function renderStepParamEditor(step: PipelineInstance["configured_steps"][number]) {
     const template = selectedPipelineInstance ? templateById.get(selectedPipelineInstance.template_id) : null;
     const definition = template?.steps.find((item) => item.step_id === step.step_id);
@@ -578,6 +1009,12 @@ export default function ProcessingLabPage() {
         </label>
       );
     });
+  }
+
+  function workerBadgeLabel(worker: RuntimeWorkerStatus | null): string {
+    if (!worker) return "stopped";
+    if (worker.state === "running" && String(worker.last_event_summary ?? "").toLowerCase().includes("dry-run")) return "dry_run";
+    return worker.state;
   }
 
   return (
@@ -700,6 +1137,10 @@ export default function ProcessingLabPage() {
             <option value="needs_review">Needs review</option>
           </select>
         </label>
+        <label>
+          <input checked={showArchived} type="checkbox" onChange={(event) => setShowArchived(event.target.checked)} />
+          Show archived
+        </label>
         <div className="studio-filter-grid">
           <label className="field-label">
             Modality
@@ -727,7 +1168,9 @@ export default function ProcessingLabPage() {
               <strong>{take.friendly_name || take.take_id}</strong>
               <small>{take.take_id}</small>
               {take.thumbnail_path && <img alt={take.friendly_name || take.take_id} className="take-thumb" src={fileUrl(take.take_id, take.thumbnail_path)} />}
-              <small>{take.tags?.join(", ") || "-"}</small>
+              <small>Operator tags: {take.tags?.join(", ") || "-"}</small>
+              <small>Semantic labels: {take.semantic_labels?.join(", ") || "-"}</small>
+              <small>Superclass: {take.superclass_labels?.join(", ") || "-"}</small>
               <small>{take.modalities?.join(", ") || "no modalities"}</small>
               <small>Validation: {take.validation_status ?? "unreviewed"}</small>
               <small>Latest run: {take.latest_run_status ?? "never"}</small>
@@ -753,6 +1196,24 @@ export default function ProcessingLabPage() {
             ))}
           </div>
           <button type="button" disabled={!detail} onClick={() => void rerunLatestPipeline()}>Rerun latest pipeline</button>
+          <button
+            type="button"
+            disabled={!detail || !((detail.processing_by_family ?? []).find((item) => item.family === "25d")?.hasCompletedOutput)}
+            onClick={() => void publish25dForSelectedTake()}
+          >
+            Publish 25D result
+          </button>
+          <button type="button" disabled={!detail} onClick={() => void removeFromDataset()}>Remove from dataset</button>
+          {!Boolean((detail?.take_metadata as Record<string, unknown> | undefined)?.archived) ? (
+            <button type="button" disabled={!detail} onClick={() => void archiveCurrentTake()}>Archive take</button>
+          ) : (
+            <button type="button" disabled={!detail} onClick={() => void restoreCurrentTake()}>Restore archived take</button>
+          )}
+          <details>
+            <summary>Delete permanently (advanced)</summary>
+            <small>Deletes raw incoming take files, processed outputs, linked sidecar metadata, and indexed run directories for this take.</small>
+            <button type="button" disabled={!detail} onClick={() => void permanentDeleteCurrentTake()}>Delete permanently</button>
+          </details>
         </div>
         <details className="studio-pipeline-card">
           <summary>Process config (advanced)</summary>
@@ -864,6 +1325,66 @@ export default function ProcessingLabPage() {
           pipelineFamilyFilter={pipelineFamilyFilter}
           onPipelineFamilyFilterChange={setPipelineFamilyFilter}
         />
+        <section className="concept-panel compact studio-run-summary">
+          <div className="concept-heading">
+            <span className="eyebrow">Runtime worker health</span>
+            <strong>Engineering supervision only</strong>
+          </div>
+          <div className="pipeline-status-grid">
+            <div>
+              <span>RGB worker</span>
+              <strong><span className={`status-badge status-${workerBadgeLabel(rgbWorkerStatus)}`}>{workerBadgeLabel(rgbWorkerStatus)}</span></strong>
+            </div>
+            <div>
+              <span>2.5D worker</span>
+              <strong><span className={`status-badge status-${workerBadgeLabel(worker25dStatus)}`}>{workerBadgeLabel(worker25dStatus)}</span></strong>
+            </div>
+            <div>
+              <span>Fusion worker</span>
+              <strong><span className={`status-badge status-${workerBadgeLabel(fusionWorkerStatus)}`}>{workerBadgeLabel(fusionWorkerStatus)}</span></strong>
+            </div>
+            <div>
+              <span>Latest published result</span>
+              <strong>
+                {latestPublishedResult ? `${latestPublishedResult.id} (${latestPublishedResult.status})` : "none"}
+              </strong>
+            </div>
+          </div>
+        </section>
+        <section className="concept-panel compact studio-run-summary">
+          <div className="concept-heading">
+            <span className="eyebrow">Active binding visibility</span>
+            <strong>Read-only ProcessBinding lookup</strong>
+          </div>
+          <div className="studio-actions">
+            <label className="field-label">
+              Purpose
+              <select value={bindingPurpose} onChange={(event) => setBindingPurpose(event.target.value as "acquisition_inspection" | "fusion")}>
+                <option value="acquisition_inspection">acquisition_inspection</option>
+                <option value="fusion">fusion</option>
+              </select>
+            </label>
+          </div>
+          <div className="pipeline-status-grid">
+            <div>
+              <span>source_id</span>
+              <strong>{selectedBindingSource ?? "-"}</strong>
+            </div>
+            <div>
+              <span>modality</span>
+              <strong>{selectedModalityForBinding}</strong>
+            </div>
+            <div>
+              <span>pipeline_id</span>
+              <strong>{activeBinding?.pipeline_id ?? "-"}</strong>
+            </div>
+            <div>
+              <span>active_recipe_version_id</span>
+              <strong>{activeBinding?.active_recipe_version_id ?? "-"}</strong>
+            </div>
+          </div>
+          {!activeBinding && <small className="section-note">No active binding found for selected source/modality/purpose.</small>}
+        </section>
 
         <section className="studio-stage-strip" aria-label="Stage navigator">
           {(selectedPipeline?.stages ?? []).map((stage, index) => {
@@ -901,6 +1422,61 @@ export default function ProcessingLabPage() {
             <PipelineExecutionGraph execution={detail?.result?.pipeline_execution} selectedStageId={canonicalSelectedStageId} />
           </details>
         </section>
+        {activeAcquisitionGroupId && (
+          <section className="concept-panel compact studio-run-summary">
+            <div className="concept-heading">
+              <span className="eyebrow">Fusion readiness</span>
+              <strong>{activeAcquisitionGroupId}</strong>
+            </div>
+            {fusionLoading && <small>Loading fusion inputs...</small>}
+            {fusionError && <small>{fusionError}</small>}
+            {!fusionLoading && !fusionError && (
+              <>
+                <div className="pipeline-status-grid">
+                  <div><span>Status</span><strong>{fusionInputs?.readiness_status ?? "-"}</strong></div>
+                  <div><span>RGB take/run</span><strong>{fusionInputs?.rgb_take_id ?? "-"} / {fusionInputs?.rgb_run_id ?? "-"}</strong></div>
+                  <div><span>25D take/run</span><strong>{fusionInputs?.heightmap_take_id ?? "-"} / {fusionInputs?.heightmap_run_id ?? "-"}</strong></div>
+                  <div><span>Missing</span><strong>{(fusionInputs?.missing_inputs ?? []).join(", ") || "-"}</strong></div>
+                </div>
+                {!!(fusionPreview?.object_candidates?.length ?? 0) && (
+                  <div className="artifact-reference">
+                    <span>Object pairing</span>
+                    <strong>{fusionPreview?.object_candidates.length} candidates</strong>
+                    {(fusionPreview?.object_candidates ?? []).slice(0, 10).map((item) => (
+                      <small key={item.fusion_object_id}>
+                        {item.fusion_object_id}: rgb={item.rgb_object_id ?? "-"} / 25d={item.heightmap_object_id ?? "-"} / {item.matching_method} ({item.confidence.toFixed(2)})
+                      </small>
+                    ))}
+                  </div>
+                )}
+                <div className="studio-actions">
+                  <button type="button" onClick={() => void runFusionForGroup(false)} disabled={fusionLoading}>Run fusion</button>
+                  <button type="button" onClick={() => void runFusionForGroup(true)} disabled={fusionLoading}>Force run</button>
+                </div>
+                {latestFusionResult && (
+                  <div className="artifact-reference">
+                    <span>Latest fusion result</span>
+                    <strong>Run: {latestFusionRun?.fusion_run_id ?? fusionRuns[0]?.fusion_run_id ?? "-"}</strong>
+                    <small>Status: {latestFusionResult.status}</small>
+                    <small>Class counts: {JSON.stringify(latestFusionResult.class_counts ?? {})}</small>
+                    {!!latestFusionRun?.artifact_paths && <small>Artifacts: {Object.values(latestFusionRun.artifact_paths).join(" | ")}</small>}
+                    {(latestFusionResult.final_objects ?? []).slice(0, 10).map((row, idx) => (
+                      <small key={`fo_${idx}`}>
+                        {String(row.final_object_id ?? `obj_${idx + 1}`)} | {String(row.final_class ?? "-")} | {String(row.final_class_group ?? "-")} | {JSON.stringify(row.decision_reasons ?? [])}
+                      </small>
+                    ))}
+                  </div>
+                )}
+                {!!(fusionInputs?.warnings?.length ?? 0) && (
+                  <div className="artifact-reference">
+                    <span>Warnings</span>
+                    {(fusionInputs?.warnings ?? []).map((warning, idx) => <small key={`fw_${idx}`}>{warning}</small>)}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        )}
 
         <section className="studio-result-workspace">
         <nav className="studio-workspace-tabs">
@@ -918,8 +1494,49 @@ export default function ProcessingLabPage() {
             <span className="eyebrow">Stage workspace</span>
             <strong>{selectedStage?.display_name ?? "Workspace"}</strong>
           </div>
+          {canonicalSelectedStageId === "segmentation" && (
+            <StageParameterPanel
+              stage={selectedStage}
+              values={segmentationPreviewParams}
+              persistedValues={segmentationPersistedParams}
+              loading={segmentationPreviewLoading}
+              dirty={segmentationPreviewDirty}
+              previewLabel={`Components: ${segmentationPreview?.metrics.component_count ?? "-"} • Threshold coverage: ${segmentationPreview?.metrics.threshold_coverage == null ? "-" : `${(segmentationPreview.metrics.threshold_coverage * 100).toFixed(1)}%`} • Cleaned coverage: ${segmentationPreview?.metrics.cleaned_coverage == null ? "-" : `${(segmentationPreview.metrics.cleaned_coverage * 100).toFixed(1)}%`} • ${segmentationPreview?.diagnostics?.preview ? "Preview (non-persisted)" : "Persisted"}`}
+              error={segmentationPreviewError}
+              onChange={(key, value) => {
+                setSegmentationPreviewParams((current) => current ? { ...current, [key]: value } : current);
+                setSegmentationPreviewDirty(true);
+              }}
+              onPreview={() => void triggerSegmentationPreview()}
+              onApply={() => void applySegmentationParams(false)}
+              onApplyRun={() => void applySegmentationParams(true)}
+              onReset={() => {
+                setSegmentationPreviewParams(segmentationPersistedParams);
+                setSegmentationPreviewDirty(false);
+              }}
+            />
+          )}
+          {canonicalSelectedStageId === "ellipse_fitting" && (
+            <StageParameterPanel
+              stage={selectedStage}
+              values={ellipsePreviewParams}
+              persistedValues={ellipsePersistedParams}
+              loading={ellipsePreviewLoading}
+              dirty={ellipsePreviewDirty}
+              previewLabel={`Fitted: ${Number((segmentationPreview?.artifacts ?? []).filter((item) => item.artifact_id === "ellipse_overlay").length ? 1 : 0)} • ${segmentationPreview?.diagnostics?.preview ? "Preview (non-persisted)" : "Persisted"}`}
+              error={ellipsePreviewError}
+              onChange={(key, value) => {
+                setEllipsePreviewParams((current) => current ? { ...current, [key]: value } : current);
+                setEllipsePreviewDirty(true);
+              }}
+              onPreview={() => void triggerEllipsePreview()}
+              onApply={() => void applyEllipseParams(false)}
+              onApplyRun={() => void applyEllipseParams(true)}
+              onReset={() => resetEllipseDefaults()}
+            />
+          )}
           {renderStageSemanticView({
-            detail,
+            detail: workspaceDetail,
             compatible,
             processed,
             stageId: canonicalSelectedStageId,
@@ -950,7 +1567,7 @@ export default function ProcessingLabPage() {
 
       <StudioInspector
         compatible={compatible}
-        detail={detail}
+        detail={workspaceDetail}
         pipeline={selectedPipeline}
         selectedArtifact={focusedArtifact}
         overlayDebug={overlayDebug}

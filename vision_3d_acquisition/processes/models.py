@@ -10,6 +10,7 @@ ProcessCategory = Literal["image_2d", "image_3d", "hybrid"]
 InputType = Literal["grayscale_image", "reflectance_image", "trispector_reflectance_png", "point_cloud", "rgb_image"]
 StepStatus = Literal["idle", "running", "success", "warning", "failed", "skipped"]
 PipelineStatus = Literal["idle", "ready", "running", "success", "warning", "failed"]
+ProcessPurpose = Literal["acquisition_inspection", "manual_debug", "fusion_input", "fusion"]
 
 
 class PipelineStepConfig(BaseModel):
@@ -55,12 +56,20 @@ class StepRunReport(BaseModel):
     overlay_ids: list[str] = Field(default_factory=list)
     measurements: list[dict[str, Any]] = Field(default_factory=list)
     metrics: dict[str, float] = Field(default_factory=dict)
+    effective_params: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipelineRunRecord(BaseModel):
     run_id: str
     timestamp: datetime
     status: PipelineStatus
+    pipeline_id: str | None = None
+    recipe_version_id: str | None = None
+    config_snapshot_hash: str | None = None
+    source_id: str | None = None
+    take_id: str | None = None
+    acquisition_group_id: str | None = None
+    calibration_profile_id: str | None = None
     parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
@@ -99,6 +108,20 @@ class RecipeVersion(BaseModel):
     created_at: datetime
     template_id: str
     pipeline_snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProcessBinding(BaseModel):
+    id: str
+    name: str
+    source_id: str
+    modality: str
+    purpose: ProcessPurpose
+    pipeline_id: str
+    active_recipe_version_id: str
+    calibration_profile_id: str | None = None
+    enabled: bool = True
+    created_at: datetime
+    updated_at: datetime
 
 
 class StepExecutionContext(BaseModel):

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-PipelineFamily = Literal["3d", "2d", "generic"]
+PipelineFamily = Literal["3d", "2d", "25d", "generic"]
 ProcessingState = Literal["never_processed", "completed", "running", "failed", "partial"]
 
 
@@ -42,6 +42,12 @@ def append_process_run_index(
     status: str,
     run_dir: Path,
     created_at: str,
+    pipeline_id: str | None = None,
+    recipe_version_id: str | None = None,
+    config_snapshot_hash: str | None = None,
+    source_id: str | None = None,
+    acquisition_group_id: str | None = None,
+    calibration_profile_id: str | None = None,
 ) -> None:
     if not take_id:
         return
@@ -56,6 +62,12 @@ def append_process_run_index(
         "status": status,
         "created_at": created_at,
         "path": str(run_dir),
+        "pipeline_id": pipeline_id,
+        "recipe_version_id": recipe_version_id,
+        "config_snapshot_hash": config_snapshot_hash,
+        "source_id": source_id,
+        "acquisition_group_id": acquisition_group_id,
+        "calibration_profile_id": calibration_profile_id,
     }
     payload.setdefault("entries", []).append(entry)
     payload["updated_at"] = datetime.now(UTC).isoformat()
@@ -82,18 +94,33 @@ def process_entries_for_take(data_dir: Path, take_id: str) -> list[dict[str, Any
 def summarize_take_processing(data_dir: Path, take_id: str, *, has_3d_done: bool, processed_dir: Path) -> list[dict[str, Any]]:
     families: dict[str, FamilyProcessingSummary] = {}
 
+    result_payload: dict[str, Any] | None = None
+    result_path = processed_dir / "result.json"
+    if result_path.is_file():
+        try:
+            parsed = json.loads(result_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                result_payload = parsed
+        except Exception:
+            result_payload = None
+    done_family = str(((result_payload or {}).get("processing_pipeline") or {}).get("pipeline_family") or "3d")
+    if done_family not in {"3d", "25d"}:
+        done_family = "3d"
+
     if has_3d_done:
         done_marker = processed_dir / "DONE"
-        families["3d"] = FamilyProcessingSummary(
-            family="3d",
+        families[done_family] = FamilyProcessingSummary(
+            family=done_family,  # type: ignore[arg-type]
             has_completed_output=True,
             last_run_at=datetime.fromtimestamp(done_marker.stat().st_mtime, tz=UTC).isoformat() if done_marker.exists() else None,
             status="completed",
             sources=[ProcessingSource(type="3d_done_marker", path=str(done_marker))],
         )
-    else:
-        families["3d"] = FamilyProcessingSummary(
-            family="3d",
+    for family in ("3d", "25d"):
+        if family in families:
+            continue
+        families[family] = FamilyProcessingSummary(
+            family=family,  # type: ignore[arg-type]
             has_completed_output=False,
             last_run_at=None,
             status="never_processed",

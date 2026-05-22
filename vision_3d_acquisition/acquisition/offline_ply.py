@@ -23,7 +23,7 @@ class OfflinePlyAcquisition(AcquisitionBase):
     def __init__(self, publisher: AcquisitionPublisher) -> None:
         self.publisher = publisher
 
-    def acquire(self, ply_path: Path) -> tuple[str, Path]:
+    def acquire(self, ply_path: Path, *, acquisition_group_id: str | None = None) -> tuple[str, Path]:
         src = self._validate_ply(ply_path)
         take_id = generate_take_id()
         created_at = utc_now_iso()
@@ -34,6 +34,7 @@ class OfflinePlyAcquisition(AcquisitionBase):
             mode="offline",
             created_at=created_at,
             frame_count=1,
+            acquisition_group_id=acquisition_group_id,
             files=FileReferences(point_cloud=POINT_CLOUD_NAME, point_cloud_npz=POINT_CLOUD_NPZ_NAME),
         )
 

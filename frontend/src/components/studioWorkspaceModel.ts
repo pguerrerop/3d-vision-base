@@ -55,6 +55,12 @@ export function artifactsForStage(detail: TakeDetail | null, stageId: string): S
     aliases.add("crop_roi");
     aliases.add("rgb_to_gray");
     aliases.add("normalize_lighting");
+  } else if (canonical === "detect_belt_plane" || canonical === "normalize_heights_to_plane") {
+    aliases.add("calibration");
+    aliases.add("input");
+  } else if (canonical === "remove_belt_segment_objects") {
+    aliases.add("segmentation");
+    aliases.add("height_segmentation");
   }
   const staged = artifacts.filter((artifact) => aliases.has(artifact.stage_id));
   const targetIds = new Set(
@@ -69,6 +75,9 @@ export function artifactsForStage(detail: TakeDetail | null, stageId: string): S
 
 function canonicalStageIdLocal(stageId: string): string {
   const raw = `${stageId ?? ""}`.toLowerCase();
+  if (raw.includes("detectbeltplane") || raw.includes("estimatebeltplane") || raw.includes("belt_plane")) return "detect_belt_plane";
+  if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized_height")) return "normalize_heights_to_plane";
+  if (raw.includes("removebeltandsegmentobjects") || raw.includes("height_segmentation")) return "remove_belt_segment_objects";
   if (
     raw.includes("blob_detection")
     || raw.includes("blob/contour")

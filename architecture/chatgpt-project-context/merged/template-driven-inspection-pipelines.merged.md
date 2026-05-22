@@ -55,6 +55,41 @@ Real RGB camera validation is documented as a manual checklist and intentionally
 - image auto-center on selected object is pending
 - run-to-run compare UX remains pending
 
+## Added: segmentation threshold live preview model
+
+- added backend preview endpoint: `POST /api/pipelines/preview-segmentation`
+- endpoint executes real process-service threshold+morphology logic with temporary overrides
+- no recipe mutation during preview calls
+- preview returns artifact-contract-compatible outputs + diagnostics + segmentation metrics
+
+Parameter semantics:
+
+- preview-only override keys:
+  - threshold value (`0..255`)
+  - auto threshold (`Otsu`)
+  - invert
+- threshold mode is derived at preview time:
+  - auto => `otsu`
+  - manual => `fixed` + provided value
+
+State model in Studio:
+
+- persisted parameters (recipe-backed)
+- preview parameters (interactive)
+- dirty preview state (preview diverges from persisted)
+
+Execution behavior:
+
+- preview requests are debounced (~320ms) to prevent excessive recomputation
+- `Preview` performs an immediate preview call
+- `Apply to recipe` persists params only
+- `Apply + rerun` persists then runs full pipeline
+
+Extensibility direction:
+
+- current control strip is threshold-focused but structurally ready for additional segmentation knobs
+- preview contract remains generic (`params`) for future morphology/ROI/adaptive-threshold live tuning
+
 ## Note on merged docs generation
 
 No merged-doc generation script was found in repository scripts; merged context was updated manually.

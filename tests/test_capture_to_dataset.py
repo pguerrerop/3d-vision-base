@@ -94,4 +94,6 @@ def test_old_capture_endpoint_still_works(tmp_path: Path, monkeypatch) -> None:
     resp = capture_rgb_image(UsbCaptureRequest(camera_index=0), settings)
 
     assert resp["take_id"] == "captured_take_001"
+    assert resp["acquisition_processing"]["status"] == "acquired"
+    assert "No active processing binding found" in str(resp["acquisition_processing"].get("warning") or "")
     assert (settings.incoming_dir / "captured_take_001" / "metadata.json").is_file()

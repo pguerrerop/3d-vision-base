@@ -93,6 +93,11 @@ export default function TakeDetailView({ detail }: Props) {
         <JsonBlock value={detail.metadata} />
       </section>
 
+      <section className="section">
+        <h3>Acquisition processing status</h3>
+        <JsonBlock value={detail.acquisition_processing_status ?? { status: "acquired" }} />
+      </section>
+
       <section className="section-group">
         <div className="section-heading">
           <h3>Processed outputs</h3>

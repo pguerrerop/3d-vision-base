@@ -156,7 +156,9 @@ class DatasetService:
     ) -> dict[str, Any]:
         take_path = self._session_dir(dataset_id, session_id) / "takes" / take_id / "metadata.json"
         existing = _read_json(take_path) or self.default_take_metadata(take_id, source_metadata)
-        merged = {**existing, **updates, "take_id": take_id, "dataset_id": dataset_id, "session_id": session_id}
+        resolved_dataset = updates["dataset_id"] if "dataset_id" in updates else dataset_id
+        resolved_session = updates["session_id"] if "session_id" in updates else session_id
+        merged = {**existing, **updates, "take_id": take_id, "dataset_id": resolved_dataset, "session_id": resolved_session}
         _write_json(take_path, merged)
         return merged
 
@@ -182,6 +184,10 @@ class DatasetService:
             "friendly_name": take_id,
             "labels": [],
             "tags": [],
+            "semantic_labels": [],
+            "superclass_labels": [],
+            "normalized_class": None,
+            "normalization_version": None,
             "notes": None,
             "expected_class": None,
             "expected_diameter_mm": None,
@@ -190,8 +196,65 @@ class DatasetService:
             "validation_status": "unreviewed",
             "dataset_id": None,
             "session_id": source.get("session_id"),
+            "acquisition_group_id": source.get("acquisition_group_id"),
             "created_at": source.get("created_at") or _now_iso(),
             "object_annotations": [],
+            "archived": False,
+            "archived_at": None,
+            "archived_reason": None,
+        }
+
+    def iter_dataset_takes(self, dataset_id: str, *, session_id: str | None = None) -> list[tuple[str, str, dict[str, Any]]]:
+        sessions = [session_id] if session_id else [str(item.get("id") or "") for item in self.list_sessions(dataset_id=dataset_id)]
+        rows: list[tuple[str, str, dict[str, Any]]] = []
+        for sid in sessions:
+            if not sid:
+                continue
+            takes_dir = self._session_dir(dataset_id, sid) / "takes"
+            if not takes_dir.is_dir():
+                continue
+            for child in sorted(takes_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                take_id = child.name
+                payload = _read_json(child / "metadata.json") or self.default_take_metadata(take_id, source_metadata={"session_id": sid})
+                rows.append((sid, take_id, payload))
+        return rows
+
+    def label_summary(self, dataset_id: str) -> dict[str, Any]:
+        raw_counts: dict[str, int] = {}
+        semantic_counts: dict[str, int] = {}
+        superclass_counts: dict[str, int] = {}
+        unmapped_counts: dict[str, int] = {}
+        normalization_versions: dict[str, int] = {}
+        take_count = 0
+        for _sid, _take_id, payload in self.iter_dataset_takes(dataset_id):
+            take_count += 1
+            for tag in [str(item).strip() for item in (payload.get("tags") or []) if str(item).strip()]:
+                raw_counts[tag] = raw_counts.get(tag, 0) + 1
+            for label in [str(item).strip() for item in (payload.get("semantic_labels") or []) if str(item).strip()]:
+                semantic_counts[label] = semantic_counts.get(label, 0) + 1
+            for label in [str(item).strip() for item in (payload.get("superclass_labels") or []) if str(item).strip()]:
+                superclass_counts[label] = superclass_counts.get(label, 0) + 1
+            for warning in [str(item) for item in (payload.get("normalization_warnings") or []) if str(item)]:
+                if warning.startswith("UNMAPPED_TAG:"):
+                    tag = warning.split(":", 1)[1]
+                    unmapped_counts[tag] = unmapped_counts.get(tag, 0) + 1
+            version = str(payload.get("normalization_version") or "").strip()
+            if version:
+                normalization_versions[version] = normalization_versions.get(version, 0) + 1
+        dominant_version = None
+        if normalization_versions:
+            dominant_version = sorted(normalization_versions.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        return {
+            "dataset_id": dataset_id,
+            "take_count": take_count,
+            "raw_tag_counts": dict(sorted(raw_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "semantic_label_counts": dict(sorted(semantic_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "superclass_counts": dict(sorted(superclass_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "unmapped_tags": dict(sorted(unmapped_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "normalization_version": dominant_version,
+            "normalization_versions_seen": normalization_versions,
         }
 
     def upsert_object_annotation(

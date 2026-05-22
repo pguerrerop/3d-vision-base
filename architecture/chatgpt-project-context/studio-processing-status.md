@@ -218,6 +218,22 @@ Studio now resolves Input-stage views through a layered model:
 1. run artifacts (preferred when present)
 2. source/take artifacts (fallback)
 
+## 2D calibration diagnostics UX
+
+Calibration 2D detection now defaults to selected-capture processing and surfaces diagnostics for failures:
+
+- dictionary used
+- marker count + marker IDs
+- ChArUco corner count
+- API mode (`legacy`, `detector`, `aruco_fallback`)
+- sharpness estimate
+- board coverage estimate
+- failure reason and warnings
+
+Camera runtime controls are best-effort by source/backend. Unsupported controls remain visible but disabled to avoid hidden state and to preserve predictable calibration UX.
+
+Realtime monitoring for calibration tuning now uses MJPEG stream views inside Camera Controls modal; the manager page intentionally avoids stale informational live-preview duplication.
+
 This allows Input stage to be immediately usable before any execution run exists.
 
 Input stage bindings:
@@ -419,3 +435,53 @@ Behavior:
 - Optional quick action: `Capture + Run` to immediately process the new take.
 
 This keeps the acquisition -> processing -> annotation loop inside one Studio workflow.
+
+## Safe take management UX
+
+Take Management now includes explicit lifecycle actions:
+
+- `Remove from dataset`
+- `Archive take` / `Restore archived take`
+- `Delete permanently (advanced)`
+
+### Safety semantics
+
+- Remove action is metadata-only and preserves raw/processed data.
+- Archive action hides takes from default list while preserving artifacts.
+- Permanent delete is gated by typed confirmation and clearly states deletion scope.
+
+### Archived visibility
+
+Studio sidebar now includes a `Show archived` toggle:
+
+- Off by default (archived hidden)
+- When enabled, archived takes appear and can be restored
+
+## 2.5D Visualization Defaults
+
+- For `heightmap` / `derived_25d` takes, Studio now treats height preview as the primary human-facing visualization.
+- Diagnostic masks remain available but are secondary.
+
+### Priority Rules
+
+- Heightmap takes:
+  1. `heightmap_preview.png`
+  2. `reflectance.png`
+  3. raw upload fallback
+  4. segmentation/debug masks
+- RGB takes continue to prioritize RGB/overlay imagery.
+
+### Stage Defaults
+
+- Input stage for 2.5D defaults to `Height preview`.
+- Segmentation stage for 2.5D defaults to overlay-on-height preview.
+- Threshold/cleaned masks and morphology artifacts remain diagnostics, explicitly labeled as such.
+
+### Canonical 2.5D Segmentation Overlay Artifact
+
+- Added `height_segmentation_overlay` (`height_segmentation_overlay.png`) with:
+  - `overlay_type: segmentation`
+  - `coordinate_space: image_pixel`
+  - `target_artifact_id: heightmap_preview`
+
+This preserves existing artifact contracts while making human-readable inspection the default UX.

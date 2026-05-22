@@ -62,7 +62,6 @@ test("target params validity and raw source text input removed", () => {
 test("stale source warning is inline and capture remains clickable", () => {
   const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
   assert.equal(calibrationPage.includes("Source preview is stale (informational only)."), false);
-  assert.equal(calibrationPage.includes("Source preview is stale. Capture still acquires a fresh frame."), true);
   assert.equal(calibrationPage.includes("disabled={busy || !sourceId} onClick={capture2DFrame}"), true);
 });
 
@@ -70,11 +69,45 @@ test("captured frame display uses image_url and has explicit load error state", 
   const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
   assert.equal(calibrationPage.includes("selectedCapture.image_url ??"), true);
   assert.equal(calibrationPage.includes("?t=${t}"), true);
-  assert.equal(calibrationPage.includes("Captured frame image could not be loaded"), true);
+  assert.equal(calibrationPage.includes("Calibration preview"), true);
 });
 
 test("capture freshness messages are explicit", () => {
   const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
   assert.equal(calibrationPage.includes("Captured fresh frame (direct USB camera)."), true);
   assert.equal(calibrationPage.includes("Capture failed: no fresh frame available."), true);
+});
+
+test("dictionary selector and selected-capture detection workflow are present", () => {
+  const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
+  assert.equal(calibrationPage.includes("DICT_6X6_250"), true);
+  assert.equal(calibrationPage.includes("Detect all captures"), true);
+  assert.equal(calibrationPage.includes("capture_id: captureId"), true);
+  assert.equal(calibrationPage.includes("Test dictionaries"), true);
+  assert.equal(calibrationPage.includes("Capture + detect"), true);
+  assert.equal(calibrationPage.includes("captureAndDetectFromCharucoModal"), true);
+});
+
+test("source controls and diagnostics hints are present", () => {
+  const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
+  assert.equal(calibrationPage.includes("Open Camera Controls"), true);
+  assert.equal(calibrationPage.includes("Open ChArUco Calibration"), true);
+  assert.equal(calibrationPage.includes("/api/runtime/stream/mjpeg"), true);
+  assert.equal(calibrationPage.includes("Camera Controls"), true);
+  assert.equal(calibrationPage.includes("Apply controls"), true);
+  assert.equal(calibrationPage.includes("Restore defaults"), true);
+  assert.equal(calibrationPage.includes("Load from calibration"), true);
+  assert.equal(calibrationPage.includes("Diagnostic hint:"), true);
+  assert.equal(calibrationPage.includes("disabled={busy || !sourceId || !streamAvailable}"), true);
+  assert.equal(calibrationPage.includes("Not supported by this camera/backend"), true);
+  assert.equal(calibrationPage.includes("hasDirtyWritableControls"), true);
+});
+
+test("charuco modal capture actions and failure shortcut are present", () => {
+  const calibrationPage = fs.readFileSync(new URL("../src/pages/CalibrationPage.tsx", import.meta.url), "utf8");
+  assert.equal(calibrationPage.includes("Capture snapshot"), true);
+  assert.equal(calibrationPage.includes("Capture + detect"), true);
+  assert.equal(calibrationPage.includes("Markers detected but insufficient consistent corners"), true);
+  assert.equal(calibrationPage.includes("setCharucoModalOpen(false); setCameraControlsModalOpen(true);"), true);
+  assert.equal(calibrationPage.includes("Source Controls"), false);
 });

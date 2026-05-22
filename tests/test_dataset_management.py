@@ -86,6 +86,35 @@ def test_dataset_session_grouping_and_take_filter(tmp_path: Path) -> None:
     assert [item.take_id for item in tagged] == ["take_a"]
 
 
+def test_take_filter_by_semantic_and_superclass_labels(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path / "data")
+    write_take(settings.data_dir, "take_sem_a")
+    write_take(settings.data_dir, "take_sem_b")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="set1", name="Set 1")
+    service.create_session(dataset_id="set1", session_id="daylight", name="Daylight")
+    service.upsert_take_metadata(
+        take_id="take_sem_a",
+        dataset_id="set1",
+        session_id="daylight",
+        updates={"semantic_labels": ["BALL_CHIPPED"], "superclass_labels": ["BALL_DEFECT"]},
+        source_metadata={},
+    )
+    service.upsert_take_metadata(
+        take_id="take_sem_b",
+        dataset_id="set1",
+        session_id="daylight",
+        updates={"semantic_labels": ["SCRAP_BOLT"], "superclass_labels": ["SCRAP"]},
+        source_metadata={},
+    )
+
+    sem = list_takes(settings, semantic_label="BALL_CHIPPED")
+    sup = list_takes(settings, superclass_label="SCRAP")
+
+    assert [item.take_id for item in sem] == ["take_sem_a"]
+    assert [item.take_id for item in sup] == ["take_sem_b"]
+
+
 def test_run_history_lookup_includes_process_entries(tmp_path: Path) -> None:
     settings = make_settings(tmp_path / "data")
     write_take(settings.data_dir, "take_hist")

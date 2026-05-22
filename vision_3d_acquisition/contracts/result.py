@@ -17,10 +17,11 @@ CalibrationResolutionSource = Literal["explicit", "runtime_default", "none"]
 AlgorithmStage = Literal["mock", "segmentation", "calibrated_segmentation", "classification", "production"]
 ObjectClass = Literal["ball", "non_ball", "unknown"]
 ArtifactKind = Literal["image", "point_cloud", "table", "json", "metric", "overlay", "video", "text", "file"]
-OverlayType = Literal["bbox", "mask", "ellipse", "sphere_fit", "centroid", "polyline", "text"]
+OverlayType = Literal["bbox", "mask", "ellipse", "sphere_fit", "centroid", "polyline", "text", "segmentation"]
 OverlayCoordinateSpace = Literal["image_pixel", "normalized_image", "projection_pixel", "world_mm", "plot_pixel", "point_cloud_projection"]
 ProjectionType = Literal["xy_topdown", "xz_side", "yz_side", "object_crop", "heightmap", "depthmap"]
 StageExecutionStatus = Literal["success", "warning", "failed", "skipped"]
+CandidateSourceModality = Literal["rgb", "heightmap", "point_cloud", "reflectance", "derived_25d"]
 
 
 class ResultSummary(BaseModel):
@@ -138,6 +139,11 @@ class ProjectionArtifactMetadata(BaseModel):
 class ResultFiles(BaseModel):
     point_cloud: str | None = None
     point_cloud_npz: str | None = None
+    heightmap: str | None = None
+    heightmap_npz: str | None = None
+    normalized_heightmap: str | None = None
+    heightmap_metadata: str | None = None
+    reflectance: str | None = None
     input_preview: str | None = None
     overlay: str | None = None
     debug_height: str | None = None
@@ -170,12 +176,17 @@ class ProcessingTiming(BaseModel):
 
 
 ProfilingCategory = Literal[
+    "input",
     "io",
+    "calibration",
     "preprocessing",
     "calibration_filtering",
+    "segmentation",
     "clustering",
+    "geometry",
     "measurement",
     "classification",
+    "overlay",
     "debug_artifacts",
     "output",
 ]
@@ -252,6 +263,27 @@ class ThroughputMetrics(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ObjectCandidate(BaseModel):
+    id: str
+    local_object_index: int = Field(ge=1)
+    source_modality: CandidateSourceModality
+    source_take_id: str
+    source_pipeline_run_id: str | None = None
+    acquisition_group_id: str | None = None
+    bbox_px: list[float] | None = None
+    contour_px: list[list[float]] | None = None
+    mask_artifact_id: str | None = None
+    overlay_artifact_id: str | None = None
+    centroid_px: list[float] | None = None
+    centroid_world: list[float] | None = None
+    geometry: dict[str, Any] = Field(default_factory=dict)
+    appearance: dict[str, Any] = Field(default_factory=dict)
+    measurements: dict[str, Any] = Field(default_factory=dict)
+    classification_hints: dict[str, Any] = Field(default_factory=dict)
+    confidence: float | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProcessingResult(BaseModel):
     take_id: str
     session_id: str | None = None
@@ -291,6 +323,12 @@ class ProcessingResult(BaseModel):
     throughput: ThroughputMetrics | None = None
     synchronization: dict[str, Any] | None = None
     acquisition_timestamps: dict[str, str] | None = None
+    recipe_version_id: str | None = None
+    config_snapshot_hash: str | None = None
+    source_id: str | None = None
+    acquisition_group_id: str | None = None
+    calibration_profile_id: str | None = None
+    object_candidates: list[ObjectCandidate] = Field(default_factory=list)
 
     @field_validator("take_id")
     @classmethod

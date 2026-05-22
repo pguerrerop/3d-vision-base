@@ -22,6 +22,8 @@ def test_runtime_config_defaults_when_missing(tmp_path: Path) -> None:
     assert status.config.default_calibration_file is None
     assert status.config.require_calibration_for_demo is True
     assert status.config.allow_auto_plane_without_calibration is True
+    assert status.config.runtime.trispector_ftp.enabled is True
+    assert status.config.runtime.trispector_ftp.stable_checks >= 1
     assert status.default_calibration_valid is False
 
 

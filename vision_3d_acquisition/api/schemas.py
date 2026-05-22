@@ -61,6 +61,7 @@ class TakeSummary(BaseModel):
     calibration_file: str | None = None
     calibration_resolution_source: str | None = None
     modalities: list[str] = Field(default_factory=list)
+    modality_labels: list[str] = Field(default_factory=list)
     assets: dict[str, dict[str, str]] = Field(default_factory=dict)
     frame_count: int | None = None
     frameset: dict[str, Any] | None = None
@@ -70,6 +71,10 @@ class TakeSummary(BaseModel):
     processing_by_family: list[dict[str, Any]] = Field(default_factory=list)
     friendly_name: str | None = None
     tags: list[str] = Field(default_factory=list)
+    semantic_labels: list[str] = Field(default_factory=list)
+    superclass_labels: list[str] = Field(default_factory=list)
+    normalized_class: str | None = None
+    normalization_version: str | None = None
     validation_status: str | None = None
     expected_class: str | None = None
     expected_diameter_mm: float | None = None
@@ -79,6 +84,8 @@ class TakeSummary(BaseModel):
     experiment_session_id: str | None = None
     experiment_session_name: str | None = None
     latest_run_status: str | None = None
+    archived: bool = False
+    acquisition_processing_status: dict[str, Any] | None = None
 
 
 class TakeDetail(BaseModel):
@@ -91,6 +98,7 @@ class TakeDetail(BaseModel):
     result: dict[str, Any] | None = None
     labels: dict[str, Any] | None = None
     modalities: list[str] = Field(default_factory=list)
+    modality_labels: list[str] = Field(default_factory=list)
     assets: dict[str, dict[str, str]] = Field(default_factory=dict)
     frame_count: int | None = None
     frameset: dict[str, Any] | None = None
@@ -101,6 +109,7 @@ class TakeDetail(BaseModel):
     take_metadata: dict[str, Any] = Field(default_factory=dict)
     run_history: list[dict[str, Any]] = Field(default_factory=list)
     object_annotations: list[dict[str, Any]] = Field(default_factory=list)
+    acquisition_processing_status: dict[str, Any] | None = None
 
 
 class DatasetSummary(BaseModel):
