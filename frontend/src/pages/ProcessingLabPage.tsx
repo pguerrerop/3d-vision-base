@@ -43,6 +43,7 @@ import { buildCapturePayload, captureDisabledReason, nextSelectedTakeAfterCaptur
 
 type TakeFilter = "all" | "processed" | "unprocessed" | "warnings";
 type SegmentationTuningParams = Record<string, unknown>;
+type PlaneQaTuningParams = Record<string, unknown>;
 
 export default function ProcessingLabPage() {
   const [takes, setTakes] = useState<TakeSummary[]>([]);
@@ -109,6 +110,9 @@ export default function ProcessingLabPage() {
   const [ellipsePreviewDirty, setEllipsePreviewDirty] = useState(false);
   const [ellipsePreviewLoading, setEllipsePreviewLoading] = useState(false);
   const [ellipsePreviewError, setEllipsePreviewError] = useState<string | null>(null);
+  const [planeQaParams, setPlaneQaParams] = useState<PlaneQaTuningParams | null>(null);
+  const [planeQaPersistedParams, setPlaneQaPersistedParams] = useState<PlaneQaTuningParams | null>(null);
+  const [planeQaDirty, setPlaneQaDirty] = useState(false);
   const [fusionInputs, setFusionInputs] = useState<FusionInputBundle | null>(null);
   const [fusionPreview, setFusionPreview] = useState<FusionPreviewResult | null>(null);
   const [fusionRuns, setFusionRuns] = useState<FusionRunRecord[]>([]);
@@ -120,6 +124,9 @@ export default function ProcessingLabPage() {
   const [latestPublishedResult, setLatestPublishedResult] = useState<InspectionPublishedResult | null>(null);
   const [processBindings, setProcessBindings] = useState<ProcessBinding[]>([]);
   const [bindingPurpose, setBindingPurpose] = useState<"acquisition_inspection" | "fusion">("acquisition_inspection");
+  const [pipelineActionBusy, setPipelineActionBusy] = useState(false);
+  const [pipelineActionMessage, setPipelineActionMessage] = useState<string | null>(null);
+  const [resultStale, setResultStale] = useState(false);
 
   const load = useCallback(async () => {
     const [
@@ -210,6 +217,43 @@ export default function ProcessingLabPage() {
     () => stageSemantic.views.map((view) => ({ id: view.id as StageViewTabId, label: view.label })),
     [stageSemantic.views]
   );
+  useEffect(() => {
+    const fallback = (stageSemantic.defaultViewId || stageTabs[0]?.id || "overview") as StageViewTabId;
+    setActiveTab(fallback);
+    setTabFallbackMessage(null);
+  }, [canonicalSelectedStageId]);
+  useEffect(() => {
+    if (selectedPipeline?.id !== "mining_steel_ball_classification_25d" || !detail) return;
+    const fromResult = (((detail.result as unknown as Record<string, unknown> | null) ?? {})["stage_params"] as Record<string, unknown> | undefined) ?? {};
+    const detect = (fromResult.detect_belt_plane as Record<string, unknown> | undefined) ?? {};
+    const seg = (fromResult.remove_belt_segment_objects as Record<string, unknown> | undefined) ?? {};
+    const defaults: PlaneQaTuningParams = {
+      background_detection_strategy: String(detect.background_detection_strategy ?? "low_gradient_surface"),
+      gradient_smoothing_kernel: Number(detect.gradient_smoothing_kernel ?? 3),
+      gradient_threshold_mode: String(detect.gradient_threshold_mode ?? "percentile"),
+      gradient_threshold_value: Number(detect.gradient_threshold_value ?? 2.0),
+      gradient_threshold_percentile: Number(detect.gradient_threshold_percentile ?? 70),
+      low_gradient_morphology_enabled: Boolean(detect.low_gradient_morphology_enabled ?? true),
+      low_gradient_open_kernel: Number(detect.low_gradient_open_kernel ?? 3),
+      low_gradient_close_kernel: Number(detect.low_gradient_close_kernel ?? 9),
+      low_gradient_fill_holes: Boolean(detect.low_gradient_fill_holes ?? true),
+      low_gradient_min_component_area: Number(detect.low_gradient_min_component_area ?? 1500),
+      reference_surface_selection_mode: String(detect.reference_surface_selection_mode ?? "largest_constant_z"),
+      reference_surface_model: String(detect.reference_surface_model ?? "auto"),
+      reference_surface_max_plane_residual_p95_mm: Number(detect.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+      object_min_height_mm: Number(seg.min_height_mm ?? 8.0),
+      object_max_height_mm: seg.max_height_mm == null ? null : Number(seg.max_height_mm),
+      reference_tolerance_mm: Number(seg.reference_tolerance_mm ?? 0.0),
+      suppress_plane_mask_in_segmentation: Boolean(seg.suppress_plane_mask_in_segmentation ?? true),
+      morphology_kernel: Number(seg.morphology_kernel ?? 5),
+      min_component_area: Number(seg.min_component_area ?? 120),
+      fill_holes: Boolean(seg.fill_holes ?? true),
+      smoothing_kernel: Number(seg.smoothing_kernel ?? 3),
+    };
+    setPlaneQaParams(defaults);
+    setPlaneQaPersistedParams(defaults);
+    setPlaneQaDirty(false);
+  }, [selectedPipeline?.id, detail?.take_id, detail?.result]);
   const detectionViewResolutionError = useMemo(() => {
     if (canonicalSelectedStageId !== "detection") return null;
     const ids = new Set(stageSemantic.views.map((view) => view.id));
@@ -580,18 +624,73 @@ export default function ProcessingLabPage() {
     await load();
   }
 
-  async function runSelectedPipeline(reprocess = false) {
+  function build25dStageParams(): Record<string, unknown> | null {
+    if (selectedPipeline?.id !== "mining_steel_ball_classification_25d" || !planeQaParams) return null;
+    return {
+      detect_belt_plane: {
+        background_detection_strategy: String(planeQaParams.background_detection_strategy ?? "low_gradient_surface"),
+        gradient_smoothing_kernel: Number(planeQaParams.gradient_smoothing_kernel ?? 3),
+        gradient_threshold_mode: String(planeQaParams.gradient_threshold_mode ?? "percentile"),
+        gradient_threshold_value: Number(planeQaParams.gradient_threshold_value ?? 2.0),
+        gradient_threshold_percentile: Number(planeQaParams.gradient_threshold_percentile ?? 70),
+        low_gradient_morphology_enabled: Boolean(planeQaParams.low_gradient_morphology_enabled ?? true),
+        low_gradient_open_kernel: Number(planeQaParams.low_gradient_open_kernel ?? 3),
+        low_gradient_close_kernel: Number(planeQaParams.low_gradient_close_kernel ?? 9),
+        low_gradient_fill_holes: Boolean(planeQaParams.low_gradient_fill_holes ?? true),
+        low_gradient_min_component_area: Number(planeQaParams.low_gradient_min_component_area ?? 1500),
+        reference_surface_selection_mode: String(planeQaParams.reference_surface_selection_mode ?? "largest_constant_z"),
+        reference_surface_model: String(planeQaParams.reference_surface_model ?? "auto"),
+        reference_surface_max_plane_residual_p95_mm: Number(planeQaParams.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+      },
+      remove_belt_segment_objects: {
+        min_height_mm: Number(planeQaParams.object_min_height_mm ?? 8.0),
+        max_height_mm: planeQaParams.object_max_height_mm == null || planeQaParams.object_max_height_mm === "" ? null : Number(planeQaParams.object_max_height_mm),
+        reference_tolerance_mm: Number(planeQaParams.reference_tolerance_mm ?? 0.0),
+        suppress_plane_mask_in_segmentation: Boolean(planeQaParams.suppress_plane_mask_in_segmentation ?? true),
+        morphology_kernel: Number(planeQaParams.morphology_kernel ?? 5),
+        min_component_area: Number(planeQaParams.min_component_area ?? 120),
+        fill_holes: Boolean(planeQaParams.fill_holes ?? true),
+        smoothing_kernel: Number(planeQaParams.smoothing_kernel ?? 3),
+      },
+    };
+  }
+
+  async function runSelectedPipeline(reprocess = false, stageParamsOverride?: Record<string, unknown> | null) {
     if (!detail || !selectedPipeline) return;
-    const response = await api.processTake(detail.take_id, { pipeline_id: selectedPipeline.id, reprocess }) as { pipeline_instance_id?: string; run_id?: string };
-    if (response.pipeline_instance_id) {
-      setSelectedPipelineInstanceId(response.pipeline_instance_id);
+    setPipelineActionBusy(true);
+    setPipelineActionMessage(stageParamsOverride ? "Applying recipe and rerunning…" : "Running pipeline…");
+    setResultStale(true);
+    try {
+      const response = await api.processTake(detail.take_id, {
+        pipeline_id: selectedPipeline.id,
+        reprocess,
+        stage_params: stageParamsOverride ?? build25dStageParams(),
+      }) as { pipeline_instance_id?: string; run_id?: string; result_path?: string };
+      if (response.pipeline_instance_id) {
+        setSelectedPipelineInstanceId(response.pipeline_instance_id);
+      }
+      await load();
+      const refreshed = await api.take(detail.take_id);
+      setDetail(refreshed);
+      setPipelineActionMessage(`Run updated: ${response.run_id ?? refreshed?.result?.processed_at ?? "completed"}`);
+      if (response.run_id) {
+        setSelectedArtifactId(null);
+        setSelectedObjectId(null);
+      }
+    } catch (err) {
+      setPipelineActionMessage(`Apply + rerun failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setPipelineActionBusy(false);
+      setResultStale(false);
     }
-    await load();
-    const refreshed = await api.take(detail.take_id);
-    setDetail(refreshed);
-    if (response.run_id) {
-      setSelectedArtifactId(null);
-      setSelectedObjectId(null);
+  }
+
+  function applyPlaneQaParams(rerun = false) {
+    if (!planeQaParams) return;
+    setPlaneQaPersistedParams(planeQaParams);
+    setPlaneQaDirty(false);
+    if (rerun) {
+      void runSelectedPipeline(false, build25dStageParams());
     }
   }
 
@@ -1289,9 +1388,9 @@ export default function ProcessingLabPage() {
             <p>{detail?.modalities?.join(", ") || "Select a take to inspect modalities, stages, artifacts, and results."}</p>
           </div>
           <div className="studio-actions">
-            <button disabled={!compatible} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(false)} type="button">Run pipeline</button>
+            <button disabled={!compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(false)} type="button">Run pipeline</button>
             <button
-              disabled={!compatible || !selectedStage || !selectedPipeline?.supports_partial_stages}
+              disabled={!compatible || !selectedStage || !selectedPipeline?.supports_partial_stages || pipelineActionBusy}
               title={
                 !compatible
                   ? "Cannot execute: incompatible modalities."
@@ -1304,9 +1403,10 @@ export default function ProcessingLabPage() {
             >
               Run until selected stage
             </button>
-            <button disabled={!detail || !compatible} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(true)} type="button">Reprocess</button>
-            <button disabled={!detail} onClick={() => void clearSelectedOutputs()} type="button">Clear outputs</button>
+            <button disabled={!detail || !compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(true)} type="button">Reprocess</button>
+            <button disabled={!detail || pipelineActionBusy} onClick={() => void clearSelectedOutputs()} type="button">Clear outputs</button>
           </div>
+          {pipelineActionMessage && <small className={resultStale ? "preview-stale" : "section-note"}>{pipelineActionMessage}</small>}
           {!compatible && selectedPipeline && (
             <p>{incompatibleModalityMessage(selectedPipeline, detail?.modalities) ?? "Cannot execute: incompatible modalities."}</p>
           )}
@@ -1388,16 +1488,18 @@ export default function ProcessingLabPage() {
 
         <section className="studio-stage-strip" aria-label="Stage navigator">
           {(selectedPipeline?.stages ?? []).map((stage, index) => {
-            const timing = stageTimingMs(detail?.result, stage.id);
-            const stageArtifacts = artifactsForStage(detail, canonicalStageId(stage.id, stage.display_name));
+            const canonicalStage = canonicalStageId(stage.id, stage.display_name);
+            const stageArtifacts = artifactsForStage(detail, canonicalStage);
             const artifactCount = stageArtifacts.length;
-            const execStage = detail?.result?.pipeline_execution?.stages?.find((item) => item.stage_id === stage.id);
-            const semanticSummary = stageSemanticSummary(canonicalStageId(stage.id, stage.display_name), detail, stageArtifacts, execStage);
+            const execStage = detail?.result?.pipeline_execution?.stages?.find((item) => item.stage_id === stage.id || item.stage_id === canonicalStage);
+            const timing = execStage?.duration_ms ?? stageTimingMs(detail?.result, stage.id) ?? stageTimingMs(detail?.result, canonicalStage);
+            const timingLabel = timing == null ? (artifactCount > 0 ? "completed" : "not run") : `${timing.toFixed(timing >= 100 ? 0 : 1)} ms`;
+            const semanticSummary = stageSemanticSummary(canonicalStage, detail, stageArtifacts, execStage);
             return (
               <button className={stage.id === selectedStageId ? "active" : ""} key={stage.id} onClick={() => selectStage(stage.id)} type="button">
                 <span>{index + 1}</span>
-                <strong>{stage.display_name}</strong>
-                <small>{timing == null ? "not run" : `${timing.toFixed(timing >= 100 ? 0 : 1)} ms`}</small>
+                <strong>{prettyStageLabel(stage.id, stage.display_name)}</strong>
+                <small>{timingLabel}</small>
                 <small>{semanticSummary}</small>
                 <small>{artifactCount} artifacts • {execStage?.warnings?.length ?? 0} warnings • {execStage?.errors?.length ?? 0} errors</small>
               </button>
@@ -1492,7 +1594,7 @@ export default function ProcessingLabPage() {
         <section className="studio-workbench">
           <div className="studio-workbench-title">
             <span className="eyebrow">Stage workspace</span>
-            <strong>{selectedStage?.display_name ?? "Workspace"}</strong>
+            <strong>{selectedStage ? prettyStageLabel(selectedStage.id, selectedStage.display_name) : "Workspace"}</strong>
           </div>
           {canonicalSelectedStageId === "segmentation" && (
             <StageParameterPanel
@@ -1535,6 +1637,109 @@ export default function ProcessingLabPage() {
               onReset={() => resetEllipseDefaults()}
             />
           )}
+          {canonicalSelectedStageId === "detect_belt_plane" && planeQaParams && (
+            <section className="segmentation-controls-strip reference-surface-controls-strip">
+              <div className="stage-parameter-panel-header">
+                <strong>Reference surface tuning</strong>
+                <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "In sync with last run payload")}</small>
+              </div>
+              <div className="segmentation-controls-row">
+                <label>Strategy
+                  <select value={String(planeQaParams.background_detection_strategy ?? "low_gradient_surface")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, background_detection_strategy: e.target.value } : c); setPlaneQaDirty(true); }}>
+                    <option value="low_gradient_surface">low_gradient_surface</option>
+                    <option value="depth_percentile_plane">depth_percentile_plane</option>
+                  </select>
+                </label>
+                <label>Gradient percentile {Number(planeQaParams.gradient_threshold_percentile ?? 70)}
+                  <input type="range" min={1} max={99} value={Number(planeQaParams.gradient_threshold_percentile ?? 70)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, gradient_threshold_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Smoothing
+                  <input type="number" min={1} max={21} step={2} value={Number(planeQaParams.gradient_smoothing_kernel ?? 3)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, gradient_smoothing_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Open
+                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.low_gradient_open_kernel ?? 3)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_open_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Close
+                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.low_gradient_close_kernel ?? 9)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_close_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Min area
+                  <input type="number" min={50} max={500000} step={50} value={Number(planeQaParams.low_gradient_min_component_area ?? 1500)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_min_component_area: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Fill holes
+                  <input type="checkbox" checked={Boolean(planeQaParams.low_gradient_fill_holes ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_fill_holes: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Model
+                  <select value={String(planeQaParams.reference_surface_model ?? "auto")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_model: e.target.value } : c); setPlaneQaDirty(true); }}>
+                    <option value="auto">auto</option>
+                    <option value="plane">plane</option>
+                    <option value="constant_z">constant_z</option>
+                  </select>
+                </label>
+                <label>Object min height
+                  <input type="number" min={0} max={200} step={0.5} value={Number(planeQaParams.object_min_height_mm ?? 8)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, object_min_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
+              </div>
+            </section>
+          )}
+          {canonicalSelectedStageId === "remove_belt_segment_objects" && planeQaParams && (
+            <section className="segmentation-controls-strip reference-surface-controls-strip">
+              <div className="stage-parameter-panel-header">
+                <strong>Segmentation tuning</strong>
+                <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "In sync with last run payload")}</small>
+              </div>
+              <div className="segmentation-controls-row">
+                <label>Min height
+                  <input type="number" min={0} max={200} step={0.5} value={Number(planeQaParams.object_min_height_mm ?? 8)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, object_min_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Max height
+                  <input type="number" min={0} max={500} step={1} value={planeQaParams.object_max_height_mm == null || !Number.isFinite(Number(planeQaParams.object_max_height_mm)) ? "" : Number(planeQaParams.object_max_height_mm)} placeholder="none" onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, object_max_height_mm: e.target.value === "" ? null : Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Reference tol
+                  <input type="number" min={0} max={50} step={0.5} value={Number(planeQaParams.reference_tolerance_mm ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_tolerance_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Suppress reference
+                  <input type="checkbox" checked={Boolean(planeQaParams.suppress_plane_mask_in_segmentation ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, suppress_plane_mask_in_segmentation: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Morph kernel
+                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.morphology_kernel ?? 5)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, morphology_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Min component
+                  <input type="number" min={0} max={500000} step={10} value={Number(planeQaParams.min_component_area ?? 120)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, min_component_area: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Fill holes
+                  <input type="checkbox" checked={Boolean(planeQaParams.fill_holes ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, fill_holes: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Smoothing
+                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.smoothing_kernel ?? 3)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, smoothing_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
+              </div>
+            </section>
+          )}
+          {canonicalSelectedStageId === "detect_belt_plane" && (() => {
+            const stageArtifacts = artifactsForStage(workspaceDetail, canonicalSelectedStageId);
+            const fit = (stageArtifacts.find((a) => a.artifact_id === "plane_fit_debug")?.metadata ?? {}) as Record<string, unknown>;
+            const sel = ((fit.background_selection as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+            const gdbg = ((sel.gradient_debug as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+            const coeffs = (fit.plane_coefficients as unknown[] | undefined) ?? [];
+            return (
+              <section className="pipeline-status-grid">
+                <div><span>Strategy</span><strong>{String(sel.background_detection_strategy ?? fit.background_detection_strategy ?? "-")}</strong></div>
+                <div><span>Reference model</span><strong>{String(fit.reference_surface_model_type ?? "failed")}</strong></div>
+                <div><span>Plane calculated</span><strong>{String(fit.reference_surface_model_type ?? "") === "plane" ? "yes" : "no"}</strong></div>
+                <div><span>Constant Z</span><strong>{fit.constant_z_mm == null ? "-" : `${Number(fit.constant_z_mm).toFixed(3)} mm`}</strong></div>
+                <div><span>Surface coverage</span><strong>{`${(Number(gdbg.selected_component_area_ratio ?? 0) * 100).toFixed(1)}%`}</strong></div>
+                <div><span>Residual p95</span><strong>{fit.model_residual_p95_mm == null ? "-" : `${Number(fit.model_residual_p95_mm).toFixed(2)} mm`}</strong></div>
+                <div><span>Selection reason</span><strong>{String(fit.model_selection_reason ?? "-")}</strong></div>
+                <div><span>Plane coeffs</span><strong>{coeffs.length ? coeffs.map((v) => Number(v).toFixed(3)).join(", ") : "-"}</strong></div>
+              </section>
+            );
+          })()}
           {renderStageSemanticView({
             detail: workspaceDetail,
             compatible,
@@ -1578,3 +1783,10 @@ export default function ProcessingLabPage() {
     </main>
   );
 }
+  const prettyStageLabel = (stageId: string, fallback: string) => {
+    const canonical = canonicalStageId(stageId, fallback);
+    if (canonical === "detect_belt_plane") return "Detect reference surface";
+    if (canonical === "normalize_heights_to_plane") return "Normalize heights to reference";
+    if (canonical === "remove_belt_segment_objects") return "Remove reference + segment objects";
+    return fallback;
+  };

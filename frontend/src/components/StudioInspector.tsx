@@ -159,6 +159,14 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         <div className={`inspector-section ${(Array.isArray(planeFitDebug.warnings) && planeFitDebug.warnings.length) || (Array.isArray(normalizationDebug.warnings) && normalizationDebug.warnings.length) ? "warning" : ""}`}>
           <span>Plane QA</span>
           <strong>{String(planeFitDebug.status ?? "unknown")}</strong>
+          <small>Strategy: {String((bgSelection.background_detection_strategy ?? planeFitDebug.background_detection_strategy) ?? "-")}</small>
+          <small>Reference model: {String(planeFitDebug.reference_surface_model_type ?? "-")}</small>
+          <small>Selection reason: {String(planeFitDebug.model_selection_reason ?? "-")}</small>
+          <small>Selected component: {String((((bgSelection.gradient_debug as Record<string, unknown> | undefined) ?? {}).selected_component_id) ?? "-")}</small>
+          <small>Selected area ratio: {String((((bgSelection.gradient_debug as Record<string, unknown> | undefined) ?? {}).selected_component_area_ratio) ?? "-")}</small>
+          <small>Selected z std/mm: {String((((bgSelection.gradient_debug as Record<string, unknown> | undefined) ?? {}).selected_component_z_std_mm) ?? "-")}</small>
+          <small>Selected z mad/mm: {String((((bgSelection.gradient_debug as Record<string, unknown> | undefined) ?? {}).selected_component_z_mad_mm) ?? "-")}</small>
+          <small>Selected gradient p95: {String((((bgSelection.gradient_debug as Record<string, unknown> | undefined) ?? {}).selected_component_gradient_p95) ?? "-")}</small>
           <small>Selection mode: {String(bgSelection.background_selection_mode ?? "-")}</small>
           <small>Inferred convention: {String(bgSelection.inferred_depth_convention ?? "-")}</small>
           <small>Candidate coverage: {String(bgSelection.candidate_coverage_percent ?? "-")}%</small>

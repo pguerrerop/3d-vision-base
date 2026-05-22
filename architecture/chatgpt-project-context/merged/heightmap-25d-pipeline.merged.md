@@ -330,3 +330,56 @@ Prints:
 - `reprocess = true`
 
 and prints the full response payload.
+
+## Low-gradient reference-surface strategy (POC default)
+
+- New default in `DetectBeltPlaneStage`:
+  - `background_detection_strategy = "low_gradient_surface"`
+- Motivation:
+  - Percentile-only seed selection was too patchy on real TriSpector captures.
+  - The POC now prefers broad low-gradient depth regions as reference-surface candidates.
+- Workflow:
+  - Compute depth-gradient magnitude on valid pixels.
+  - Threshold into low-gradient mask (`fixed | percentile | otsu`).
+  - Connected-components candidate scoring with area + constancy + border-touch priors.
+  - Select best reference-surface component.
+  - Fit model in `auto | plane | constant_z`.
+    - `auto` falls back to `constant_z` when plane quality is poor.
+- New/updated artifacts:
+  - `depth_gradient_magnitude.png`
+  - `low_gradient_mask.png`
+  - `low_gradient_components_overlay.png`
+  - `low_gradient_components.json`
+  - `reference_surface_selected_mask.png`
+  - `reference_surface_candidates.json`
+  - `gradient_debug.json`
+- Segmentation now suppresses selected reference-surface pixels before final object mask generation.
+
+## Studio-tunable 25D reference-surface parameters
+
+The `Detect belt plane` stage now accepts run-time tuning parameters from Studio (`stage_params`) so engineers can iterate without code edits:
+
+- `background_detection_strategy`: `depth_percentile_plane | low_gradient_surface`
+- `gradient_smoothing_kernel`
+- `gradient_threshold_mode`: `fixed | percentile | otsu`
+- `gradient_threshold_value`
+- `gradient_threshold_percentile`
+- `low_gradient_morphology_enabled`
+- `low_gradient_open_kernel`
+- `low_gradient_close_kernel`
+- `low_gradient_fill_holes`
+- `low_gradient_min_component_area`
+- `reference_surface_selection_mode`
+- `reference_surface_model`: `plane | constant_z | auto`
+- `reference_surface_max_plane_residual_p95_mm`
+- `object_min_height_mm` (mapped to segmentation min-height threshold)
+
+Model selection diagnostics explicitly report:
+
+- `reference_surface_model_type`
+- `plane_coefficients` or `constant_z_mm`
+- `selected_component_id`
+- `selected_component_area_ratio`
+- `model_residual_mean_mm`
+- `model_residual_p95_mm`
+- `model_selection_reason`

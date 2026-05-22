@@ -33,6 +33,7 @@ def dispatch_take_processing(
     recipe_version_id: str | None = None,
     acquisition_group_id: str | None = None,
     calibration_profile_id: str | None = None,
+    stage_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     logger.info(
         "dispatch_take_processing take_id=%s pipeline_id=%s reprocess=%s source_id=%s recipe_version_id=%s acquisition_group_id=%s",
@@ -137,6 +138,7 @@ def dispatch_take_processing(
             source_id=source_id or None,
             acquisition_group_id=acquisition_group_id,
             calibration_profile_id=str(calibration_profile_id) if calibration_profile_id else None,
+            stage_params=stage_params or None,
         )
         logger.info(
             "25d_processing_completed take_id=%s output_dir=%s status=%s artifacts=%s",

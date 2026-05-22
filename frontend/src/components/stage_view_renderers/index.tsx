@@ -58,7 +58,8 @@ function objectAnnotationByCandidate(detail: TakeDetail | null): Map<string, Rec
 
 function explore(
   artifacts: StudioArtifact[],
-  props: RendererProps
+  props: RendererProps,
+  opts?: { disableRoi?: boolean }
 ) {
   if (!artifacts.length) return semanticEmpty(props.stageId, props.view.id);
   return (
@@ -75,13 +76,13 @@ function explore(
       onHoverObject={props.onHoverObject}
       onHoverArtifact={props.onHoverArtifact}
       onOverlayDebug={props.onOverlayDebug}
-      roi={props.roi}
-      roiPolygon={props.roiPolygon}
-      roiType={props.roiType}
-      roiEnabled={props.roiEnabled}
-      onApplyRoi={props.onApplyRoi}
-      onApplyPolygonRoi={props.onApplyPolygonRoi}
-      onClearRoi={props.onClearRoi}
+      roi={opts?.disableRoi ? null : props.roi}
+      roiPolygon={opts?.disableRoi ? null : props.roiPolygon}
+      roiType={opts?.disableRoi ? undefined : props.roiType}
+      roiEnabled={opts?.disableRoi ? false : props.roiEnabled}
+      onApplyRoi={opts?.disableRoi ? undefined : props.onApplyRoi}
+      onApplyPolygonRoi={opts?.disableRoi ? undefined : props.onApplyPolygonRoi}
+      onClearRoi={opts?.disableRoi ? undefined : props.onClearRoi}
     />
   );
 }
@@ -91,7 +92,16 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     const semantic = stageSemanticDefinition(props.stageId);
     const runArtifacts = artifactsForStage(props.detail, props.stageId);
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, runArtifacts);
-    const artifacts = context.resolvedArtifacts.filter((artifact) => {
+    const candidateArtifacts = (() => {
+      if (props.view.id === "below_reference" || props.view.id === "above_threshold") {
+        return [
+          ...context.resolvedArtifacts,
+          ...(props.detail?.result?.artifacts ?? []).filter((artifact) => !context.resolvedArtifacts.some((item) => item.artifact_id === artifact.artifact_id && item.stage_id === artifact.stage_id)),
+        ];
+      }
+      return context.resolvedArtifacts;
+    })();
+    const artifacts = candidateArtifacts.filter((artifact) => {
       if (artifact.kind !== "image") return false;
       if (props.view.id === "height_preview") {
         return artifact.artifact_id === "source_heightmap_preview"
@@ -104,6 +114,8 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       if (props.view.id === "low_gradient_mask") return artifact.artifact_id === "low_gradient_mask" || /low_gradient_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "selected_surface") return artifact.artifact_id === "reference_surface_selected_mask" || artifact.artifact_id === "expanded_plane_mask" || /reference_surface_selected_mask|expanded_plane_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "normalized_height") return artifact.artifact_id === "normalized_heightmap" || /normalized_heightmap/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "below_reference") return artifact.artifact_id === "below_reference_mask" || /below_reference_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "above_threshold") return artifact.artifact_id === "above_threshold_mask" || /above_threshold_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "valid_mask") return artifact.artifact_id === "valid_mask" || /valid_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "background_candidates" || props.view.id === "background_seeds") return artifact.artifact_id === "background_seed_mask" || artifact.artifact_id === "background_candidate_mask" || /background_(seed|candidate)_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "expanded_plane") return artifact.artifact_id === "expanded_plane_mask" || /expanded_plane_mask/i.test(String(artifact.path ?? ""));
@@ -141,6 +153,9 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
           </div>
         );
       }
+    }
+    if (props.view.id === "depth_plot") {
+      return explore(artifacts, props, { disableRoi: true });
     }
     return explore(artifacts, props);
   },
@@ -540,6 +555,26 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       if (!rows.length) return semanticEmpty(props.stageId, props.view.id);
       return <pre className="json-block">{JSON.stringify(rows, null, 2)}</pre>;
     }
+    if (semantic.category === "measurement" && (props.view.id === "measurements_25d" || props.view.id === "measurements")) {
+      const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
+      const kept = objects.filter((item) => item.filter_status !== "rejected");
+      const avgDiameter = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.diameter_mm ?? obj.diameter_estimate_mm ?? 0), 0) / kept.length : 0;
+      const avgCircularity = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.sphericity_score ?? 0), 0) / kept.length : 0;
+      return (
+        <div className="studio-object-workspace">
+          <StudioObjectList objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelect={props.onSelectObject} onHover={props.onHoverObject} />
+          <div className="studio-table-pane">
+            <div className="pipeline-status-grid">
+              <div><span>Objects</span><strong>{kept.length}</strong></div>
+              <div><span>Rejected</span><strong>{objects.length - kept.length}</strong></div>
+              <div><span>Avg diameter</span><strong>{kept.length ? `${avgDiameter.toFixed(2)} mm` : "-"}</strong></div>
+              <div><span>Avg circularity</span><strong>{kept.length ? avgCircularity.toFixed(2) : "-"}</strong></div>
+            </div>
+            <ObjectTable objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelectObject={props.onSelectObject} onHoverObject={props.onHoverObject} />
+          </div>
+        </div>
+      );
+    }
     const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
     const stageArtifacts = artifactsForStage(props.detail, props.stageId);
     const classificationArtifact = firstArtifactByAlias(stageArtifacts, ["classification_result", "classification_result_artifact"]);
@@ -668,7 +703,13 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     if (semantic.category === "plane_qa" && props.view.id === "surface_candidates") {
       const surfaceCandidates = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_candidates");
       const gradientDebug = context.runArtifacts.find((item) => item.artifact_id === "gradient_debug");
-      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null }, null, 2)}</pre>;
+      const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");
+      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null, selected_surface_debug: selectedSurface?.metadata ?? null }, null, 2)}</pre>;
+    }
+    if (semantic.category === "plane_qa" && props.view.id === "reference_surface") {
+      const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");
+      const planeFit = context.runArtifacts.find((item) => item.artifact_id === "plane_fit_debug");
+      return <pre className="json-block">{JSON.stringify({ selected_surface_debug: selectedSurface?.metadata ?? null, plane_fit_debug: planeFit?.metadata ?? null }, null, 2)}</pre>;
     }
     return <pre className="json-block">{JSON.stringify(payload, null, 2)}</pre>;
   },

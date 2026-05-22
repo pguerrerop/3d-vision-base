@@ -433,7 +433,7 @@ def test_source_histogram_resolves_rgb_and_computes_cached_payload(tmp_path: Pat
     assert any(path.name.startswith("hist_") for path in cache_dir.iterdir())
 
 
-def test_runtime_process_endpoints_delegate_to_supervisor(monkeypatch) -> None:
+def test_runtime_process_endpoints_delegate_to_supervisor(monkeypatch, tmp_path: Path) -> None:
     class FakeSupervisor:
         def list_processes(self):
             return [{"process_id": "trispector_ftp", "status": "stopped"}]
@@ -457,7 +457,27 @@ def test_runtime_process_endpoints_delegate_to_supervisor(monkeypatch) -> None:
             return {"process_id": process_id, "events": [{"event_type": "PROCESS_STARTED", "limit": limit}]}
 
     monkeypatch.setattr("vision_3d_acquisition.api.main.get_runtime_supervisor", lambda: FakeSupervisor())
-    assert runtime_processes()["processes"][0]["process_id"] == "trispector_ftp"
+    data_dir = tmp_path / "data"
+    settings = make_settings(data_dir)
+    process_dir = data_dir / "runtime" / "processes"
+    process_dir.mkdir(parents=True, exist_ok=True)
+    (process_dir / "run_25d_worker.json").write_text(
+        json.dumps(
+            {
+                "process_name": "run_25d_worker",
+                "runtime_role": "worker",
+                "pid": 1234,
+                "status": "running",
+                "started_at": "2026-05-22T10:00:00+00:00",
+                "last_heartbeat": "2026-05-22T10:00:01+00:00",
+                "host": "test-host",
+                "version": "poc",
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = runtime_processes(settings=settings)
+    assert rows[0]["process_name"] == "run_25d_worker"
     assert runtime_process_status("trispector_ftp")["status"] == "stopped"
     assert runtime_process_start("trispector_ftp")["status"] == "running"
     assert runtime_process_stop("trispector_ftp")["status"] == "stopped"

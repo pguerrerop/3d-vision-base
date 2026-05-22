@@ -1149,7 +1149,7 @@ export const api = {
     request<SourceHistogramResponse>(
       `/api/takes/${encodeURIComponent(takeId)}/source-histogram?max_dim=${encodeURIComponent(String(maxDim))}&bins=${encodeURIComponent(String(bins))}${filename ? `&filename=${encodeURIComponent(filename)}` : ""}`
     ),
-  processTake: (takeId: string, payload: { pipeline_id: string; run_until_stage?: string | null; reprocess?: boolean }) =>
+  processTake: (takeId: string, payload: { pipeline_id: string; run_until_stage?: string | null; reprocess?: boolean; stage_params?: Record<string, unknown> | null }) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/process`, payload),
   previewSegmentation: (payload: { take_id: string; pipeline_id: string; stage_id?: string; params: Record<string, unknown> }) =>
     post<SegmentationPreviewResponse>("/api/pipelines/preview-segmentation", payload),

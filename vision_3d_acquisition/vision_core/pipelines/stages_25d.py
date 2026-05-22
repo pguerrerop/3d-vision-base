@@ -129,12 +129,12 @@ class DetectBeltPlaneStage:
     gradient_method: str = "sobel"
     gradient_threshold_mode: str = "percentile"
     gradient_threshold_value: float = 2.0
-    gradient_threshold_percentile: float = 35.0
+    gradient_threshold_percentile: float = 70.0
     invalid_neighbor_policy: str = "mark_high_gradient"
     low_gradient_morphology_enabled: bool = True
     low_gradient_open_kernel: int = 3
-    low_gradient_close_kernel: int = 5
-    low_gradient_min_component_area: int = 800
+    low_gradient_close_kernel: int = 9
+    low_gradient_min_component_area: int = 1500
     low_gradient_fill_holes: bool = True
     reference_surface_selection_mode: str = "largest_constant_z"
     reference_surface_min_area_ratio: float = 0.08
@@ -144,6 +144,11 @@ class DetectBeltPlaneStage:
     reference_surface_constancy_weight: float = 0.5
     reference_surface_area_weight: float = 0.3
     reference_surface_model: str = "auto"
+    reference_surface_max_plane_residual_p95_mm: float = 3.0
+    reference_surface_height_gate_enabled: bool = True
+    reference_surface_height_gate_margin_mm: float = 8.0
+    reference_surface_height_gate_min_coverage_ratio: float = 0.10
+    reference_surface_height_gate_max_coverage_ratio: float = 0.95
     random_seed: int = 7
     name: str = "DetectBeltPlane"
     category: str = "calibration"
@@ -182,6 +187,10 @@ class DetectBeltPlaneStage:
         inferred_depth_convention = "unknown"
         candidate_coverage = 0.0
         z_thresholds: dict[str, float] = {}
+        height_gate_mask = valid_for_fit.copy()
+        active_height_gate_mask = valid_for_fit.copy()
+        height_gate_debug: dict[str, Any] = {"enabled": bool(self.reference_surface_height_gate_enabled), "status": "not_evaluated"}
+        gradient_debug: dict[str, Any] = {}
 
         if valid_pixel_count < self.plane_fit_min_valid_pixels:
             status = "failed"
@@ -194,8 +203,16 @@ class DetectBeltPlaneStage:
             z_thresholds = {"near_q": near_q, "far_q": far_q, "percentile": p}
             low_mask = valid_for_fit & (frame.z_mm <= near_q)
             high_mask = valid_for_fit & (frame.z_mm >= far_q)
+            height_gate_mask, height_gate_debug = _reference_height_gate_from_distribution(
+                frame.z_mm,
+                valid_for_fit,
+                enabled=bool(self.reference_surface_height_gate_enabled),
+                margin_mm=float(self.reference_surface_height_gate_margin_mm),
+                min_coverage_ratio=float(self.reference_surface_height_gate_min_coverage_ratio),
+                max_coverage_ratio=float(self.reference_surface_height_gate_max_coverage_ratio),
+            )
+            active_height_gate_mask = height_gate_mask if self.background_detection_strategy == "low_gradient_surface" else valid_for_fit
 
-            gradient_debug: dict[str, Any] = {}
             if self.background_detection_strategy == "low_gradient_surface":
                 grad = _compute_depth_gradient(
                     frame.z_mm,
@@ -236,14 +253,21 @@ class DetectBeltPlaneStage:
                 selected_mask = np.zeros_like(valid_for_fit, dtype=bool)
                 if selected_label > 0:
                     selected_mask = (lg_result["labels"] == selected_label) & valid_for_fit
-                candidate_mask = selected_mask
+                candidate_mask = selected_mask & height_gate_mask
                 inferred_depth_convention = "low_gradient_surface"
+                selected_row = next((row for row in (lg_result.get("candidates") or []) if int(row.get("label") or 0) == int(selected_label)), {})
                 gradient_debug = {
                     "strategy": "low_gradient_surface",
                     "threshold_mode": self.gradient_threshold_mode,
                     "threshold_value": float(gthr),
                     "selected_component_id": int(selected_label),
                     "selected_component_area_ratio": float(np.count_nonzero(candidate_mask) / max(1, np.count_nonzero(valid_for_fit))),
+                    "selected_component_z_std_mm": float(selected_row.get("z_std") or 0.0),
+                    "selected_component_z_mad_mm": float(selected_row.get("z_mad") or 0.0),
+                    "selected_component_gradient_p95": float(selected_row.get("gradient_p95") or 0.0),
+                    "selected_component_score": float(selected_row.get("score") or 0.0),
+                    "component_count": int(len(lg_result.get("candidates") or [])),
+                    "height_gate": height_gate_debug,
                 }
                 write_heightmap_preview_png(grad, valid_for_fit, output_dir / "depth_gradient_magnitude.png")
                 cv2.imwrite(str(output_dir / "low_gradient_mask.png"), (low_grad_mask.astype(np.uint8) * 255))
@@ -355,6 +379,11 @@ class DetectBeltPlaneStage:
 
             candidate_coverage = float(np.count_nonzero(candidate_mask) / max(1, np.count_nonzero(valid_for_fit)))
             seed_mask = candidate_mask.copy()
+            if self.background_detection_strategy == "low_gradient_surface":
+                if candidate_coverage < float(self.reference_surface_min_area_ratio):
+                    warnings.append("selected_reference_surface_too_small")
+                if candidate_coverage < 0.02:
+                    warnings.append("low_gradient_mask_coverage_too_low")
             if (
                 inferred_depth_convention == "smaller_z_is_farther"
                 and abs(near_q) < 1e-6
@@ -399,7 +428,7 @@ class DetectBeltPlaneStage:
                         float(np.std(seed_residual_values) * self.plane_background_residual_adaptive_multiplier),
                     )
                 tol = adaptive_tol if self.plane_background_residual_tolerance_mode == "adaptive" else float(self.plane_background_residual_tolerance_mm)
-                expanded_plane_mask = (np.abs(residual_seed) <= tol) & valid_for_fit
+                expanded_plane_mask = (np.abs(residual_seed) <= tol) & valid_for_fit & active_height_gate_mask
                 if self.plane_background_fill_holes:
                     close_k = max(1, int(self.plane_background_close_kernel))
                     kernel = np.ones((close_k, close_k), np.uint8)
@@ -411,7 +440,7 @@ class DetectBeltPlaneStage:
                         flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
                         cv2.floodFill(flood, flood_mask, (0, 0), 255)
                         expanded_u8 = expanded_u8 | cv2.bitwise_not(flood)
-                    expanded_plane_mask = expanded_u8 > 0
+                    expanded_plane_mask = (expanded_u8 > 0) & active_height_gate_mask
                 expanded_plane_coverage = float(np.count_nonzero(expanded_plane_mask) / max(1, np.count_nonzero(valid_for_fit)))
                 if expanded_plane_coverage < float(self.plane_background_min_coverage_ratio):
                     warnings.append("expanded_plane_coverage_too_low")
@@ -424,7 +453,7 @@ class DetectBeltPlaneStage:
                             break
                         coeffs = _least_squares_plane(refit_points)
                         residual_refit = _residual_map(frame, coeffs)
-                        final_plane_inlier_mask = (np.abs(residual_refit) <= tol) & valid_for_fit
+                        final_plane_inlier_mask = (np.abs(residual_refit) <= tol) & valid_for_fit & active_height_gate_mask
                 else:
                     final_plane_inlier_mask = expanded_plane_mask.copy()
 
@@ -459,6 +488,8 @@ class DetectBeltPlaneStage:
             warnings.append("plane_fit_used_very_few_samples")
         if bg_p95_abs > 100.0:
             warnings.append("extreme_plane_fit_residuals_detected")
+        if float(np.percentile(residual_abs, 95)) > float(self.reference_surface_max_plane_residual_p95_mm):
+            warnings.append("model_residual_p95_too_high")
         if np.count_nonzero(candidate_mask) and np.count_nonzero(belt_mask):
             overlap = float(np.count_nonzero(candidate_mask & belt_mask) / max(1, np.count_nonzero(candidate_mask)))
             if overlap < 0.3:
@@ -472,18 +503,28 @@ class DetectBeltPlaneStage:
             "inlier_ratio": inlier_ratio,
         }
         reference_model_type = "plane"
+        model_selection_reason = "plane_fit_ok"
         reference_constant_z_mm = float(np.median(frame.z_mm[candidate_mask])) if np.count_nonzero(candidate_mask) else float(np.median(frame.z_mm[valid_for_fit]))
         use_constant_z = False
         if self.reference_surface_model == "constant_z":
             use_constant_z = True
+            model_selection_reason = "forced_constant_z"
+        elif self.reference_surface_model == "plane":
+            use_constant_z = False
+            model_selection_reason = "forced_plane"
         elif self.reference_surface_model == "auto":
-            if status != "success" or inlier_ratio < max(0.15, self.plane_fit_min_inlier_ratio * 0.6):
+            auto_fail = status != "success" or inlier_ratio < max(0.15, self.plane_fit_min_inlier_ratio * 0.6) or bg_p95_abs > float(self.reference_surface_max_plane_residual_p95_mm)
+            if auto_fail:
                 use_constant_z = True
+                model_selection_reason = "auto_constant_z_fallback"
+            else:
+                model_selection_reason = "auto_plane_selected"
         if use_constant_z:
             reference_model_type = "constant_z"
             coeffs = np.asarray([0.0, 0.0, 1.0, -reference_constant_z_mm], dtype=np.float64)
             residual_map = frame.z_mm.astype(np.float32) - np.float32(reference_constant_z_mm)
             residual_map[~frame.valid_mask] = 0.0
+            warnings.append("constant_z_fallback_used")
 
         context.set_artifact("belt_plane", tuple(float(x) for x in coeffs.tolist()))
         context.set_artifact("plane_model", tuple(float(x) for x in coeffs.tolist()))
@@ -493,6 +534,7 @@ class DetectBeltPlaneStage:
                 "type": reference_model_type,
                 "plane_coefficients": [float(x) for x in coeffs.tolist()] if reference_model_type == "plane" else None,
                 "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
+                "model_selection_reason": model_selection_reason,
             },
         )
         context.set_artifact("belt_plane_stats", stats)
@@ -507,6 +549,7 @@ class DetectBeltPlaneStage:
         plane_json = {
             "reference_surface_model_type": reference_model_type,
             "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
+            "model_selection_reason": model_selection_reason,
             "equation": {"a": float(coeffs[0]), "b": float(coeffs[1]), "c": float(coeffs[2]), "d": float(coeffs[3])},
             "residual_stats_mm": stats,
             "status": status,
@@ -514,7 +557,12 @@ class DetectBeltPlaneStage:
         }
         (output_dir / "belt_plane.json").write_text(json.dumps(plane_json, indent=2), encoding="utf-8")
 
-        write_heightmap_preview_png(np.abs(residual_map), frame.valid_mask, output_dir / "belt_plane_residuals.png")
+        write_heightmap_preview_png(
+            np.abs(residual_map),
+            frame.valid_mask,
+            output_dir / "belt_plane_residuals.png",
+            colorbar_label="absolute residual (mm)",
+        )
         cv2.imwrite(str(output_dir / "plane_inlier_mask.png"), (belt_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "background_candidate_mask.png"), (candidate_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "background_seed_mask.png"), (seed_mask.astype(np.uint8) * 255))
@@ -542,6 +590,7 @@ class DetectBeltPlaneStage:
                 "enabled": bool(self.background_must_touch_roi_border),
                 "border_connected_component_count": int(border_connected_count),
             },
+            "height_gate": height_gate_debug,
             "component_stats": component_stats[:40],
             "warnings": warnings,
         }
@@ -568,6 +617,11 @@ class DetectBeltPlaneStage:
             "background_height_std_after_normalization_mm": bg_std,
             "background_height_p95_abs_after_normalization_mm": bg_p95_abs,
             "foreground_mean_height_mm": fg_mean,
+            "reference_surface_model_type": reference_model_type,
+            "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
+            "model_selection_reason": model_selection_reason,
+            "model_residual_mean_mm": float(np.mean(residual_abs)) if residual_abs.size else 0.0,
+            "model_residual_p95_mm": float(np.percentile(residual_abs, 95)) if residual_abs.size else 0.0,
             "warnings": warnings,
             "background_selection": background_selection_debug,
             "config": {
@@ -592,9 +646,24 @@ class DetectBeltPlaneStage:
                 "invalid_neighbor_policy": self.invalid_neighbor_policy,
                 "reference_surface_selection_mode": self.reference_surface_selection_mode,
                 "reference_surface_model": self.reference_surface_model,
+                "reference_surface_height_gate_enabled": self.reference_surface_height_gate_enabled,
+                "reference_surface_height_gate_margin_mm": self.reference_surface_height_gate_margin_mm,
+                "reference_surface_height_gate_min_coverage_ratio": self.reference_surface_height_gate_min_coverage_ratio,
+                "reference_surface_height_gate_max_coverage_ratio": self.reference_surface_height_gate_max_coverage_ratio,
             },
         }
         (output_dir / "plane_fit_debug.json").write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
+        selected_surface_debug = {
+            "reference_surface_model_type": reference_model_type,
+            "plane_coefficients": [float(x) for x in coeffs.tolist()] if reference_model_type == "plane" else None,
+            "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
+            "selected_component_id": (gradient_debug.get("selected_component_id") if isinstance(gradient_debug, dict) else None),
+            "selected_component_area_ratio": (gradient_debug.get("selected_component_area_ratio") if isinstance(gradient_debug, dict) else None),
+            "model_residual_mean_mm": float(np.mean(residual_abs)) if residual_abs.size else 0.0,
+            "model_residual_p95_mm": float(np.percentile(residual_abs, 95)) if residual_abs.size else 0.0,
+            "model_selection_reason": model_selection_reason,
+        }
+        (output_dir / "selected_surface_debug.json").write_text(json.dumps(selected_surface_debug, indent=2), encoding="utf-8")
         files = dict(context.get_artifact("files", {}))
         files.update(
             {
@@ -612,6 +681,7 @@ class DetectBeltPlaneStage:
                 "reference_surface_selected_mask": "reference_surface_selected_mask.png",
                 "reference_surface_candidates": "reference_surface_candidates.json",
                 "gradient_debug": "gradient_debug.json",
+                "selected_surface_debug": "selected_surface_debug.json",
                 "background_selection_debug": "background_selection_debug.json",
                 "background_seed_mask": "background_seed_mask.png",
                 "expanded_plane_mask": "expanded_plane_mask.png",
@@ -815,6 +885,16 @@ class DetectBeltPlaneStage:
             metadata={"source": "native_pipeline", "producer": self.name, **z_thresholds},
         )
         context.add_processing_artifact(
+            artifact_id="selected_surface_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Selected surface debug",
+            path="selected_surface_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
             artifact_id="background_selection_debug",
             stage_id="detect_belt_plane",
             kind="json",
@@ -854,6 +934,7 @@ class NormalizeHeightsToPlaneStage:
     normalization_background_p95_warning_mm: float = 3.5
     normalization_fg_bg_separation_warning_mm: float = 3.0
     normalization_min_inlier_ratio_warning: float = 0.2
+    below_reference_tolerance_mm: float = 0.0
     name: str = "NormalizeHeightsToPlane"
     category: str = "calibration"
     required_modalities: tuple[CaptureModality, ...] = ("heightmap",)
@@ -885,6 +966,11 @@ class NormalizeHeightsToPlaneStage:
         if self.normalized_clip_negative:
             normalized = np.where(normalized < -abs(self.normalized_negative_tolerance_mm), 0.0, normalized)
         context.set_artifact("normalized_heightmap_mm", normalized)
+        object_min_height_mm = float((context.get_artifact("stage_params.remove_belt_segment_objects", {}) or {}).get("min_height_mm", 8.0))
+        below_reference_mask = frame.valid_mask & (normalized <= float(self.below_reference_tolerance_mm))
+        above_threshold_mask = frame.valid_mask & (normalized > object_min_height_mm)
+        cv2.imwrite(str(output_dir / "below_reference_mask.png"), (below_reference_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "above_threshold_mask.png"), (above_threshold_mask.astype(np.uint8) * 255))
 
         norm_frame = HeightmapFrame(
             z_mm=normalized.astype(np.float32),
@@ -921,12 +1007,17 @@ class NormalizeHeightsToPlaneStage:
         (output_dir / "normalized_height_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
         norm_debug = {
             "normalization_convention": convention,
+            "normalization_formula": convention,
+            "model_type": model_type,
+            "positive_object_direction": "positive",
             "clip_negative": bool(self.normalized_clip_negative),
             "negative_tolerance_mm": float(self.normalized_negative_tolerance_mm),
             "background_height_mean_after_normalization_mm": float(np.mean(bg_values)) if bg_values.size else 0.0,
             "background_height_std_after_normalization_mm": float(np.std(bg_values)) if bg_values.size else 0.0,
             "background_height_p95_abs_after_normalization_mm": float(np.percentile(np.abs(bg_values), 95)) if bg_values.size else 0.0,
             "foreground_mean_height_mm": float(np.mean(fg_values)) if fg_values.size else 0.0,
+            "below_reference_pixel_count": int(np.count_nonzero(below_reference_mask)),
+            "above_threshold_pixel_count": int(np.count_nonzero(above_threshold_mask)),
         }
         norm_warnings: list[str] = []
         if norm_debug["background_height_p95_abs_after_normalization_mm"] > float(self.normalization_background_p95_warning_mm):
@@ -950,6 +1041,8 @@ class NormalizeHeightsToPlaneStage:
                 "debug_height": "normalized_heightmap.png",
                 "normalized_height_histogram": "normalized_height_histogram.json",
                 "normalization_debug": "normalization_debug.json",
+                "below_reference_mask": "below_reference_mask.png",
+                "above_threshold_mask": "above_threshold_mask.png",
             }
         )
         context.set_artifact("files", files)
@@ -970,6 +1063,26 @@ class NormalizeHeightsToPlaneStage:
                 "normalization_convention": convention,
                 "reference_surface_model_type": model_type,
             },
+        )
+        context.add_processing_artifact(
+            artifact_id="below_reference_mask",
+            stage_id="normalize_heights_to_plane",
+            kind="image",
+            title="Pixels below or on reference",
+            path="below_reference_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="above_threshold_mask",
+            stage_id="normalize_heights_to_plane",
+            kind="image",
+            title="Pixels above object threshold",
+            path="above_threshold_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "object_min_height_mm": object_min_height_mm},
         )
         context.add_processing_artifact(
             artifact_id="normalized_height_histogram",
@@ -996,6 +1109,7 @@ class NormalizeHeightsToPlaneStage:
 @dataclass
 class RemoveBeltAndSegmentObjectsStage:
     min_height_mm: float = 8.0
+    reference_tolerance_mm: float = 0.0
     max_height_mm: float | None = None
     suppress_plane_mask_in_segmentation: bool = True
     ignore_small_residual_background: bool = True
@@ -1016,12 +1130,15 @@ class RemoveBeltAndSegmentObjectsStage:
         normalized = np.asarray(context.require_artifact("normalized_heightmap_mm"), dtype=np.float32)
         output_dir: Path = context.require_artifact("output_dir")
 
+        below_or_on_reference = frame.valid_mask & (normalized <= float(self.reference_tolerance_mm))
         foreground = normalized > self.min_height_mm
         if self.max_height_mm is not None:
             foreground &= normalized <= self.max_height_mm
         foreground &= frame.valid_mask
         foreground_before_suppression = foreground.copy()
         cv2.imwrite(str(output_dir / "foreground_before_plane_suppression.png"), (foreground_before_suppression.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "below_reference_mask.png"), (below_or_on_reference.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "above_threshold_mask.png"), (foreground_before_suppression.astype(np.uint8) * 255))
 
         plane_mask = np.asarray(
             context.get_artifact(
@@ -1086,16 +1203,25 @@ class RemoveBeltAndSegmentObjectsStage:
                 "max_height_mm": self.max_height_mm,
                 "suppress_plane_mask_in_segmentation": self.suppress_plane_mask_in_segmentation,
                 "ignore_small_residual_background": self.ignore_small_residual_background,
+                "reference_tolerance_mm": self.reference_tolerance_mm,
                 "morphology_kernel": self.morphology_kernel,
                 "min_component_area": self.min_component_area,
                 "fill_holes": self.fill_holes,
                 "smoothing_kernel": self.smoothing_kernel,
             },
             "plane_suppressed_pixel_count": int(np.count_nonzero(suppressed_plane_pixels)),
+            "below_or_on_reference_pixel_count": int(np.count_nonzero(below_or_on_reference)),
             "connected_components_before_suppression": int(max(num_labels_before - 1, 0)),
             "connected_components_after_suppression": int(max(num_labels_after_suppress - 1, 0)),
             "connected_component_count": int(max(num_labels - 1, 0)),
         }
+        seg_warnings: list[str] = []
+        fg_after = float(seg_debug["foreground_after_plane_suppression_percent"])
+        if fg_after <= 0.0:
+            seg_warnings.append("foreground_coverage_zero_after_reference_suppression")
+        if fg_after > 60.0:
+            seg_warnings.append("foreground_coverage_too_high_possible_background_leak")
+        seg_debug["warnings"] = seg_warnings
         (output_dir / "segmentation_debug.json").write_text(json.dumps(seg_debug, indent=2), encoding="utf-8")
         context.set_artifact("segmentation_mask", filtered > 0)
         files = dict(context.get_artifact("files", {}))
@@ -1106,6 +1232,8 @@ class RemoveBeltAndSegmentObjectsStage:
                 "normalized_height_threshold_mask": "normalized_height_threshold_mask.png",
                 "cleaned_object_mask": "cleaned_object_mask.png",
                 "foreground_before_plane_suppression": "foreground_before_plane_suppression.png",
+                "below_reference_mask": "below_reference_mask.png",
+                "above_threshold_mask": "above_threshold_mask.png",
                 "plane_suppressed_mask": "plane_suppressed_mask.png",
                 "final_object_mask": "final_object_mask.png",
                 "rejected_background_residuals": "rejected_background_residuals.png",
@@ -1142,6 +1270,26 @@ class RemoveBeltAndSegmentObjectsStage:
             mime_type="image/png",
             preview_available=True,
             metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="below_reference_mask",
+            stage_id="remove_belt_segment_objects",
+            kind="image",
+            title="Below/equal reference mask",
+            path="below_reference_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="above_threshold_mask",
+            stage_id="remove_belt_segment_objects",
+            kind="image",
+            title="Above object threshold mask",
+            path="above_threshold_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "object_min_height_mm": self.min_height_mm},
         )
         context.add_processing_artifact(
             artifact_id="plane_suppressed_mask",
@@ -1215,8 +1363,8 @@ class RemoveBeltAndSegmentObjectsStage:
             preview_available=True,
             overlay_type="segmentation",
             coordinate_space="image_pixel",
-            target_artifact_id="heightmap_preview",
-            source_artifact_ids=["heightmap", "cleaned_object_mask"],
+            target_artifact_id="height_segmentation",
+            source_artifact_ids=["height_segmentation", "cleaned_object_mask"],
             metadata={"source": "native_pipeline", "producer": self.name, "semantic": "primary_human_view"},
         )
 
@@ -1671,6 +1819,106 @@ def _heightmap_points(frame: HeightmapFrame, valid_mask: np.ndarray | None = Non
     return np.column_stack((x_mm, y_mm, z.astype(np.float64)))
 
 
+def _reference_height_gate_from_distribution(
+    z_mm: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    enabled: bool,
+    margin_mm: float,
+    min_coverage_ratio: float,
+    max_coverage_ratio: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    valid = np.asarray(valid_mask, dtype=bool)
+    if not enabled:
+        return valid.copy(), {"enabled": False, "status": "disabled"}
+
+    vals = np.asarray(z_mm[valid], dtype=np.float64)
+    if vals.size < 8:
+        return valid.copy(), {"enabled": True, "status": "too_few_values", "sample_count": int(vals.size)}
+
+    min_cov = float(np.clip(min_coverage_ratio, 0.01, 0.95))
+    max_cov = float(np.clip(max_coverage_ratio, min_cov + 0.01, 0.99))
+    sample_count = int(min(2048, vals.size))
+    qs = np.linspace(0.0, 1.0, sample_count, dtype=np.float64)
+    curve = np.quantile(vals, qs)
+    z_min = float(curve[0])
+    z_max = float(curve[-1])
+    z_range = z_max - z_min
+    if z_range <= 1e-6:
+        cutoff = z_max + float(max(0.0, margin_mm))
+        gate = valid & (z_mm <= cutoff)
+        return (
+            gate,
+            {
+                "enabled": True,
+                "status": "flat_distribution",
+                "cutoff_z_mm": cutoff,
+                "coverage_percent": float(np.count_nonzero(gate) / max(1, np.count_nonzero(valid)) * 100.0),
+                "sample_count": int(vals.size),
+            },
+        )
+
+    sorted_vals = np.sort(vals)
+    gap_start = max(0, min(int(np.floor(min_cov * (sorted_vals.size - 1))), sorted_vals.size - 2))
+    gap_end = max(gap_start + 1, min(int(np.ceil(max_cov * (sorted_vals.size - 1))), sorted_vals.size - 1))
+    gap_values = np.diff(sorted_vals)
+    search_gaps = gap_values[gap_start:gap_end]
+    gap_cutoff: float | None = None
+    gap_ratio = 0.0
+    if search_gaps.size:
+        local_gap_idx = int(np.argmax(search_gaps))
+        gap_idx = gap_start + local_gap_idx
+        robust_gap_scale = float(np.median(gap_values[gap_values > 0])) if np.any(gap_values > 0) else 0.0
+        largest_gap = float(gap_values[gap_idx])
+        gap_ratio = largest_gap / max(robust_gap_scale, 1e-6)
+        if largest_gap >= max(1.0, robust_gap_scale * 8.0):
+            gap_cutoff = float(sorted_vals[gap_idx] + max(0.0, margin_mm))
+
+    smooth_window = max(5, min(51, (sample_count // 40) | 1))
+    kernel = np.ones(smooth_window, dtype=np.float64) / float(smooth_window)
+    smooth = np.convolve(np.pad(curve, (smooth_window // 2, smooth_window // 2), mode="edge"), kernel, mode="valid")
+    normalized = (smooth - z_min) / z_range
+    curvature = np.gradient(np.gradient(normalized, qs), qs)
+    search = np.where((qs >= min_cov) & (qs <= max_cov))[0]
+    if search.size:
+        knee_idx = int(search[np.argmax(curvature[search])])
+        reason = "max_positive_second_derivative"
+    else:
+        knee_idx = int(np.clip(round(min_cov * (sample_count - 1)), 0, sample_count - 1))
+        reason = "fallback_min_coverage"
+
+    if gap_cutoff is not None:
+        cutoff = gap_cutoff
+        reason = "largest_height_gap"
+    else:
+        cutoff = float(smooth[knee_idx] + max(0.0, margin_mm))
+    coverage = float(np.count_nonzero(vals <= cutoff) / max(1, vals.size))
+    if coverage < min_cov:
+        cutoff = float(np.percentile(vals, min_cov * 100.0) + max(0.0, margin_mm))
+        reason = "clamped_to_min_coverage"
+    elif coverage > max_cov:
+        cutoff = float(np.percentile(vals, max_cov * 100.0))
+        reason = "clamped_to_max_coverage"
+
+    gate = valid & (z_mm <= cutoff)
+    coverage_percent = float(np.count_nonzero(gate) / max(1, np.count_nonzero(valid)) * 100.0)
+    return (
+        gate,
+        {
+            "enabled": True,
+            "status": "ok",
+            "reason": reason,
+            "cutoff_z_mm": cutoff,
+            "knee_quantile": float(qs[knee_idx]),
+            "knee_z_mm": float(smooth[knee_idx]),
+            "margin_mm": float(max(0.0, margin_mm)),
+            "coverage_percent": coverage_percent,
+            "sample_count": int(vals.size),
+            "largest_gap_ratio": float(gap_ratio),
+        },
+    )
+
+
 def _fit_plane_ransac(points: np.ndarray, *, iterations: int, threshold_mm: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     best_inliers = np.array([], dtype=np.int64)
@@ -1696,26 +1944,25 @@ def _fit_plane_ransac(points: np.ndarray, *, iterations: int, threshold_mm: floa
 
 
 def _plane_from_three(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> np.ndarray | None:
-    v1 = p2 - p1
-    v2 = p3 - p1
-    normal = np.cross(v1, v2)
-    norm = np.linalg.norm(normal)
-    if norm < 1e-9:
+    xyz = np.asarray([p1, p2, p3], dtype=np.float64)
+    design = np.column_stack((xyz[:, 0], xyz[:, 1], np.ones(3, dtype=np.float64)))
+    if abs(float(np.linalg.det(design))) < 1e-9:
         return None
-    normal = normal / norm
-    d = -float(np.dot(normal, p1))
-    return np.array([normal[0], normal[1], normal[2], d], dtype=np.float64)
+    sx, sy, intercept = np.linalg.solve(design, xyz[:, 2])
+    return _heightmap_plane_coeffs(float(sx), float(sy), float(intercept))
 
 
 def _least_squares_plane(points: np.ndarray) -> np.ndarray:
     xyz = np.asarray(points, dtype=np.float64)
-    centroid = np.mean(xyz, axis=0)
-    centered = xyz - centroid
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    normal = vh[-1]
-    normal = normal / max(np.linalg.norm(normal), 1e-12)
-    d = -float(np.dot(normal, centroid))
-    return np.array([normal[0], normal[1], normal[2], d], dtype=np.float64)
+    design = np.column_stack((xyz[:, 0], xyz[:, 1], np.ones(xyz.shape[0], dtype=np.float64)))
+    sx, sy, intercept = np.linalg.lstsq(design, xyz[:, 2], rcond=None)[0]
+    return _heightmap_plane_coeffs(float(sx), float(sy), float(intercept))
+
+
+def _heightmap_plane_coeffs(sx: float, sy: float, intercept: float) -> np.ndarray:
+    # Model reference surfaces as z = sx*x + sy*y + intercept; near-vertical planes are invalid for heightmaps.
+    coeffs = np.array([-sx, -sy, 1.0, -intercept], dtype=np.float64)
+    return coeffs / max(float(np.linalg.norm(coeffs[:3])), 1e-12)
 
 
 def _plane_residuals(points: np.ndarray, coeffs: np.ndarray) -> np.ndarray:

@@ -169,6 +169,7 @@ class ExecuteTakeRequest(BaseModel):
     modality: str | None = None
     purpose: str = "manual_debug"
     acquisition_group_id: str | None = None
+    stage_params: dict[str, Any] | None = None
 
 
 class CreateProcessBindingRequest(BaseModel):
@@ -1681,6 +1682,7 @@ def process_take_for_pipeline(take_id: str, payload: ExecuteTakeRequest, setting
             recipe_version_id=str(recipe_version_id) if recipe_version_id else None,
             acquisition_group_id=str(resolved_acquisition_group_id) if resolved_acquisition_group_id else None,
             calibration_profile_id=str(calibration_profile_id) if calibration_profile_id else None,
+            stage_params=payload.stage_params or None,
         )
         if binding_warning:
             response["warning"] = binding_warning

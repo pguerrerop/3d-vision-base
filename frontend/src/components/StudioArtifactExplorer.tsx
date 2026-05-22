@@ -134,7 +134,7 @@ export default function StudioArtifactExplorer({
         {(selected.kind === "image" || selected.kind === "overlay") && previewTarget?.path && takeId && (
           <ProjectionArtifactViewer
             title={previewTarget.title}
-            src={fileUrl(takeId, previewTarget.path)}
+            src={`${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(String(selected.created_at ?? previewTarget.created_at ?? Date.now()))}`}
             overlays={overlays}
             selectedObjectId={selectedObjectId ?? null}
             hoveredObjectId={hoveredObjectId}

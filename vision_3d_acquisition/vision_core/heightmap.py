@@ -73,10 +73,19 @@ def write_heightmap_metadata_json(frame: HeightmapFrame, path: Path, *, extra: d
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def write_heightmap_preview_png(values_mm: np.ndarray, valid_mask: np.ndarray, path: Path, *, colormap: int = cv2.COLORMAP_TURBO) -> None:
+def write_heightmap_preview_png(
+    values_mm: np.ndarray,
+    valid_mask: np.ndarray,
+    path: Path,
+    *,
+    colormap: int = cv2.COLORMAP_TURBO,
+    colorbar_label: str | None = None,
+) -> None:
     values = np.asarray(values_mm, dtype=np.float32)
     mask = np.asarray(valid_mask, dtype=bool)
     image = np.zeros(values.shape, dtype=np.uint8)
+    min_v = 0.0
+    max_v = 1.0
     if np.count_nonzero(mask) > 0:
         valid_values = values[mask]
         min_v = float(np.nanpercentile(valid_values, 2.0))
@@ -88,4 +97,32 @@ def write_heightmap_preview_png(values_mm: np.ndarray, valid_mask: np.ndarray, p
         image[~mask] = 0
     color = cv2.applyColorMap(image, colormap)
     color[~mask] = (0, 0, 0)
+    if colorbar_label:
+        color = _append_colorbar(color, min_v=min_v, max_v=max_v, label=colorbar_label, colormap=colormap)
     cv2.imwrite(str(path), color)
+
+
+def _append_colorbar(image: np.ndarray, *, min_v: float, max_v: float, label: str, colormap: int) -> np.ndarray:
+    h, w = image.shape[:2]
+    bar_h = 46
+    canvas = np.zeros((h + bar_h, w, 3), dtype=np.uint8)
+    canvas[:h, :, :] = image
+    canvas[h:, :, :] = (18, 18, 18)
+    margin = max(24, min(80, w // 12))
+    bar_w = max(1, w - (2 * margin))
+    gradient = np.linspace(0, 255, bar_w, dtype=np.uint8).reshape(1, bar_w)
+    gradient = np.repeat(gradient, 12, axis=0)
+    bar = cv2.applyColorMap(gradient, colormap)
+    y0 = h + 8
+    canvas[y0 : y0 + bar.shape[0], margin : margin + bar_w, :] = bar
+    cv2.rectangle(canvas, (margin, y0), (margin + bar_w - 1, y0 + bar.shape[0] - 1), (210, 210, 210), 1)
+    text_y = h + 36
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(canvas, f"{min_v:.2f}", (margin, text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+    max_text = f"{max_v:.2f}"
+    (tw, _), _ = cv2.getTextSize(max_text, font, 0.42, 1)
+    cv2.putText(canvas, max_text, (max(0, margin + bar_w - tw), text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+    label_text = label
+    (lw, _), _ = cv2.getTextSize(label_text, font, 0.42, 1)
+    cv2.putText(canvas, label_text, (max(0, (w - lw) // 2), text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+    return canvas

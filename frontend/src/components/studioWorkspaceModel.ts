@@ -75,6 +75,8 @@ export function artifactsForStage(detail: TakeDetail | null, stageId: string): S
 
 function canonicalStageIdLocal(stageId: string): string {
   const raw = `${stageId ?? ""}`.toLowerCase();
+  if (raw.includes("fitobjectgeometry") || raw.includes("footprint") || raw === "geometry") return "fit_object_geometry";
+  if (raw.includes("computeheightmetrics") || raw === "measurement") return "compute_height_metrics";
   if (raw.includes("detectbeltplane") || raw.includes("estimatebeltplane") || raw.includes("belt_plane")) return "detect_belt_plane";
   if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized_height")) return "normalize_heights_to_plane";
   if (raw.includes("removebeltandsegmentobjects") || raw.includes("height_segmentation")) return "remove_belt_segment_objects";

@@ -17,8 +17,22 @@ function vector(value: [number, number, number] | null | undefined) {
   return value ? value.map((item) => item.toFixed(1)).join(", ") : "-";
 }
 
-function heightRange(value: { min: number; max: number; mean: number } | null | undefined) {
-  return value ? `${value.min.toFixed(1)} / ${value.mean.toFixed(1)} / ${value.max.toFixed(1)}` : "-";
+function fmtUnknown(value: unknown, digits = 1) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "-";
+}
+
+function heightRange(value: Record<string, unknown> | null | undefined) {
+  if (!value) return "-";
+  const min = value.min ?? value.min_height_mm;
+  const mean = value.mean ?? value.mean_height_mm;
+  const max = value.max ?? value.max_height_mm;
+  const p95 = value.p95 ?? value.p95_height_mm;
+  const median = value.median ?? value.median_height_mm;
+  const compact = [min, mean, max].some((item) => Number.isFinite(Number(item)))
+    ? `${fmtUnknown(min)} / ${fmtUnknown(mean)} / ${fmtUnknown(max)}`
+    : "-";
+  return p95 == null && median == null ? compact : `${compact} (median ${fmtUnknown(median)}, p95 ${fmtUnknown(p95)})`;
 }
 
 export default function ObjectTable({ objects, selectedObjectId = null, hoveredObjectId = null, onSelectObject, onHoverObject }: Props) {

@@ -10,8 +10,8 @@ export function canonicalStageId(stageId: string, stageLabel?: string | null): s
   if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized height")) return "normalize_heights_to_plane";
   if (raw.includes("removebeltandsegmentobjects") || raw.includes("heightsegmentation")) return "remove_belt_segment_objects";
   if (raw.includes("extractconnectedcomponents")) return "connected_components";
-  if (raw.includes("fitobjectgeometry")) return "fit_object_geometry";
-  if (raw.includes("computeheightmetrics")) return "compute_height_metrics";
+  if (raw.includes("fitobjectgeometry") || raw.includes("footprint geometry") || raw === "geometry") return "fit_object_geometry";
+  if (raw.includes("computeheightmetrics") || raw.includes("height + volume") || raw === "measurement") return "compute_height_metrics";
   if (raw.includes("classifyminingball25d")) return "classify_25d";
   if (raw.includes("generate25doverlays")) return "overlays_25d";
   if (
@@ -102,9 +102,9 @@ const VIEWS_BY_CATEGORY: Record<StageSemanticCategory, StageViewDefinition[]> = 
     { id: "json", label: "JSON", rendererType: "json", priority: 99 },
   ],
   measurement: [
-    { id: "fit_metrics", label: "Fit metrics", rendererType: "metrics", priority: 1, emptyState: { title: "Ellipse fitting has not been executed for this take." } },
-    { id: "diameter_histogram", label: "Diameter histogram", rendererType: "histogram", priority: 2 },
-    { id: "measurements", label: "Measurements", rendererType: "table", priority: 3 },
+    { id: "measurements", label: "Objects", rendererType: "table", priority: 1 },
+    { id: "fit_metrics", label: "Fit metrics", rendererType: "metrics", priority: 2, emptyState: { title: "Ellipse fitting has not been executed for this take." } },
+    { id: "diameter_histogram", label: "Diameter histogram", rendererType: "histogram", priority: 3 },
     { id: "json", label: "JSON", rendererType: "json", priority: 99 },
   ],
   classification: [
@@ -141,8 +141,12 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       category: "plane_qa",
       defaultViewId: "normalized_height",
       views: [
+        { id: "raw_heightmap", label: "Raw heightmap", rendererType: "image", priority: 1, emptyState: { title: "No raw heightmap preview available yet." } },
+        { id: "reference_surface", label: "Reference surface model", rendererType: "json", priority: 2, emptyState: { title: "No reference-surface model available yet." } },
         { id: "normalized_height", label: "Normalized height", rendererType: "image", priority: 1, emptyState: { title: "No normalized height preview available yet." } },
-        { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 2, emptyState: { title: "No normalized-height histogram available yet." } },
+        { id: "below_reference", label: "Below/equal reference", rendererType: "image", priority: 4, emptyState: { title: "No below-reference mask available yet." } },
+        { id: "above_threshold", label: "Above threshold", rendererType: "image", priority: 5, emptyState: { title: "No above-threshold mask available yet." } },
+        { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 6, emptyState: { title: "No normalized-height histogram available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };
@@ -154,11 +158,11 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       defaultViewId: "selected_surface",
       views: [
         { id: "raw_heightmap", label: "Raw heightmap", rendererType: "image", priority: 1, emptyState: { title: "No raw heightmap preview available yet." } },
-        { id: "depth_gradient", label: "Depth gradient", rendererType: "image", priority: 2, emptyState: { title: "No depth gradient preview available yet." } },
-        { id: "low_gradient_mask", label: "Low-gradient mask", rendererType: "image", priority: 3, emptyState: { title: "No low-gradient mask available yet." } },
-        { id: "surface_candidates", label: "Surface candidates", rendererType: "json", priority: 4, emptyState: { title: "No reference-surface candidates available yet." } },
-        { id: "selected_surface", label: "Selected surface", rendererType: "image", priority: 5, emptyState: { title: "No selected surface mask available yet." } },
-        { id: "valid_mask", label: "Valid mask", rendererType: "image", priority: 6, emptyState: { title: "No valid mask available yet." } },
+        { id: "valid_mask", label: "Valid mask", rendererType: "image", priority: 2, emptyState: { title: "No valid mask available yet." } },
+        { id: "depth_gradient", label: "Depth gradient", rendererType: "image", priority: 3, emptyState: { title: "No depth gradient preview available yet." } },
+        { id: "low_gradient_mask", label: "Low-gradient mask", rendererType: "image", priority: 4, emptyState: { title: "No low-gradient mask available yet." } },
+        { id: "surface_candidates", label: "Surface candidates", rendererType: "json", priority: 5, emptyState: { title: "No reference-surface candidates available yet." } },
+        { id: "selected_surface", label: "Selected surface", rendererType: "image", priority: 6, emptyState: { title: "No selected surface mask available yet." } },
         { id: "plane_inliers", label: "Plane inliers", rendererType: "image", priority: 7, emptyState: { title: "No plane inlier mask available yet." } },
         { id: "residual_heatmap", label: "Residual heatmap", rendererType: "image", priority: 8, emptyState: { title: "No residual heatmap available yet." } },
         { id: "depth_plot", label: "Depth plot", rendererType: "image", priority: 9, emptyState: { title: "No depth plot available yet." } },
@@ -249,18 +253,26 @@ export function stageSemanticSummary(stageId: string, detail: TakeDetail | null,
     const debug = artifacts.find((item) => item.artifact_id === "plane_fit_debug");
     const meta = (debug?.metadata ?? {}) as Record<string, unknown>;
     const status = String(meta.status ?? "unknown");
-    const inlier = Number(meta.inlier_ratio ?? 0) * 100.0;
     const p95 = Number(meta.residual_p95_mm ?? 0);
     const sel = (meta.background_selection as Record<string, unknown> | undefined) ?? {};
-    const seedCov = Number(sel.seed_coverage_percent ?? sel.candidate_coverage_percent ?? 0);
-    const expCov = Number(sel.expanded_plane_coverage_percent ?? 0);
-    return `${status} • seed ${seedCov.toFixed(1)}% • expanded ${expCov.toFixed(1)}% • residual p95 ${p95.toFixed(1)} mm`;
+    const gdbg = (sel.gradient_debug as Record<string, unknown> | undefined) ?? {};
+    const area = Number(gdbg.selected_component_area_ratio ?? sel.expanded_plane_coverage_percent ?? 0) * (Number(gdbg.selected_component_area_ratio ?? NaN) <= 1 ? 100 : 1);
+    const model = String(meta.reference_surface_model_type ?? "plane");
+    if (model === "constant_z") {
+      const zstd = Number(gdbg.selected_component_z_std_mm ?? 0);
+      return `model ${model} • surface ${area.toFixed(1)}% • z std ${zstd.toFixed(1)} mm`;
+    }
+    return `model ${model} • surface ${area.toFixed(1)}% • residual p95 ${p95.toFixed(1)} mm`;
   }
   if (canonical === "normalize_heights_to_plane" || canonical === "normalized_height") {
     const debug = artifacts.find((item) => item.artifact_id === "normalization_debug" || item.artifact_id === "normalized_height_debug");
+    const hist = artifacts.find((item) => item.artifact_id === "normalized_height_histogram");
     const meta = (debug?.metadata ?? {}) as Record<string, unknown>;
     const bg = Number(meta.background_height_p95_abs_after_normalization_mm ?? 0);
-    return `background p95 abs ${bg.toFixed(1)} mm`;
+    const above = Number(meta.above_threshold_pixel_count ?? 0);
+    const total = Number(((hist?.metadata ?? {}) as Record<string, unknown>).sample_count ?? 0);
+    const pct = total > 0 ? (above / total) * 100.0 : 0.0;
+    return `background p95 abs ${bg.toFixed(1)} mm • above threshold ${pct.toFixed(1)}%`;
   }
   if (canonical === "remove_belt_segment_objects") {
     const debug = artifacts.find((item) => item.artifact_id === "segmentation_debug");
