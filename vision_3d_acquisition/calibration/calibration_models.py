@@ -142,8 +142,5 @@ class SystemCalibration(BaseModel):
     def belt_plane_3d(self) -> PlaneCalibration:
         return next(plane for plane in self.planes if plane.label == "belt")
 
-    def belt_plane(self) -> PlaneCalibration:
-        return self.belt_plane_3d()
-
     def ignored_planes(self) -> list[PlaneCalibration]:
         return [plane for plane in self.planes if plane.label == "outer_plane_ignore"]

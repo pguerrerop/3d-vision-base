@@ -436,6 +436,15 @@ Behavior:
 
 This keeps the acquisition -> processing -> annotation loop inside one Studio workflow.
 
+### Stable take selection during refresh
+
+Processing Lab now separates user-driven take selection from auto-selection during background refresh:
+
+- User clicks remain authoritative while the selected take still exists in the refreshed list.
+- Auto-selection fallback only runs when no take is selected or when the selected take no longer exists.
+- Polling/refetches for takes, pipelines, runtime state, and related summaries do not force-select a different take.
+- Reordered take lists do not reset selection by position.
+
 ## Safe take management UX
 
 Take Management now includes explicit lifecycle actions:
@@ -485,3 +494,107 @@ Studio sidebar now includes a `Show archived` toggle:
   - `target_artifact_id: heightmap_preview`
 
 This preserves existing artifact contracts while making human-readable inspection the default UX.
+# Engineering Mode UI Semantics
+
+Studio now supports a lightweight operator UX with an additive engineering debug mode.
+
+## Mode Behavior
+
+- `Operator`: compact overlays, primary object/classification summaries.
+- `Engineering`: full diagnostics (residual artifacts, hover inspector, line profiles, provenance tabs).
+
+## Hover Inspector Architecture
+
+Hover diagnostics are implemented in projection-aware stage renderers and reused across stage views.
+
+- Pixel `x/y`
+- Approx metric value from stage range metadata when available
+- Extensible fields for world coordinates, residuals, segmentation ids, normals, and reflectance
+
+## Profile Tool
+
+Engineering users can define a two-point line profile in stage image views to inspect sampled height/intensity evolution, distance, and min/max/p95.
+
+## Stage-Native Engineering Tabs
+
+Debug surfaces are integrated through semantic stage view definitions (no floating tools or detached debug windows), including tabs such as:
+
+- `residuals`
+- `diagnostics`
+- `profiles`
+- `provenance`
+
+## Measurement/Height-Volume workspace semantics (stage-centric)
+
+The Measurement stage workspace is now explicitly segmented by semantic scope to prevent layout instability and semantic overload.
+
+### Region ownership
+
+- Stage config:
+  - top `Measurement controls` strip only
+  - contains known-cube calibration controls, correction toggles, target selection, expected XYZ, and apply/reset/rerun actions
+  - does not include KPIs or object rows
+- Stage summary:
+  - single compact KPI row directly below controls
+  - metrics limited to `Objects`, `Rejected`, `Avg Ø`, `Circ.`, `Scale X`, `Scale Y`, `Scale Z`
+- Object navigation:
+  - left panel only (scrollable object browser/list)
+- Selected object detail:
+  - right panel only (selected-object summary, overlay/artifact preview, measurement table and diagnostics)
+- Diagnostics:
+  - remains in inspector context; not duplicated into controls/KPI regions
+
+### Layout ownership rules
+
+- Measurement table is no longer co-owned by KPI auto-grid layout.
+- KPI cards and table are isolated in different containers.
+- Table section owns full row width inside selected-object workspace (`grid-column: 1 / -1`).
+- No card/table overlap is allowed under variable content lengths.
+
+### Responsive + stability contract
+
+- Controls are compact, fixed-purpose, and wrap horizontally on narrow widths.
+- KPI cards use fixed height with single-line labels (`ellipsis`, no multiline growth).
+- Left object panel and right selected-object workspace have independent scroll behavior.
+- No upward flow of object detail rows under summary cards.
+- Inspector remains an independent column/scroll region.
+
+### Object-centric model (future-ready)
+
+The Measurement stage prioritizes object inspection and validation over dashboard density. New diagnostics (residual plots, hover probes, calibration overlays, point-cloud/profile views, fusion metrics) should extend the selected-object workspace or inspector, not reintroduce floating KPI-card blocks.
+
+### Numeric-vs-display contract
+
+- `heightmap_preview.png` and `normalized_heightmap.png` are display artifacts only.
+- Numeric measurements and hover diagnostics must use canonical numeric sources (`height16.tif`, `heightmap_frame.npz`, `normalized_heightmap.npz`) or direct derivatives serialized for numeric sampling.
+- Studio must not infer physical values by inverting colorized PNG RGB pixels.
+
+
+### Normalized-height semantic invariant
+
+- Stage `Normalize heights to reference` uses canonical display semantic `height_above_plane_mm` where `0 mm` is the belt plane.
+- Studio hover footer separates semantic spaces:
+  - displayed semantic value (primary)
+  - plane/reference value
+  - optional raw diagnostics (`raw_sensor_z_mm`, residual, clipping state)
+- Normalized colorbar label must explicitly indicate semantic units (`Height above plane (mm)`).
+- Display transform metadata (`normalized_heightmap_display.json`) carries semantic id, raw semantic id, display range, and scaling mode.
+- Viewer synchronization invariant: rendered normalized view, hover probe, legend range, and histogram all consume the same semantic raster source (`normalized_heightmap.npz`) and transform metadata.
+
+### Second-pass hardening: canonical height semantics
+
+- `HeightLegend` is the canonical Studio legend component for all height views. It renders semantic label, units, range, direction, authoritative/debug status, and optional percentile/ticks from semantic metadata only.
+- Studio resolves height artifacts by semantic intent (`semantic_field` + `representation`) with additive legacy fallbacks and warning visibility.
+- Hover runtime checks emit debug warnings on semantic mismatch between rendered preview and hovered numeric semantic source.
+- Inspector now includes a dedicated "Height semantics" block exposing semantic field, lineage, authoritative state, hover semantic source, numeric raster source, preview source, and color range.
+- Canonical geometry policy:
+  - measurements/classification/reports/exports/default overlays use `height_above_belt`;
+  - `raw_sensor_z` remains acquisition/debug/engineering context only.
+
+### Canonical color mapping (renderer/legend/hover synchronization)
+
+- A single `HeightColorMapping` contract is shared by the image renderer, `HeightLegend`, hover sampler and debug reconstruction.
+- Resolution priority: explicit `color_mapping` block → render context (`render_vmin/vmax`, `colormap_id`) → display metadata (`color_scale_min/max`, `color_map`) → legacy fallback (with warning).
+- `HeightLegend` draws its gradient from the active LUT (`turbo`/`viridis`/`magma`/`gray`); no hard-coded gradients.
+- Direction is data-native; `direction` only changes label/tick orientation.
+- Hover/debug reconstruction uses the same LUT as the renderer so scalar↔RGB diffs remain consistent across colormap choices.

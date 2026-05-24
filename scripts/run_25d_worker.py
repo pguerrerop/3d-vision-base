@@ -177,7 +177,7 @@ def _execute_take(settings: ApiSettings, take_id: str, pipeline_id: str) -> tupl
     _mark_state(settings.data_dir, take_id, "processing", {"processing_started_at": now_iso(), "pipeline_id": pipeline_id})
     output_dir = settings.processed_dir / take_id
     if output_dir.exists():
-        shutil.rmtree(output_dir)
+        _remove_dir_with_retry(output_dir)
     try:
         dispatch = dispatch_take_processing(
             settings=settings,
@@ -202,6 +202,28 @@ def _execute_take(settings: ApiSettings, take_id: str, pipeline_id: str) -> tupl
         _mark_state(settings.data_dir, take_id, "failed", {"error": message, "processed_at": now_iso()})
         _ensure_failed_result(settings.data_dir, take_id, message)
         return False, message
+
+
+def _remove_dir_with_retry(path: Path, retries: int = 5, delay_sec: float = 0.15) -> None:
+    last_error: Exception | None = None
+    for _ in range(max(1, retries)):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(max(0.01, delay_sec))
+    if path.exists():
+        # Final attempt through temporary rename helps on transient macOS metadata races.
+        tmp = path.with_name(f".delete_{path.name}_{int(time.time() * 1000)}")
+        try:
+            path.rename(tmp)
+            shutil.rmtree(tmp)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    if last_error is not None:
+        raise last_error
 
 
 def run_iteration(settings: ApiSettings, pipeline_id: str, retry_failed: bool, max_per_iteration: int) -> dict[str, Any]:

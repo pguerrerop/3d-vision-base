@@ -60,9 +60,11 @@ def run_ball_inspection_25d_flow(
     detect_params = dict(stage_params.get("detect_belt_plane") or {})
     segment_params = dict(stage_params.get("remove_belt_segment_objects") or {})
     normalize_params = dict(stage_params.get("normalize_heights_to_plane") or {})
+    known_object_params = dict(stage_params.get("known_object_25d") or {})
     context.set_artifact("stage_params.detect_belt_plane", detect_params)
     context.set_artifact("stage_params.remove_belt_segment_objects", segment_params)
     context.set_artifact("stage_params.normalize_heights_to_plane", normalize_params)
+    context.set_artifact("stage_params.known_object_25d", known_object_params)
     runner = PipelineRunner(
         stages=[
             LoadCaptureStage(source=source, take_id=take_id, output_root=output_root),

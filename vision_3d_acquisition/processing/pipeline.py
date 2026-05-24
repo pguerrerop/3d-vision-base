@@ -315,7 +315,7 @@ def process_take(
             lambda: render_belt_polygon_topview(
                 segmentation["candidate_foreground_points"],
                 segmentation["rejected_points"],
-                calibration_model.belt_plane().roi_polygon_xy_mm,
+                calibration_model.belt_plane_3d().roi_polygon_xy_mm,
                 output_dir / "debug_belt_polygon_topview.png",
             ),
             input_points=_point_count(segmentation["candidate_foreground_points"]) + _point_count(segmentation["rejected_points"]),
@@ -497,7 +497,7 @@ def _early_calibration_crop(cloud: Any, calibration: SystemCalibration, margin_m
     points = np.asarray(cloud.points)
     if len(points) == 0:
         return cloud.select_by_index([])
-    belt = calibration.belt_plane()
+    belt = calibration.belt_plane_3d()
     if len(belt.roi_polygon_xy_mm) >= 3:
         xy = np.asarray(belt.roi_polygon_xy_mm, dtype=float)
         xy_min = xy.min(axis=0) - margin_mm

@@ -7,7 +7,7 @@ from typing import Any
 
 from vision_3d_acquisition.operations.classification_superclass import (
     SUPERCLASS_UNKNOWN,
-    map_label_to_superclass,
+    select_dominant_classification,
 )
 
 CARD_FILENAME = "operations_card.json"
@@ -71,22 +71,23 @@ def pick_primary_object(result: dict[str, Any]) -> dict[str, Any] | None:
     return ranked[0] if ranked else None
 
 
-def primary_label(result: dict[str, Any], obj: dict[str, Any] | None) -> str:
-    if isinstance(obj, dict):
-        for key in ("class_name", "label", "class_label"):
-            value = obj.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        cls = obj.get("classification")
-        if isinstance(cls, dict):
-            value = cls.get("class_label") or cls.get("label")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
-    summary_label = summary.get("label") or summary.get("class_label")
-    if isinstance(summary_label, str) and summary_label.strip():
-        return summary_label.strip()
-    return "Unknown"
+def extract_classification_variables(obj: dict[str, Any] | None) -> dict[str, float | None]:
+    item = obj if isinstance(obj, dict) else {}
+    height_metrics = item.get("height_above_belt_mm") if isinstance(item.get("height_above_belt_mm"), dict) else {}
+
+    def as_float(value: Any) -> float | None:
+        return float(value) if isinstance(value, (int, float)) else None
+
+    return {
+        "max_height_mm": as_float(height_metrics.get("max_height_mm")),
+        "p95_height_mm": as_float(height_metrics.get("p95_height_mm")),
+        "eccentricity": as_float(item.get("feature_eccentricity")),
+        "sphericity_3d": as_float(item.get("feature_sphericity_3d")),
+        "flatness": as_float(item.get("feature_flatness")),
+        "edge_roughness": as_float(item.get("feature_edge_roughness")),
+        "footprint_roundness": as_float(item.get("feature_footprint_roundness") or item.get("feature_sphere_fit")),
+        "volume_proxy_mm3": as_float(item.get("feature_volume_proxy_mm3")),
+    }
 
 
 def _status_for_operation(result_payload: dict[str, Any] | None, runtime_state: dict[str, Any] | None) -> str:
@@ -109,22 +110,23 @@ def build_operations_card(
     result_payload: dict[str, Any] | None,
     processed_dir: Path,
 ) -> dict[str, Any]:
-    primary = pick_primary_object(result_payload or {})
-    label = primary_label(result_payload or {}, primary)
-    confidence = None
-    if isinstance(primary, dict) and isinstance(primary.get("confidence"), (int, float)):
-        confidence = float(primary["confidence"])
-    else:
-        summary = (result_payload or {}).get("summary") if isinstance((result_payload or {}).get("summary"), dict) else {}
-        if isinstance(summary.get("confidence"), (int, float)):
-            confidence = float(summary["confidence"])
+    payload = result_payload or {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    canonical = select_dominant_classification(payload)
+    label = str(summary.get("label") or canonical.get("label") or "unknown")
+    superclass = str(summary.get("superclass") or canonical.get("superclass") or SUPERCLASS_UNKNOWN)
+    confidence_raw = summary.get("confidence")
+    if not isinstance(confidence_raw, (int, float)):
+        confidence_raw = canonical.get("confidence")
+    confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else None
 
     status = _status_for_operation(result_payload, runtime_state)
-    object_count = len((result_payload or {}).get("objects") or []) if isinstance((result_payload or {}).get("objects"), list) else 0
+    object_count = int(canonical.get("object_count") or 0)
+    primary_object = pick_primary_object(payload)
     card: dict[str, Any] = {
         "take_id": take_id,
         "status": status,
-        "superclass": map_label_to_superclass(label),
+        "superclass": superclass,
         "label": label,
         "confidence": confidence,
         "object_count": object_count,
@@ -137,6 +139,7 @@ def build_operations_card(
         "modalities": ["heightmap"],
         "error": (result_payload or {}).get("error") if isinstance((result_payload or {}).get("error"), str) else (runtime_state or {}).get("error"),
         "pipeline_id": "mining_steel_ball_classification_25d",
+        "classification_variables": extract_classification_variables(primary_object),
     }
     if card["superclass"] == SUPERCLASS_UNKNOWN and label.lower() == "unknown" and status == "completed":
         # completed with unknown label stays explicit in Operations
@@ -163,3 +166,39 @@ def update_operations_index(data_dir: Path, card: dict[str, Any], *, limit: int 
     }
     write_json(index_path, next_payload)
     return next_payload
+
+
+def reindex_recent_operations_cards(data_dir: Path, *, limit: int = 200) -> dict[str, Any]:
+    incoming_root = data_dir / "incoming"
+    processed_root = data_dir / "processed"
+    rows: list[tuple[float, str]] = []
+    for processed_dir in processed_root.iterdir() if processed_root.is_dir() else []:
+        if not processed_dir.is_dir() or processed_dir.name.startswith("."):
+            continue
+        result_path = processed_dir / "result.json"
+        result_payload = read_json(result_path)
+        if not isinstance(result_payload, dict):
+            continue
+        processed_at = str(result_payload.get("processed_at") or "")
+        ts = 0.0
+        try:
+            if processed_at:
+                ts = datetime.fromisoformat(processed_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = result_path.stat().st_mtime
+        rows.append((ts, processed_dir.name))
+    rows.sort(key=lambda item: item[0], reverse=True)
+
+    count = 0
+    for _, take_id in rows[: max(1, int(limit))]:
+        card = build_operations_card(
+            take_id=take_id,
+            incoming_metadata=read_json(incoming_root / take_id / "metadata.json"),
+            runtime_state=read_json(incoming_root / take_id / "runtime_state.json"),
+            result_payload=read_json(processed_root / take_id / "result.json"),
+            processed_dir=processed_root / take_id,
+        )
+        write_operations_card(processed_root / take_id, card)
+        update_operations_index(data_dir, card, limit=500)
+        count += 1
+    return {"reindexed": count, "limit": max(1, int(limit))}

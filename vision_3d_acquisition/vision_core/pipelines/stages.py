@@ -369,7 +369,7 @@ class RenderDebugArtifactsStage:
             render_belt_polygon_topview(
                 segmentation["candidate_foreground_points"],
                 rejected_cloud,
-                calibration.belt_plane().roi_polygon_xy_mm,
+                calibration.belt_plane_3d().roi_polygon_xy_mm,
                 output_dir / "debug_belt_polygon_topview.png",
             )
             render_foreground(segmentation["candidate_foreground_points"], output_dir / "debug_filtered_foreground.png")
@@ -556,6 +556,7 @@ class SerializeProcessingResultStage:
                 "acquired_at": str(frameset.get("timestamp") or (metadata or {}).get("created_at")),
                 "metadata_created_at": str((metadata or {}).get("created_at")),
             },
+            classification=context.get_artifact("classification_result_25d"),
         )
         result_payload = result.model_dump(mode="json")
         result_payload["artifacts"] = normalize_processing_artifacts(result_payload | {"artifacts": explicit_artifacts}, output_dir=context.get_artifact("output_dir"))
@@ -684,7 +685,7 @@ def _early_calibration_crop(cloud: Any, calibration: SystemCalibration, margin_m
     points = np.asarray(cloud.points)
     if len(points) == 0:
         return cloud.select_by_index([])
-    belt = calibration.belt_plane()
+    belt = calibration.belt_plane_3d()
     if len(belt.roi_polygon_xy_mm) >= 3:
         xy = np.asarray(belt.roi_polygon_xy_mm, dtype=float)
         xy_min = xy.min(axis=0) - margin_mm

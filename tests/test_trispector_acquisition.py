@@ -132,3 +132,20 @@ def test_trispector_adapter_reuses_existing_parser_function(tmp_path: Path, monk
         upload, take_id="take_trispector_parser_reuse"
     )
     assert called["count"] == 1
+
+
+def test_trispector_parser_reconstructs_little_endian_exactly_and_emits_diagnostics(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path / "data")
+    upload = tmp_path / "upload_exact.png"
+    _build_trispector_raw_image(upload)
+    TriSpectorFtpAcquisitionAdapter(settings, source_id="trispector_ftp_0").parse_and_register_trispector_upload(upload, take_id="take_exact_25d")
+    take_dir = settings.incoming_dir / "take_exact_25d"
+    height = np.array(Image.open(take_dir / "height16.tif"), dtype=np.uint16)
+    expected = np.arange(height.shape[0] * height.shape[1], dtype=np.uint16).reshape(height.shape)
+    assert np.array_equal(height, expected)
+    parser_meta = json.loads((take_dir / "parser_metadata.json").read_text(encoding="utf-8"))
+    stats = parser_meta.get("effective_bit_depth_stats") or {}
+    assert parser_meta.get("reconstruction_mode") == "little_endian_uint16_default"
+    assert isinstance(stats.get("effective_bits_estimate"), float)
+    assert stats.get("raw_min") == 1.0
+    assert stats.get("raw_max") == float(expected.max())

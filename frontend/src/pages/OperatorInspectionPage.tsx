@@ -33,13 +33,37 @@ function previewUrl(card: OperationsCard): string | null {
   return fileUrl(card.take_id, path);
 }
 
+function superclassLabelEs(value: string | null | undefined): string {
+  const key = String(value || "").toUpperCase();
+  if (key === "BALL_GOOD") return "Bola Buena";
+  if (key === "BALL_SCRAP") return "Scrap de Bola";
+  if (key === "SCRAP" || key === "SCRAP_METAL") return "Chatarra";
+  return "Desconocido";
+}
+
+function superclassToneClass(value: string | null | undefined): string {
+  const key = String(value || "").toUpperCase();
+  if (key === "BALL_GOOD") return "superclass-tone-ball-good";
+  if (key === "BALL_SCRAP") return "superclass-tone-ball-scrap";
+  if (key === "SCRAP" || key === "SCRAP_METAL") return "superclass-tone-scrap";
+  return "superclass-tone-unknown";
+}
+
+function formatVariable(value: number | null | undefined, digits = 3): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return value.toFixed(digits);
+}
+
 export default function OperatorInspectionPage() {
   const [cards, setCards] = useState<OperationsCard[]>([]);
   const [processes, setProcesses] = useState<RuntimeProcessSummary[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
+  const [showClassificationVariables, setShowClassificationVariables] = useState<boolean>(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [hiddenTakeIds, setHiddenTakeIds] = useState<Set<string>>(new Set());
+  const [expandedImage, setExpandedImage] = useState<{ src: string; alt: string } | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -67,6 +91,15 @@ export default function OperatorInspectionPage() {
     return () => window.clearInterval(timer);
   }, [autoRefresh, load]);
 
+  useEffect(() => {
+    if (!expandedImage) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setExpandedImage(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [expandedImage]);
+
   const statusCounts = useMemo(() => {
     const bucket: Record<string, number> = { acquired: 0, queued: 0, processing: 0, completed: 0, failed: 0 };
     for (const card of cards) {
@@ -75,6 +108,19 @@ export default function OperatorInspectionPage() {
       bucket[key] += 1;
     }
     return bucket;
+  }, [cards]);
+
+  const visibleCards = useMemo(
+    () => cards.filter((card) => !hiddenTakeIds.has(card.take_id)),
+    [cards, hiddenTakeIds]
+  );
+
+  const clearPastDetections = useCallback(() => {
+    setHiddenTakeIds((previous) => {
+      const next = new Set(previous);
+      for (const card of cards) next.add(card.take_id);
+      return next;
+    });
   }, [cards]);
 
   return (
@@ -89,14 +135,25 @@ export default function OperatorInspectionPage() {
         <button type="button" className="primary-button" onClick={() => void load()} disabled={loading}>
           {loading ? "Refreshing..." : "Refresh"}
         </button>
+        <button type="button" className="secondary-button" onClick={clearPastDetections} disabled={!cards.length}>
+          Clean Past Detections
+        </button>
         <label className="demo-toggle">
           <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
           Auto-refresh ({AUTO_REFRESH_MS / 1000}s)
         </label>
+        <label className="demo-toggle">
+          <input
+            type="checkbox"
+            checked={showClassificationVariables}
+            onChange={(event) => setShowClassificationVariables(event.target.checked)}
+          />
+          Show classification variables
+        </label>
         <small>Index updated: {formatTimestamp(lastUpdatedAt)}</small>
       </section>
 
-      {error && <section className="mode-banner"><span>Unable to load operations cards: {error}</span></section>}
+      {error && <section className="mode-banner"><span>Unable to load operator inspection results: {error}</span></section>}
 
       <section className="section-group">
         <div className="section-heading">
@@ -122,26 +179,69 @@ export default function OperatorInspectionPage() {
       </section>
 
       <section className="operator-recent-list">
-        {cards.map((card) => {
+        {visibleCards.map((card, index) => {
           const image = previewUrl(card);
+          const superclass = card.superclass || "-";
+          const superclassEs = superclassLabelEs(card.superclass);
+          const superclassTone = superclassToneClass(card.superclass);
           return (
-            <article key={card.take_id} className="take-row operator-recent-row">
+            <article
+              key={card.take_id}
+              className={`take-row operator-recent-row ${index === 0 ? "operator-recent-row-latest" : ""}`}
+            >
+              <div className={`operator-superclass-center ${superclassTone}`}>{superclassEs}</div>
               <div className="take-row-main">
                 <strong>{card.take_id}</strong>
                 <small>Status: {prettyStatus(card.status)}</small>
-                <small>Superclass: {card.superclass || "-"} | Label: {card.label || "-"}</small>
+                <small>Superclass: {superclassEs} ({superclass}) | Label: {card.label || "-"}</small>
                 <small>Confidence: {formatConfidence(card.confidence)} | Objects: {card.object_count ?? 0}</small>
+                {showClassificationVariables && (
+                  <small>
+                    Vars: max_h={formatVariable(card.classification_variables?.max_height_mm, 2)}mm | p95_h=
+                    {formatVariable(card.classification_variables?.p95_height_mm, 2)}mm | ecc=
+                    {formatVariable(card.classification_variables?.eccentricity)} | sph3d=
+                    {formatVariable(card.classification_variables?.sphericity_3d)} | flat=
+                    {formatVariable(card.classification_variables?.flatness)} | rough=
+                    {formatVariable(card.classification_variables?.edge_roughness, 2)} | footprint_roundness=
+                    {formatVariable(card.classification_variables?.footprint_roundness)} | vol=
+                    {formatVariable(card.classification_variables?.volume_proxy_mm3, 1)}mm3
+                  </small>
+                )}
                 <small>Acquired: {formatTimestamp(card.acquired_at)} | Processed: {formatTimestamp(card.processed_at)}</small>
                 {card.error && <small>Error: {card.error}</small>}
               </div>
               <div className="take-row-meta">
-                {image ? <img src={image} alt={`Preview ${card.take_id}`} style={{ width: 180, height: 120, objectFit: "cover", borderRadius: 10 }} /> : <small>No preview</small>}
+                {image ? (
+                  <button
+                    type="button"
+                    className="preview-thumb-button"
+                    onClick={() => setExpandedImage({ src: image, alt: `Preview ${card.take_id}` })}
+                  >
+                    <img src={image} alt={`Preview ${card.take_id}`} className="preview-thumb-image" />
+                  </button>
+                ) : (
+                  <small>No display image available</small>
+                )}
               </div>
             </article>
           );
         })}
-        {!cards.length && !loading && <div className="empty-state compact">No operations cards available yet.</div>}
+        {!visibleCards.length && !loading && <div className="empty-state compact">No operations cards available yet.</div>}
       </section>
+
+      {expandedImage && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={() => setExpandedImage(null)}>
+          <div className="modal-panel wide image-modal-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Image Preview</h3>
+              <button type="button" onClick={() => setExpandedImage(null)}>Close</button>
+            </div>
+            <div className="image-modal-content">
+              <img src={expandedImage.src} alt={expandedImage.alt} className="image-modal-preview" />
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

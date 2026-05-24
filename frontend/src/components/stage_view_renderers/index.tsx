@@ -9,7 +9,11 @@ import { artifactsForStage, firstArtifactByAlias } from "../studioWorkspaceModel
 import { stageEmptyState, stageSemanticDefinition, type StageViewDefinition } from "../stageSemantics";
 import { primarySourceImageUrl, resolveStageViewContext } from "../stage_sources";
 import type { RoiPolygon, RoiRect } from "../roiMapping";
+import type { RoiType } from "../ProjectionArtifactViewer";
 import { normalizeBlobDetectionArtifacts } from "../../studio/blobDetectionModel";
+import type { StudioDebugMode } from "../studioDebugMode";
+import type { HoverInspectionSample } from "../hoverInspectionModel";
+import { resolveHeightArtifact } from "../heightSemantics";
 
 type RendererProps = {
   detail: TakeDetail | null;
@@ -28,14 +32,19 @@ type RendererProps = {
   onOverlayDebug: (info: OverlayDebugInfo) => void;
   roi?: RoiRect | null;
   roiPolygon?: RoiPolygon | null;
-  roiType?: "rectangle" | "polygon";
+  roiType?: RoiType;
   roiEnabled?: boolean;
   onApplyRoi?: (roi: RoiRect, rerun: boolean) => void;
   onApplyPolygonRoi?: (points: RoiPolygon, rerun: boolean) => void;
   onClearRoi?: () => void;
+  roiEditModeActive?: boolean;
+  roiEditStatus?: "idle" | "active" | "unsaved" | "saved" | "rerun_required";
+  onCancelRoiEdit?: () => void;
   blobParams?: Record<string, unknown> | null;
   onApplyBlobParams?: (params: Record<string, unknown>, rerun: boolean) => void;
   onUpsertObjectAnnotation?: (payload: Record<string, unknown>) => void;
+  debugMode?: StudioDebugMode;
+  onHoverSample?: (sample: HoverInspectionSample | null) => void;
 };
 
 function semanticEmpty(stageId: string, viewId: string) {
@@ -83,6 +92,11 @@ function explore(
       onApplyRoi={opts?.disableRoi ? undefined : props.onApplyRoi}
       onApplyPolygonRoi={opts?.disableRoi ? undefined : props.onApplyPolygonRoi}
       onClearRoi={opts?.disableRoi ? undefined : props.onClearRoi}
+      roiEditModeActive={Boolean(props.roiEditModeActive)}
+      roiEditStatus={props.roiEditStatus}
+      onCancelRoiEdit={props.onCancelRoiEdit}
+      debugMode={props.debugMode ?? "operator"}
+      onHoverSample={props.onHoverSample}
     />
   );
 }
@@ -101,6 +115,9 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       }
       return context.resolvedArtifacts;
     })();
+    const rawPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "raw_sensor_z", representation: "preview_image" }).artifact;
+    const normalizedPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "height_above_belt", representation: "preview_image" }).artifact;
+    const residualPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "plane_signed_distance", representation: "preview_image" }).artifact;
     const artifacts = candidateArtifacts.filter((artifact) => {
       if (artifact.kind !== "image") return false;
       if (props.view.id === "height_preview") {
@@ -109,11 +126,24 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
           || artifact.artifact_id === "heightmap"
           || artifact.artifact_id === "input_preview";
       }
-      if (props.view.id === "heightmap" || props.view.id === "raw_heightmap") return artifact.artifact_id === "heightmap" || artifact.artifact_id === "input_preview" || artifact.artifact_id === "raw_heightmap_preview";
+      if (props.view.id === "heightmap" || props.view.id === "raw_heightmap") {
+        if (rawPreview) return artifact.artifact_id === rawPreview.artifact_id;
+        return artifact.artifact_id === "heightmap" || artifact.artifact_id === "input_preview" || artifact.artifact_id === "raw_heightmap_preview";
+      }
       if (props.view.id === "depth_gradient") return artifact.artifact_id === "depth_gradient_magnitude" || /depth_gradient_magnitude/i.test(String(artifact.path ?? ""));
       if (props.view.id === "low_gradient_mask") return artifact.artifact_id === "low_gradient_mask" || /low_gradient_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "selected_surface") return artifact.artifact_id === "reference_surface_selected_mask" || artifact.artifact_id === "expanded_plane_mask" || /reference_surface_selected_mask|expanded_plane_mask/i.test(String(artifact.path ?? ""));
-      if (props.view.id === "normalized_height") return artifact.artifact_id === "normalized_heightmap" || /normalized_heightmap/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "normalized_height") {
+        if (normalizedPreview) return artifact.artifact_id === normalizedPreview.artifact_id;
+        return artifact.artifact_id === "normalized_heightmap" || /normalized_heightmap/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "residuals") {
+        if (residualPreview) return artifact.artifact_id === residualPreview.artifact_id;
+        return artifact.artifact_id === "belt_plane_residuals"
+          || artifact.artifact_id === "sphere_fit_residual_heatmap"
+          || /residual/i.test(String(artifact.artifact_id ?? ""))
+          || /residual/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "below_reference") return artifact.artifact_id === "below_reference_mask" || /below_reference_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "above_threshold") return artifact.artifact_id === "above_threshold_mask" || /above_threshold_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "valid_mask") return artifact.artifact_id === "valid_mask" || /valid_mask/i.test(String(artifact.path ?? ""));
@@ -557,23 +587,99 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     }
     if (semantic.category === "measurement" && (props.view.id === "measurements_25d" || props.view.id === "measurements")) {
       const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const knownScale = firstArtifactByAlias(stageArtifacts, ["known_object_scale_validation"])
+        ?? firstArtifactByAlias(props.detail.result?.artifacts ?? [], ["known_object_scale_validation"]);
+      const knownMeta = (knownScale?.metadata ?? {}) as Record<string, unknown>;
+      const stageParams = ((props.detail.result as unknown as Record<string, unknown> | null)?.stage_params ?? {}) as Record<string, unknown>;
+      const knownParams = (stageParams.known_object_25d ?? {}) as Record<string, unknown>;
+      const scaleX = knownMeta.recommended_scale_correction_x ?? knownMeta.persisted_scale_correction_x ?? knownParams.persisted_scale_correction_x;
+      const scaleY = knownMeta.recommended_scale_correction_y ?? knownMeta.persisted_scale_correction_y ?? knownParams.persisted_scale_correction_y;
+      const scaleZ = knownMeta.recommended_scale_correction_z ?? knownMeta.persisted_scale_correction_z ?? knownParams.persisted_scale_correction_z;
       const kept = objects.filter((item) => item.filter_status !== "rejected");
       const avgDiameter = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.diameter_mm ?? obj.diameter_estimate_mm ?? 0), 0) / kept.length : 0;
       const avgCircularity = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.sphericity_score ?? 0), 0) / kept.length : 0;
+      const selected = objects.find((item) => item.object_id === props.selectedObjectId) ?? null;
+      const measurementArtifacts = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, stageArtifacts).resolvedArtifacts;
       return (
-        <div className="studio-object-workspace">
-          <StudioObjectList objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelect={props.onSelectObject} onHover={props.onHoverObject} />
-          <div className="studio-table-pane">
-            <div className="pipeline-status-grid">
-              <div><span>Objects</span><strong>{kept.length}</strong></div>
-              <div><span>Rejected</span><strong>{objects.length - kept.length}</strong></div>
-              <div><span>Avg diameter</span><strong>{kept.length ? `${avgDiameter.toFixed(2)} mm` : "-"}</strong></div>
-              <div><span>Avg circularity</span><strong>{kept.length ? avgCircularity.toFixed(2) : "-"}</strong></div>
-            </div>
-            <ObjectTable objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelectObject={props.onSelectObject} onHoverObject={props.onHoverObject} />
-          </div>
-        </div>
+        <section className="measurement-stage-layout">
+          <section className="measurement-kpi-row" aria-label="Measurement stage summary">
+            <div className="measurement-kpi-card"><span title="Objects">Objects</span><strong>{kept.length}</strong></div>
+            <div className="measurement-kpi-card"><span title="Rejected">Rejected</span><strong>{objects.length - kept.length}</strong></div>
+            <div className="measurement-kpi-card"><span title="Average diameter">Avg Ø</span><strong>{kept.length ? `${avgDiameter.toFixed(2)} mm` : "-"}</strong></div>
+            <div className="measurement-kpi-card"><span title="Average circularity">Circ.</span><strong>{kept.length ? avgCircularity.toFixed(2) : "-"}</strong></div>
+            <div className="measurement-kpi-card"><span title="Scale X">Scale X</span><strong>{scaleX == null ? "-" : Number(scaleX).toFixed(4)}</strong></div>
+            <div className="measurement-kpi-card"><span title="Scale Y">Scale Y</span><strong>{scaleY == null ? "-" : Number(scaleY).toFixed(4)}</strong></div>
+            <div className="measurement-kpi-card"><span title="Scale Z">Scale Z</span><strong>{scaleZ == null ? "-" : Number(scaleZ).toFixed(4)}</strong></div>
+          </section>
+          <section className="measurement-main-split">
+            <aside className="measurement-object-nav">
+              <StudioObjectList objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelect={props.onSelectObject} onHover={props.onHoverObject} />
+            </aside>
+            <section className="measurement-selected-workspace">
+              <section className="measurement-selected-summary">
+                <strong>Selected object workspace</strong>
+                {selected ? (
+                  <div className="pipeline-status-grid">
+                    <div><span>Object</span><strong>{selected.object_id}</strong></div>
+                    <div><span>Class</span><strong>{selected.class_name ?? "-"}</strong></div>
+                    <div><span>Conf.</span><strong>{selected.confidence == null ? "-" : `${Math.round(selected.confidence * 100)}%`}</strong></div>
+                    <div><span>Diameter</span><strong>{selected.diameter_mm ?? selected.diameter_estimate_mm ?? "-"}</strong></div>
+                  </div>
+                ) : <small>Select an object from the left panel.</small>}
+              </section>
+              <section className="measurement-overlay-section">
+                {explore(measurementArtifacts, props)}
+              </section>
+              <section className="measurement-table-section">
+                <ObjectTable objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelectObject={props.onSelectObject} onHoverObject={props.onHoverObject} />
+              </section>
+            </section>
+          </section>
+        </section>
       );
+    }
+    if (semantic.category === "measurement" && props.view.id === "provenance") {
+      const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
+      const rows = objects.map((obj) => ({
+        ...(obj as Record<string, unknown>),
+        object_id: obj.object_id,
+        bbox_px: (obj as Record<string, unknown>).bbox_px ?? null,
+        segmented_bbox_mm: { min: obj.bbox_min_mm ?? null, max: obj.bbox_max_mm ?? null },
+        segmentation_coverage: (obj as Record<string, unknown>).segmentation_coverage ?? null,
+        removed_points: (obj as Record<string, unknown>).removed_points ?? null,
+        morphology_removals: (obj as Record<string, unknown>).morphology_removals ?? null,
+        contour_metrics: {
+          eccentricity: (obj as Record<string, unknown>).feature_eccentricity ?? null,
+          footprint_roundness: (obj as Record<string, unknown>).feature_footprint_roundness ?? null,
+          roughness: (obj as Record<string, unknown>).feature_edge_roughness ?? null,
+        },
+        height_stats: obj.height_above_belt_mm ?? null,
+        sphere_fit_stats: {
+          fit_rmse_mm: obj.fit_rmse_mm ?? null,
+          sphericity_score: obj.sphericity_score ?? null,
+          feature_sphericity_3d: (obj as Record<string, unknown>).feature_sphericity_3d ?? null,
+        },
+      }));
+      return <pre className="json-block">{JSON.stringify(rows, null, 2)}</pre>;
+    }
+    if (semantic.category === "plane_qa" && (props.view.id === "diagnostics" || props.view.id === "residual_histogram")) {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const fit = (stageArtifacts.find((item) => item.artifact_id === "plane_fit_debug")?.metadata ?? {}) as Record<string, unknown>;
+      const selected = (stageArtifacts.find((item) => item.artifact_id === "selected_surface_debug")?.metadata ?? {}) as Record<string, unknown>;
+      const residualHistogram = (stageArtifacts.find((item) => item.artifact_id === "plane_residual_histogram")?.metadata ?? {}) as Record<string, unknown>;
+      return <pre className="json-block">{JSON.stringify({ plane_fit_debug: fit, selected_surface_debug: selected, residual_histogram: residualHistogram }, null, 2)}</pre>;
+    }
+    if (semantic.category === "classification" && props.view.id === "diagnostics") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const result = (stageArtifacts.find((item) => item.artifact_id === "classification_result_25d")?.metadata ?? {}) as Record<string, unknown>;
+      const explanations = (props.detail.result?.objects ?? []).map((obj) => ({
+        object_id: obj.object_id,
+        label: (obj as Record<string, unknown>).label ?? null,
+        confidence: obj.confidence,
+        explanation: (obj as Record<string, unknown>).classification_explanation ?? null,
+      }));
+      return <pre className="json-block">{JSON.stringify({ summary: result, explanations }, null, 2)}</pre>;
     }
     const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
     const stageArtifacts = artifactsForStage(props.detail, props.stageId);

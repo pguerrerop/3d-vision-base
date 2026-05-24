@@ -4,6 +4,7 @@ import TakeDetailPage from "./pages/TakeDetailPage";
 import CalibrationPage from "./pages/CalibrationPage";
 import ProcessingLabPage from "./pages/ProcessingLabPage";
 import RuntimePage from "./pages/RuntimePage";
+import SuperclassHistogramPage from "./pages/SuperclassHistogramPage";
 import AppHeader from "./components/AppHeader";
 import { productAreaForPath } from "./productNavigation";
 
@@ -13,6 +14,7 @@ type Route =
   | { name: "runtime" }
   | { name: "calibration" }
   | { name: "studio" }
+  | { name: "superclass_histograms" }
   | { name: "take"; takeId: string };
 
 function currentRoute(): Route {
@@ -31,6 +33,7 @@ export default function App() {
       <AppHeader active={route.name} />
       {route.name === "calibration" && <CalibrationPage />}
       {route.name === "studio" && <ProcessingLabPage />}
+      {route.name === "superclass_histograms" && <SuperclassHistogramPage />}
       {route.name === "runtime" && <RuntimePage />}
       {route.name === "diagnostics" && <DebugPage />}
       {route.name === "take" && <TakeDetailPage takeId={route.takeId} />}

@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 
 from vision_3d_acquisition.contracts.modalities import CaptureModality
+from vision_3d_acquisition.operations.classification_superclass import (
+    apply_sphericity_3d_fallback_to_object,
+    map_label_to_superclass,
+    select_dominant_classification,
+)
 from vision_3d_acquisition.vision_core.heightmap import (
     HeightmapFrame,
     load_heightmap_npz,
@@ -17,6 +22,232 @@ from vision_3d_acquisition.vision_core.heightmap import (
     write_heightmap_preview_png,
 )
 from vision_3d_acquisition.vision_core.pipelines.core import PipelineContext
+
+
+_PREVIEW_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_SUPPORTED_HEIGHT_TRANSFORM_TYPES = {
+    "raw_decode",
+    "plane_fit",
+    "signed_distance",
+    "invert_signed_distance",
+    "normalization",
+    "clipping",
+    "scaling",
+    "projection",
+    "smoothing",
+    "masking",
+}
+
+
+def _display_only_meta(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta: dict[str, Any] = {"display_only": True, "numeric_source": False}
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _numeric_source_meta(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta: dict[str, Any] = {"display_only": False, "numeric_source": True}
+    if extra:
+        meta.update(extra)
+    return meta
+
+
+def _height_semantic_meta(
+    *,
+    semantic_field: str,
+    semantic_label: str,
+    units: str,
+    value_min: float,
+    value_max: float,
+    color_scale_min: float,
+    color_scale_max: float,
+    color_map: str,
+    positive_direction: str,
+    is_measurement_authoritative: bool,
+    source_artifact_id: str,
+    stage_id: str,
+) -> dict[str, Any]:
+    # `color_mapping` is the canonical contract shared by:
+    #   - image renderer (this writes the PNG using these bounds)
+    #   - HeightLegend (renders gradient/labels from the same LUT)
+    #   - hover / debug reconstruction (scalar->RGB diff uses these bounds)
+    # Studio considers metadata.color_mapping authoritative.
+    color_mapping = build_height_color_mapping_block(
+        semantic_field=semantic_field,
+        units=units,
+        value_min=value_min,
+        value_max=value_max,
+        color_scale_min=color_scale_min,
+        color_scale_max=color_scale_max,
+        color_map=color_map,
+        direction=_direction_for_semantic(semantic_field, positive_direction),
+        source="artifact_metadata",
+    )
+    return {
+        "semantic_field": semantic_field,
+        "semantic_label": semantic_label,
+        "units": units,
+        "value_min": float(value_min),
+        "value_max": float(value_max),
+        "color_scale_min": float(color_scale_min),
+        "color_scale_max": float(color_scale_max),
+        "color_map": color_map,
+        "positive_direction": positive_direction,
+        "is_measurement_authoritative": bool(is_measurement_authoritative),
+        "source_artifact_id": source_artifact_id,
+        "stage_id": stage_id,
+        "color_mapping": color_mapping,
+    }
+
+
+def build_height_color_mapping_block(
+    *,
+    semantic_field: str,
+    units: str,
+    value_min: float,
+    value_max: float,
+    color_scale_min: float,
+    color_scale_max: float,
+    color_map: str,
+    direction: str = "higher_is_hotter",
+    clamp: bool = True,
+    source: str = "artifact_metadata",
+) -> dict[str, Any]:
+    """Build a canonical color_mapping block.
+
+    Direction is data-native: the LUT is always anchored at value_min (cool)
+    to value_max (hot). The `direction` field only affects how labels/ticks
+    are rendered by HeightLegend; it never inverts the LUT.
+    """
+    return {
+        "semantic_field": semantic_field,
+        "units": units,
+        "value_min": float(value_min),
+        "value_max": float(value_max),
+        "color_scale_min": float(color_scale_min),
+        "color_scale_max": float(color_scale_max),
+        "color_map": str(color_map or "turbo"),
+        "direction": direction if direction in ("higher_is_hotter", "lower_is_hotter") else "higher_is_hotter",
+        "clamp": bool(clamp),
+        "source": source if source in ("artifact_metadata", "render_context", "legacy_fallback") else "artifact_metadata",
+    }
+
+
+def _direction_for_semantic(semantic_field: str, positive_direction: str | None) -> str:
+    key = str(positive_direction or "").lower()
+    if "lower" in key:
+        return "lower_is_hotter"
+    if semantic_field in ("height_above_belt", "raw_sensor_z", "plane_signed_distance", "preview_normalized"):
+        return "higher_is_hotter"
+    return "higher_is_hotter"
+
+
+def _assert_not_preview_semantic(context: PipelineContext, *, stage_name: str) -> None:
+    if str(context.get_artifact("height_processing_semantic_field", "")).strip() == "preview_normalized":
+        raise ValueError(f"{stage_name} cannot consume preview_normalized")
+
+
+def build_height_transform_metadata(
+    *,
+    semantic_field: str,
+    derived_from: str,
+    transform_type: str,
+    plane_id: str | None = None,
+    units: str = "mm",
+    extras: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = str(transform_type or "").strip()
+    if normalized not in _SUPPORTED_HEIGHT_TRANSFORM_TYPES:
+        raise ValueError(f"Unsupported height transform type: {transform_type}")
+    transform: dict[str, Any] = {
+        "type": normalized,
+        "units": units,
+    }
+    if plane_id:
+        transform["plane_id"] = plane_id
+    if extras:
+        transform.update(extras)
+    return {
+        "semantic_field": semantic_field,
+        "derived_from": derived_from,
+        "transform": transform,
+    }
+
+
+def _semantic_raster_meta(
+    *,
+    semantic_field: str,
+    source_stage: str,
+    coordinate_space: str,
+    units: str = "mm",
+    dtype: str = "float32",
+    derived_from: str,
+    transform_type: str,
+    plane_id: str | None = None,
+    extras: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        **_numeric_source_meta(),
+        "semantic_field": semantic_field,
+        "coordinate_space": coordinate_space,
+        "units": units,
+        "dtype": dtype,
+        "source_stage": source_stage,
+    }
+    meta.update(
+        build_height_transform_metadata(
+            semantic_field=semantic_field,
+            derived_from=derived_from,
+            transform_type=transform_type,
+            plane_id=plane_id,
+            units=units,
+        )
+    )
+    if extras:
+        meta.update(extras)
+    return meta
+
+
+def resolve_height_artifact(
+    context: PipelineContext,
+    *,
+    semantic_field: str,
+    representation: str,
+) -> dict[str, Any] | None:
+    def _matches(item: dict[str, Any]) -> bool:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if str(metadata.get("semantic_field") or "") != semantic_field:
+            return False
+        kind = str(item.get("kind") or "")
+        path = str(item.get("path") or "")
+        if representation == "numeric_raster":
+            return kind == "file" or path.endswith(".values.f32")
+        if representation == "preview_image":
+            return kind == "image"
+        if representation == "debug_overlay":
+            return kind == "overlay"
+        if representation == "histogram":
+            return "histogram" in str(item.get("artifact_id") or "") or "histogram" in path
+        if representation == "mask":
+            return "mask" in str(item.get("artifact_id") or "") or "mask" in path
+        if representation == "residual_map":
+            return "residual" in str(item.get("artifact_id") or "") or "residual" in path
+        return False
+
+    for artifact in context.processing_artifacts:
+        if isinstance(artifact, dict) and _matches(artifact):
+            return artifact
+    return None
+
+
+def _valid_min_max_mm(values: np.ndarray, valid_mask: np.ndarray) -> tuple[float, float]:
+    vals = np.asarray(values, dtype=np.float32)
+    mask = np.asarray(valid_mask, dtype=bool)
+    valid = vals[mask]
+    if valid.size <= 0:
+        return 0.0, 0.0
+    return float(np.min(valid)), float(np.max(valid))
 
 
 @dataclass
@@ -52,9 +283,14 @@ class LoadHeightmapCaptureStage:
         npz_name = "heightmap_frame.npz"
         preview_name = "heightmap_input_preview.png"
         meta_name = "heightmap_frame.metadata.json"
+        raw_semantic_raster = "raw_sensor_z.values.f32"
         save_heightmap_npz(frame, output_dir / npz_name)
         write_heightmap_preview_png(frame.z_mm, frame.valid_mask, output_dir / preview_name)
         write_heightmap_metadata_json(frame, output_dir / meta_name, extra={"source_file": height_file})
+        frame.z_mm.astype(np.float32).tofile(output_dir / raw_semantic_raster)
+        # Backward-compatible alias while studio migrates to semantic-first paths.
+        frame.z_mm.astype(np.float32).tofile(output_dir / "raw_heightmap.values.f32")
+        input_min_mm, input_max_mm = _valid_min_max_mm(frame.z_mm, frame.valid_mask)
 
         files_payload: dict[str, str | None] = {
             "heightmap": height_file,
@@ -76,7 +312,56 @@ class LoadHeightmapCaptureStage:
             preview_available=True,
             projection_type="heightmap",
             projection_coordinate_system={"pixel_per_mm": 1.0 / max(frame.x_resolution_mm, 1e-6)},
-            metadata={"source": "native_pipeline", "producer": self.name, "modality": "heightmap"},
+            metadata={
+                **_display_only_meta(),
+                **_height_semantic_meta(
+                    semantic_field="raw_sensor_z",
+                    semantic_label="Raw sensor Z",
+                    units="mm",
+                    value_min=input_min_mm,
+                    value_max=input_max_mm,
+                    color_scale_min=input_min_mm,
+                    color_scale_max=input_max_mm,
+                    color_map="turbo",
+                    positive_direction="higher_value",
+                    is_measurement_authoritative=False,
+                    source_artifact_id="heightmap_frame.npz:z_mm",
+                    stage_id="input",
+                ),
+                "source": "native_pipeline",
+                "producer": self.name,
+                "modality": "heightmap",
+                "min_mm": input_min_mm,
+                "max_mm": input_max_mm,
+                "units": "mm",
+                "display_semantic": "raw_sensor_z_mm",
+                "display_units": "mm",
+                "display_range": {"min": input_min_mm, "max": input_max_mm},
+                "raw_semantic": "raw_sensor_z_mm",
+                "semantic_source_id": "heightmap_frame.npz:z_mm",
+                **build_height_transform_metadata(
+                    semantic_field="raw_sensor_z",
+                    derived_from="sensor_heightmap_decode",
+                    transform_type="raw_decode",
+                    units="mm",
+                ),
+            },
+        )
+        context.add_processing_artifact(
+            artifact_id="raw_sensor_z_raster",
+            stage_id="input",
+            kind="file",
+            title="Raw sensor Z semantic raster",
+            path=raw_semantic_raster,
+            mime_type="application/octet-stream",
+            preview_available=False,
+            metadata=_semantic_raster_meta(
+                semantic_field="raw_sensor_z",
+                source_stage="load_heightmap_capture",
+                coordinate_space="sensor_xy_pixels",
+                derived_from="sensor_heightmap_decode",
+                transform_type="raw_decode",
+            ),
         )
 
 
@@ -161,6 +446,7 @@ class DetectBeltPlaneStage:
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
         output_dir: Path = context.require_artifact("output_dir")
         write_heightmap_preview_png(frame.z_mm, frame.valid_mask, output_dir / "raw_heightmap_preview.png")
+        raw_min_mm, raw_max_mm = _valid_min_max_mm(frame.z_mm, frame.valid_mask)
         valid_mask_u8 = (frame.valid_mask.astype(np.uint8) * 255)
         cv2.imwrite(str(output_dir / "valid_mask.png"), valid_mask_u8)
 
@@ -169,6 +455,17 @@ class DetectBeltPlaneStage:
         cv2.imwrite(str(output_dir / "plane_fit_roi_mask.png"), (roi_mask.astype(np.uint8) * 255))
         valid_for_fit = frame.valid_mask & roi_mask
         valid_pixel_count = int(np.count_nonzero(valid_for_fit))
+        roi_enabled = roi_cfg is not None
+        roi_type = str(roi_cfg.get("type") or roi_cfg.get("roi_type") or "rectangle").lower() if isinstance(roi_cfg, dict) else "rectangle"
+        roi_x = int(roi_cfg.get("x", 0)) if isinstance(roi_cfg, dict) else 0
+        roi_w = int(roi_cfg.get("width", frame.valid_mask.shape[1])) if isinstance(roi_cfg, dict) else int(frame.valid_mask.shape[1])
+        if roi_type == "vertical_band":
+            roi_y = 0
+            roi_h = int(frame.valid_mask.shape[0])
+        else:
+            roi_y = int(roi_cfg.get("y", 0)) if isinstance(roi_cfg, dict) else 0
+            roi_h = int(roi_cfg.get("height", frame.valid_mask.shape[0])) if isinstance(roi_cfg, dict) else int(frame.valid_mask.shape[0])
+        roi_area_ratio = float(np.count_nonzero(roi_mask) / max(1, roi_mask.size))
 
         status = "success"
         failure_reason: str | None = None
@@ -563,6 +860,10 @@ class DetectBeltPlaneStage:
             output_dir / "belt_plane_residuals.png",
             colorbar_label="absolute residual (mm)",
         )
+        residual_raster_name = "plane_signed_distance.values.f32"
+        residual_map.astype(np.float32).tofile(output_dir / residual_raster_name)
+        # Backward-compatible alias while semantic raster contracts propagate.
+        residual_map.astype(np.float32).tofile(output_dir / "plane_residuals.values.f32")
         cv2.imwrite(str(output_dir / "plane_inlier_mask.png"), (belt_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "background_candidate_mask.png"), (candidate_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "background_seed_mask.png"), (seed_mask.astype(np.uint8) * 255))
@@ -570,6 +871,18 @@ class DetectBeltPlaneStage:
         cv2.imwrite(str(output_dir / "final_plane_inlier_mask.png"), (belt_mask.astype(np.uint8) * 255))
         overlay = _render_belt_plane_overlay(frame, belt_mask)
         cv2.imwrite(str(output_dir / "belt_plane_overlay.png"), overlay)
+
+        roi_valid_ratio = float(np.count_nonzero(valid_for_fit) / max(1, np.count_nonzero(roi_mask)))
+        roi_candidate_coverage = float(np.count_nonzero(candidate_mask) / max(1, np.count_nonzero(roi_mask)))
+        roi_selected_surface_coverage = float(np.count_nonzero(belt_mask) / max(1, np.count_nonzero(roi_mask)))
+        if roi_valid_ratio < 0.2:
+            warnings.append("roi_valid_pixels_too_low")
+        if roi_candidate_coverage < 0.05:
+            warnings.append("roi_candidate_coverage_too_low")
+        if roi_selected_surface_coverage < 0.05:
+            warnings.append("roi_selected_surface_coverage_too_low")
+        if roi_area_ratio < 0.03:
+            warnings.append("roi_coverage_too_small")
 
         background_selection_debug = {
             "background_detection_strategy": self.background_detection_strategy,
@@ -593,6 +906,14 @@ class DetectBeltPlaneStage:
             "height_gate": height_gate_debug,
             "component_stats": component_stats[:40],
             "warnings": warnings,
+            "roi_inspector": {
+                "enabled": roi_enabled,
+                "coverage_ratio": roi_area_ratio,
+                "coverage_percent": roi_area_ratio * 100.0,
+                "valid_pixel_ratio": roi_valid_ratio,
+                "candidate_coverage_ratio": roi_candidate_coverage,
+                "selected_surface_coverage_ratio": roi_selected_surface_coverage,
+            },
         }
         gradient_debug_path = output_dir / "gradient_debug.json"
         if gradient_debug_path.is_file():
@@ -622,7 +943,26 @@ class DetectBeltPlaneStage:
             "model_selection_reason": model_selection_reason,
             "model_residual_mean_mm": float(np.mean(residual_abs)) if residual_abs.size else 0.0,
             "model_residual_p95_mm": float(np.percentile(residual_abs, 95)) if residual_abs.size else 0.0,
+            "roi_enabled": roi_enabled,
+            "roi_type": roi_type,
+            "roi_x": roi_x,
+            "roi_y": roi_y,
+            "roi_width": roi_w,
+            "roi_height": roi_h,
+            "roi_area_ratio": roi_area_ratio,
             "warnings": warnings,
+            "roi": {
+                "enabled": roi_enabled,
+                "type": roi_type,
+                "x": roi_x,
+                "y": roi_y,
+                "width": roi_w,
+                "height": roi_h,
+                "area_ratio": roi_area_ratio,
+                "valid_pixel_ratio": roi_valid_ratio,
+                "candidate_coverage_ratio": roi_candidate_coverage,
+                "selected_surface_coverage_ratio": roi_selected_surface_coverage,
+            },
             "background_selection": background_selection_debug,
             "config": {
                 "plane_fit_roi": roi_cfg,
@@ -652,6 +992,15 @@ class DetectBeltPlaneStage:
                 "reference_surface_height_gate_max_coverage_ratio": self.reference_surface_height_gate_max_coverage_ratio,
             },
         }
+        residual_hist_counts, residual_hist_edges = np.histogram(residuals.astype(np.float64) if residuals.size else np.asarray([0.0]), bins=64)
+        residual_hist_payload = {
+            "bin_counts": [int(x) for x in residual_hist_counts.tolist()],
+            "bin_edges": [float(x) for x in residual_hist_edges.tolist()],
+            "sample_count": int(residuals.size),
+            "signed": True,
+            "units": "mm",
+        }
+        (output_dir / "plane_residual_histogram.json").write_text(json.dumps(residual_hist_payload, indent=2), encoding="utf-8")
         (output_dir / "plane_fit_debug.json").write_text(json.dumps(debug_payload, indent=2), encoding="utf-8")
         selected_surface_debug = {
             "reference_surface_model_type": reference_model_type,
@@ -690,10 +1039,22 @@ class DetectBeltPlaneStage:
                 "plane_fit_debug": "plane_fit_debug.json",
                 "belt_plane_overlay": "belt_plane_overlay.png",
                 "belt_plane_residuals": "belt_plane_residuals.png",
+                "plane_signed_distance_values": "plane_signed_distance.values.f32",
+                "plane_residual_histogram": "plane_residual_histogram.json",
             }
         )
         context.set_artifact("files", files)
 
+        context.add_processing_artifact(
+            artifact_id="plane_residual_histogram",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Plane residual histogram",
+            path="plane_residual_histogram.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **residual_hist_payload},
+        )
         context.add_processing_artifact(
             artifact_id="belt_plane",
             stage_id="detect_belt_plane",
@@ -712,7 +1073,61 @@ class DetectBeltPlaneStage:
             path="belt_plane_residuals.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, "residual_stats_mm": stats},
+            metadata={
+                **_display_only_meta(),
+                **_height_semantic_meta(
+                    semantic_field="plane_signed_distance",
+                    semantic_label="Plane signed distance",
+                    units="mm",
+                    value_min=float(-stats.get("max_abs_mm", 0.0) if isinstance(stats, dict) else 0.0),
+                    value_max=float(stats.get("max_abs_mm", 0.0) if isinstance(stats, dict) else 0.0),
+                    color_scale_min=0.0,
+                    color_scale_max=float(stats.get("max_abs_mm", 0.0) if isinstance(stats, dict) else 0.0),
+                    color_map="turbo",
+                    positive_direction="higher_value",
+                    is_measurement_authoritative=False,
+                    source_artifact_id="heightmap_frame.npz:z_mm",
+                    stage_id="detect_belt_plane",
+                ),
+                "source": "native_pipeline",
+                "producer": self.name,
+                "residual_stats_mm": stats,
+                "min_mm": 0.0,
+                "max_mm": float(stats.get("max_abs_mm", 0.0) if isinstance(stats, dict) else 0.0),
+                "units": "mm",
+                "display_semantic": "plane_residual_mm",
+                "display_units": "mm",
+                "display_range": {
+                    "min": 0.0,
+                    "max": float(stats.get("max_abs_mm", 0.0) if isinstance(stats, dict) else 0.0),
+                },
+                "raw_semantic": "raw_sensor_z_mm",
+                "semantic_source_id": "heightmap_frame.npz:z_mm",
+                **build_height_transform_metadata(
+                    semantic_field="plane_signed_distance",
+                    derived_from="raw_sensor_z",
+                    transform_type="signed_distance",
+                    plane_id="plane_001",
+                    units="mm",
+                ),
+            },
+        )
+        context.add_processing_artifact(
+            artifact_id="plane_signed_distance_raster",
+            stage_id="detect_belt_plane",
+            kind="file",
+            title="Plane signed distance semantic raster",
+            path=residual_raster_name,
+            mime_type="application/octet-stream",
+            preview_available=False,
+            metadata=_semantic_raster_meta(
+                semantic_field="plane_signed_distance",
+                source_stage="detect_belt_plane",
+                coordinate_space="belt_xy_pixels",
+                derived_from="raw_sensor_z",
+                transform_type="signed_distance",
+                plane_id="plane_001",
+            ),
         )
         context.add_processing_artifact(
             artifact_id="belt_plane_overlay",
@@ -722,7 +1137,16 @@ class DetectBeltPlaneStage:
             path="belt_plane_overlay.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata={
+                "source": "native_pipeline",
+                "producer": self.name,
+                "roi_enabled": roi_enabled,
+                "roi_x": roi_x,
+                "roi_y": roi_y,
+                "roi_width": roi_w,
+                "roi_height": roi_h,
+                "roi_area_ratio": roi_area_ratio,
+            },
         )
         context.add_processing_artifact(
             artifact_id="raw_heightmap_preview",
@@ -732,7 +1156,39 @@ class DetectBeltPlaneStage:
             path="raw_heightmap_preview.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata={
+                **_display_only_meta(),
+                **_height_semantic_meta(
+                    semantic_field="raw_sensor_z",
+                    semantic_label="Raw sensor Z",
+                    units="mm",
+                    value_min=raw_min_mm,
+                    value_max=raw_max_mm,
+                    color_scale_min=raw_min_mm,
+                    color_scale_max=raw_max_mm,
+                    color_map="turbo",
+                    positive_direction="higher_value",
+                    is_measurement_authoritative=False,
+                    source_artifact_id="heightmap_frame.npz:z_mm",
+                    stage_id="detect_belt_plane",
+                ),
+                "source": "native_pipeline",
+                "producer": self.name,
+                "min_mm": raw_min_mm,
+                "max_mm": raw_max_mm,
+                "units": "mm",
+                "display_semantic": "raw_sensor_z_mm",
+                "display_units": "mm",
+                "display_range": {"min": raw_min_mm, "max": raw_max_mm},
+                "raw_semantic": "raw_sensor_z_mm",
+                "semantic_source_id": "heightmap_frame.npz:z_mm",
+                **build_height_transform_metadata(
+                    semantic_field="raw_sensor_z",
+                    derived_from="sensor_heightmap_decode",
+                    transform_type="raw_decode",
+                    units="mm",
+                ),
+            },
         )
         context.add_processing_artifact(
             artifact_id="valid_mask",
@@ -742,7 +1198,7 @@ class DetectBeltPlaneStage:
             path="valid_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="plane_inlier_mask",
@@ -752,7 +1208,7 @@ class DetectBeltPlaneStage:
             path="plane_inlier_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="background_candidate_mask",
@@ -802,7 +1258,7 @@ class DetectBeltPlaneStage:
             path="depth_gradient_magnitude.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="low_gradient_mask",
@@ -812,7 +1268,7 @@ class DetectBeltPlaneStage:
             path="low_gradient_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="low_gradient_components_overlay",
@@ -966,6 +1422,7 @@ class NormalizeHeightsToPlaneStage:
         if self.normalized_clip_negative:
             normalized = np.where(normalized < -abs(self.normalized_negative_tolerance_mm), 0.0, normalized)
         context.set_artifact("normalized_heightmap_mm", normalized)
+        context.set_artifact("height_processing_semantic_field", "height_above_belt")
         object_min_height_mm = float((context.get_artifact("stage_params.remove_belt_segment_objects", {}) or {}).get("min_height_mm", 8.0))
         below_reference_mask = frame.valid_mask & (normalized <= float(self.below_reference_tolerance_mm))
         above_threshold_mask = frame.valid_mask & (normalized > object_min_height_mm)
@@ -983,17 +1440,59 @@ class NormalizeHeightsToPlaneStage:
             coordinate_system="belt_plane_normalized_mm",
         )
         save_heightmap_npz(norm_frame, output_dir / "normalized_heightmap.npz")
-        write_heightmap_preview_png(normalized, frame.valid_mask, output_dir / "normalized_heightmap.png")
+        valid_values = normalized[frame.valid_mask]
+        p1 = float(np.percentile(valid_values, 1)) if valid_values.size else 0.0
+        p2 = float(np.percentile(valid_values, 2)) if valid_values.size else 0.0
+        p5 = float(np.percentile(valid_values, 5)) if valid_values.size else 0.0
+        p50 = float(np.percentile(valid_values, 50)) if valid_values.size else 0.0
+        p95 = float(np.percentile(valid_values, 95)) if valid_values.size else 0.0
+        p98 = float(np.percentile(valid_values, 98)) if valid_values.size else 0.0
+        p99 = float(np.percentile(valid_values, 99)) if valid_values.size else 0.0
+        display_vmin = p2
+        display_vmax = p98 if p98 > p2 else (p2 + 1.0)
+        write_heightmap_preview_png(
+            normalized,
+            frame.valid_mask,
+            output_dir / "normalized_heightmap.png",
+            vmin=display_vmin,
+            vmax=display_vmax,
+            clipping_percentiles=(2.0, 98.0),
+        )
         write_heightmap_metadata_json(norm_frame, output_dir / "normalized_heightmap.metadata.json")
+        # Canonical numeric hover/debug sources (never infer values from colorized PNG).
+        normalized.astype(np.float32).tofile(output_dir / "height_above_belt.values.f32")
+        frame.z_mm.astype(np.float32).tofile(output_dir / "raw_sensor_z.values.f32")
+        # Backward-compatible aliases.
+        normalized.astype(np.float32).tofile(output_dir / "normalized_heightmap.values.f32")
+        frame.z_mm.astype(np.float32).tofile(output_dir / "raw_heightmap.values.f32")
+        frame.valid_mask.astype(np.uint8).tofile(output_dir / "valid_mask.u8")
+        valid_u8 = frame.valid_mask.astype(np.uint8)
+        invalid_holes = int(np.count_nonzero((valid_u8 == 0) & (normalized != 0.0)))
+        print(
+            "[25d-hover-debug] wrote normalized hover rasters "
+            f"take_dir={output_dir.name} "
+            f"shape={tuple(int(v) for v in normalized.shape)} "
+            f"normalized_count={int(normalized.size)} "
+            f"raw_count={int(frame.z_mm.size)} "
+            f"valid_mask_count={int(valid_u8.size)} "
+            f"valid_count={int(np.count_nonzero(frame.valid_mask))} "
+            f"invalid_count={int(frame.valid_mask.size - np.count_nonzero(frame.valid_mask))} "
+            f"invalid_nonzero_normalized_count={invalid_holes} "
+            f"normalized_minmax=({float(np.nanmin(normalized)):.6g},{float(np.nanmax(normalized)):.6g}) "
+            f"raw_minmax=({float(np.nanmin(frame.z_mm)):.6g},{float(np.nanmax(frame.z_mm)):.6g}) "
+            f"files=(height_above_belt.values.f32,raw_sensor_z.values.f32,valid_mask.u8)",
+            flush=True,
+        )
         bg_values = normalized[plane_mask & frame.valid_mask]
         fg_values = normalized[(~plane_mask) & frame.valid_mask]
-        valid_values = normalized[frame.valid_mask]
+        norm_min_mm = float(np.min(valid_values)) if valid_values.size else 0.0
+        norm_max_mm = float(np.max(valid_values)) if valid_values.size else 0.0
         hist_payload = {
             "bin_edges_mm": [],
             "bin_counts": [],
             "sample_count": int(valid_values.size),
-            "min_mm": float(np.min(valid_values)) if valid_values.size else 0.0,
-            "max_mm": float(np.max(valid_values)) if valid_values.size else 0.0,
+            "min_mm": norm_min_mm,
+            "max_mm": norm_max_mm,
             "mean_mm": float(np.mean(valid_values)) if valid_values.size else 0.0,
             "median_mm": float(np.median(valid_values)) if valid_values.size else 0.0,
             "normalization_convention": convention,
@@ -1004,8 +1503,104 @@ class NormalizeHeightsToPlaneStage:
             counts, edges = np.histogram(valid_values, bins=32)
             hist_payload["bin_counts"] = counts.astype(int).tolist()
             hist_payload["bin_edges_mm"] = [float(x) for x in edges.tolist()]
+        render_context_color_mapping = build_height_color_mapping_block(
+            semantic_field="height_above_belt",
+            units="mm",
+            value_min=norm_min_mm,
+            value_max=norm_max_mm,
+            color_scale_min=float(display_vmin),
+            color_scale_max=float(display_vmax),
+            color_map="turbo",
+            direction="higher_is_hotter",
+            source="render_context",
+        )
+        render_context = {
+            "render_vmin": float(display_vmin),
+            "render_vmax": float(display_vmax),
+            "value_min": float(norm_min_mm),
+            "value_max": float(norm_max_mm),
+            "semantic_field": "height_above_belt",
+            "units": "mm",
+            "clipping_mode": "percentile_clipped",
+            "clipping_percentiles": [2.0, 98.0],
+            "auto_range_mode": "percentile",
+            "semantic_range_mode": "height_above_belt",
+            "colormap_id": "turbo",
+            "direction": "higher_is_hotter",
+            "clamp": True,
+            "interpolation_mode": "nearest",
+            "roi_purpose": "plane_fit_only",
+            "render_coordinate_space": "full_frame",
+            "source_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "rendered_png_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "numeric_array_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "valid_mask_shape": [int(frame.valid_mask.shape[0]), int(frame.valid_mask.shape[1])],
+            "numeric_values_path": "height_above_belt.values.f32",
+            "raw_values_path": "raw_sensor_z.values.f32",
+            "valid_mask_path": "valid_mask.u8",
+            "source_artifact_id": "normalized_heightmap.npz:z_mm",
+            "color_mapping": render_context_color_mapping,
+        }
+        (output_dir / "normalized_heightmap.render_context.json").write_text(json.dumps(render_context, indent=2), encoding="utf-8")
+        display_meta = {
+            "numeric_source_artifact": "normalized_heightmap.npz",
+            "display_source_field": "height_above_belt",
+            "units": "mm",
+            "display_semantic": "height_above_belt",
+            "display_semantic_label": "Height above belt",
+            "raw_semantic": "raw_sensor_z",
+            "raw_units": "mm",
+            "shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "valid_count": int(np.count_nonzero(frame.valid_mask)),
+            "invalid_count": int(frame.valid_mask.size - np.count_nonzero(frame.valid_mask)),
+            "raw_min": norm_min_mm,
+            "raw_max": norm_max_mm,
+            "p1": p1,
+            "p2": p2,
+            "p5": p5,
+            "p50": p50,
+            "p95": p95,
+            "p98": p98,
+            "p99": p99,
+            "display_vmin": float(display_vmin),
+            "display_vmax": float(display_vmax),
+            "display_scaling": "percentile_clipped",
+            "display_percentiles": [2, 98],
+            "display_range": {"min": float(display_vmin), "max": float(display_vmax)},
+            "colormap": "turbo",
+            "interpolation_mode": "nearest",
+            "roi_purpose": "plane_fit_only",
+            "render_coordinate_space": "full_frame",
+            "source_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "rendered_png_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "numeric_array_shape": [int(normalized.shape[0]), int(normalized.shape[1])],
+            "valid_mask_shape": [int(frame.valid_mask.shape[0]), int(frame.valid_mask.shape[1])],
+            "invalid_color": "black",
+            "zero_reference_mm": 0.0,
+            "numeric_values_path": "height_above_belt.values.f32",
+            "raw_values_path": "raw_sensor_z.values.f32",
+            "valid_mask_path": "valid_mask.u8",
+            "semantic_source_id": "normalized_heightmap.npz:z_mm",
+            "render_context_path": "normalized_heightmap.render_context.json",
+            "render_context": render_context,
+            "color_mapping": build_height_color_mapping_block(
+                semantic_field="height_above_belt",
+                units="mm",
+                value_min=norm_min_mm,
+                value_max=norm_max_mm,
+                color_scale_min=float(display_vmin),
+                color_scale_max=float(display_vmax),
+                color_map="turbo",
+                direction="higher_is_hotter",
+                source="artifact_metadata",
+            ),
+        }
+        (output_dir / "normalized_heightmap_display.json").write_text(json.dumps(display_meta, indent=2), encoding="utf-8")
         (output_dir / "normalized_height_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
         norm_debug = {
+            "semantic_source_id": "normalized_heightmap.npz:z_mm",
+            "display_semantic": "height_above_plane_mm",
+            "raw_semantic": "raw_sensor_z_mm",
             "normalization_convention": convention,
             "normalization_formula": convention,
             "model_type": model_type,
@@ -1018,6 +1613,11 @@ class NormalizeHeightsToPlaneStage:
             "foreground_mean_height_mm": float(np.mean(fg_values)) if fg_values.size else 0.0,
             "below_reference_pixel_count": int(np.count_nonzero(below_reference_mask)),
             "above_threshold_pixel_count": int(np.count_nonzero(above_threshold_mask)),
+            "valid_ratio": float(np.count_nonzero(frame.valid_mask) / max(1, frame.valid_mask.size)),
+            "display_vmin": float(display_meta["display_vmin"]),
+            "display_vmax": float(display_meta["display_vmax"]),
+            "display_percentiles": display_meta["display_percentiles"],
+            "display_scaling": display_meta["display_scaling"],
         }
         norm_warnings: list[str] = []
         if norm_debug["background_height_p95_abs_after_normalization_mm"] > float(self.normalization_background_p95_warning_mm):
@@ -1032,6 +1632,28 @@ class NormalizeHeightsToPlaneStage:
         if inlier_ratio < float(self.normalization_min_inlier_ratio_warning):
             norm_warnings.append("plane_inlier_ratio_low")
         norm_debug["warnings"] = norm_warnings
+        plane_fit_status = str(context.get_artifact("plane_fit_status", "unknown"))
+        belt_plane_stats = context.get_artifact("belt_plane_stats", {}) or {}
+        normalization_quality = {
+            "status": "ok",
+            "reason": None,
+            "plane_fit_status": plane_fit_status,
+            "plane_fit_inlier_ratio": float((belt_plane_stats.get("inlier_ratio") or 0.0) if isinstance(belt_plane_stats, dict) else 0.0),
+            "plane_fit_residual_p95_mm": float((belt_plane_stats.get("p95_abs_mm") or 0.0) if isinstance(belt_plane_stats, dict) else 0.0),
+            "warning": None,
+        }
+        if model_type == "constant_z" and plane_fit_status != "success":
+            normalization_quality = {
+                "status": "degraded",
+                "reason": "plane_fit_failed_constant_z_fallback",
+                "plane_fit_status": plane_fit_status,
+                "plane_fit_inlier_ratio": float((belt_plane_stats.get("inlier_ratio") or 0.0) if isinstance(belt_plane_stats, dict) else 0.0),
+                "plane_fit_residual_p95_mm": float((belt_plane_stats.get("p95_abs_mm") or 0.0) if isinstance(belt_plane_stats, dict) else 0.0),
+                "warning": "Normalized height is fallback-based; belt may not be near 0 mm.",
+            }
+            norm_warnings.append("normalized_height_degraded_constant_z_fallback")
+            norm_debug["warnings"] = norm_warnings
+        norm_debug["normalization_quality"] = normalization_quality
         (output_dir / "normalization_debug.json").write_text(json.dumps(norm_debug, indent=2), encoding="utf-8")
 
         files = dict(context.get_artifact("files", {}))
@@ -1039,8 +1661,12 @@ class NormalizeHeightsToPlaneStage:
             {
                 "normalized_heightmap": "normalized_heightmap.npz",
                 "debug_height": "normalized_heightmap.png",
+                "height_above_belt_values": "height_above_belt.values.f32",
+                "raw_sensor_z_values": "raw_sensor_z.values.f32",
                 "normalized_height_histogram": "normalized_height_histogram.json",
                 "normalization_debug": "normalization_debug.json",
+                "normalized_heightmap_display": "normalized_heightmap_display.json",
+                "normalized_heightmap_render_context": "normalized_heightmap.render_context.json",
                 "below_reference_mask": "below_reference_mask.png",
                 "above_threshold_mask": "above_threshold_mask.png",
             }
@@ -1057,12 +1683,135 @@ class NormalizeHeightsToPlaneStage:
             preview_available=True,
             projection_type="heightmap",
             metadata={
+                **_display_only_meta(),
+                **_height_semantic_meta(
+                    semantic_field="height_above_belt",
+                    semantic_label="Height above belt",
+                    units="mm",
+                    value_min=norm_min_mm,
+                    value_max=norm_max_mm,
+                    color_scale_min=float(display_meta["display_vmin"]),
+                    color_scale_max=float(display_meta["display_vmax"]),
+                    color_map="turbo",
+                    positive_direction="higher_above_belt",
+                    is_measurement_authoritative=True,
+                    source_artifact_id="normalized_heightmap.npz:z_mm",
+                    stage_id="normalize_heights_to_plane",
+                ),
                 "source": "native_pipeline",
                 "producer": self.name,
                 "semantic": "height_above_belt_mm",
+                "display_semantic": "height_above_belt",
+                "raw_semantic": "raw_sensor_z",
                 "normalization_convention": convention,
                 "reference_surface_model_type": model_type,
+                "min_mm": norm_min_mm,
+                "max_mm": norm_max_mm,
+                "units": "mm",
+                "display_range": {
+                    "min": float(display_meta["display_vmin"]),
+                    "max": float(display_meta["display_vmax"]),
+                },
+                "semantic_source_id": "normalized_heightmap.npz:z_mm",
+                "display_metadata_path": "normalized_heightmap_display.json",
+                "render_context_path": "normalized_heightmap.render_context.json",
+                "render_vmin": float(render_context["render_vmin"]),
+                "render_vmax": float(render_context["render_vmax"]),
+                "render_colormap_id": str(render_context["colormap_id"]),
+                "render_interpolation_mode": str(render_context["interpolation_mode"]),
+                "normalization_quality": norm_debug.get("normalization_quality"),
+                **build_height_transform_metadata(
+                    semantic_field="height_above_belt",
+                    derived_from="plane_signed_distance",
+                    transform_type="invert_signed_distance",
+                    plane_id="plane_001",
+                    units="mm",
+                ),
             },
+        )
+        context.add_processing_artifact(
+            artifact_id="height_above_belt_raster",
+            stage_id="normalize_heights_to_plane",
+            kind="file",
+            title="Height above belt semantic raster",
+            path="height_above_belt.values.f32",
+            mime_type="application/octet-stream",
+            preview_available=False,
+            metadata=_semantic_raster_meta(
+                semantic_field="height_above_belt",
+                source_stage="normalize_heights_to_plane",
+                coordinate_space="belt_xy_pixels",
+                derived_from="plane_signed_distance",
+                transform_type="invert_signed_distance",
+                plane_id="plane_001",
+                extras={
+                    "color_mapping": build_height_color_mapping_block(
+                        semantic_field="height_above_belt",
+                        units="mm",
+                        value_min=norm_min_mm,
+                        value_max=norm_max_mm,
+                        color_scale_min=float(display_vmin),
+                        color_scale_max=float(display_vmax),
+                        color_map="turbo",
+                        direction="higher_is_hotter",
+                        source="artifact_metadata",
+                    ),
+                },
+            ),
+        )
+        context.add_processing_artifact(
+            artifact_id="normalized_heightmap_display",
+            stage_id="normalize_heights_to_plane",
+            kind="json",
+            title="Normalized height display transform",
+            path="normalized_heightmap_display.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    **_height_semantic_meta(
+                        semantic_field="preview_normalized",
+                        semantic_label="Preview normalized",
+                        units="mm",
+                        value_min=norm_min_mm,
+                        value_max=norm_max_mm,
+                        color_scale_min=float(display_meta["display_vmin"]),
+                        color_scale_max=float(display_meta["display_vmax"]),
+                        color_map="turbo",
+                        positive_direction="higher_value",
+                        is_measurement_authoritative=False,
+                        source_artifact_id="normalized_heightmap.npz:z_mm",
+                        stage_id="normalize_heights_to_plane",
+                    ),
+                    **build_height_transform_metadata(
+                        semantic_field="preview_normalized",
+                        derived_from="height_above_belt",
+                        transform_type="normalization",
+                        units="mm",
+                    ),
+                    **display_meta,
+                }
+            ),
+        )
+        context.add_processing_artifact(
+            artifact_id="normalized_heightmap_render_context",
+            stage_id="normalize_heights_to_plane",
+            kind="json",
+            title="Normalized height render context",
+            path="normalized_heightmap.render_context.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "render_context_for": "normalized_heightmap.png",
+                    **render_context,
+                    "display_metadata_path": "normalized_heightmap_display.json",
+                }
+            ),
         )
         context.add_processing_artifact(
             artifact_id="below_reference_mask",
@@ -1072,7 +1821,7 @@ class NormalizeHeightsToPlaneStage:
             path="below_reference_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name}),
         )
         context.add_processing_artifact(
             artifact_id="above_threshold_mask",
@@ -1082,7 +1831,7 @@ class NormalizeHeightsToPlaneStage:
             path="above_threshold_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, "object_min_height_mm": object_min_height_mm},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "object_min_height_mm": object_min_height_mm}),
         )
         context.add_processing_artifact(
             artifact_id="normalized_height_histogram",
@@ -1092,7 +1841,7 @@ class NormalizeHeightsToPlaneStage:
             path="normalized_height_histogram.json",
             mime_type="application/json",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, **hist_payload},
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **hist_payload}),
         )
         context.add_processing_artifact(
             artifact_id="normalization_debug",
@@ -1102,7 +1851,7 @@ class NormalizeHeightsToPlaneStage:
             path="normalization_debug.json",
             mime_type="application/json",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, **norm_debug},
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **norm_debug}),
         )
 
 
@@ -1117,7 +1866,6 @@ class RemoveBeltAndSegmentObjectsStage:
     min_component_area: int = 120
     fill_holes: bool = True
     smoothing_kernel: int = 3
-    roi: dict[str, Any] | None = None
     name: str = "RemoveBeltAndSegmentObjects"
     category: str = "segmentation"
     required_modalities: tuple[CaptureModality, ...] = ("heightmap",)
@@ -1126,6 +1874,7 @@ class RemoveBeltAndSegmentObjectsStage:
     stage_category: str | None = "segmentation"
 
     def run(self, context: PipelineContext) -> None:
+        _assert_not_preview_semantic(context, stage_name=self.name)
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
         normalized = np.asarray(context.require_artifact("normalized_heightmap_mm"), dtype=np.float32)
         output_dir: Path = context.require_artifact("output_dir")
@@ -1152,11 +1901,6 @@ class RemoveBeltAndSegmentObjectsStage:
             foreground = foreground & (~plane_mask)
         cv2.imwrite(str(output_dir / "plane_suppressed_mask.png"), (foreground.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "rejected_background_residuals.png"), (suppressed_plane_pixels.astype(np.uint8) * 255))
-
-        roi_cfg = self.roi or _roi_from_metadata(context.get_artifact("metadata", {}))
-        if roi_cfg is not None:
-            foreground &= _roi_mask(foreground.shape, roi_cfg)
-            context.set_artifact("roi_25d", roi_cfg)
 
         threshold_mask = (foreground.astype(np.uint8) * 255)
         cv2.imwrite(str(output_dir / "normalized_height_threshold_mask.png"), threshold_mask)
@@ -1289,7 +2033,7 @@ class RemoveBeltAndSegmentObjectsStage:
             path="above_threshold_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, "object_min_height_mm": self.min_height_mm},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "object_min_height_mm": self.min_height_mm, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="plane_suppressed_mask",
@@ -1299,7 +2043,7 @@ class RemoveBeltAndSegmentObjectsStage:
             path="plane_suppressed_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="final_object_mask",
@@ -1309,7 +2053,7 @@ class RemoveBeltAndSegmentObjectsStage:
             path="final_object_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
         context.add_processing_artifact(
             artifact_id="rejected_background_residuals",
@@ -1319,7 +2063,7 @@ class RemoveBeltAndSegmentObjectsStage:
             path="rejected_background_residuals.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
 
         context.add_processing_artifact(
@@ -1330,7 +2074,7 @@ class RemoveBeltAndSegmentObjectsStage:
             path="segmentation_debug.json",
             mime_type="application/json",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, **seg_debug},
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz", **seg_debug}),
         )
         context.add_processing_artifact(
             artifact_id="height_segmentation",
@@ -1341,8 +2085,10 @@ class RemoveBeltAndSegmentObjectsStage:
             mime_type="image/png",
             preview_available=True,
             metadata={
+                **_display_only_meta(),
                 "source": "native_pipeline",
                 "producer": self.name,
+                "numeric_source_artifact": "normalized_heightmap.npz",
                 "height_threshold_config": {
                     "min_height_mm": self.min_height_mm,
                     "max_height_mm": self.max_height_mm,
@@ -1365,7 +2111,7 @@ class RemoveBeltAndSegmentObjectsStage:
             coordinate_space="image_pixel",
             target_artifact_id="height_segmentation",
             source_artifact_ids=["height_segmentation", "cleaned_object_mask"],
-            metadata={"source": "native_pipeline", "producer": self.name, "semantic": "primary_human_view"},
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "semantic": "primary_human_view", "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
 
 
@@ -1379,6 +2125,7 @@ class ExtractConnectedComponentsStage:
     stage_category: str | None = "segmentation"
 
     def run(self, context: PipelineContext) -> None:
+        _assert_not_preview_semantic(context, stage_name=self.name)
         mask = np.asarray(context.require_artifact("segmentation_mask"), dtype=bool)
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
         components: list[dict[str, Any]] = []
@@ -1413,7 +2160,14 @@ class ExtractConnectedComponentsStage:
             kind="json",
             title="Connected components",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name, "component_count": len(components)},
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "component_count": len(components),
+                    "numeric_source_artifact": "normalized_heightmap.npz",
+                }
+            ),
         )
 
 
@@ -1427,6 +2181,7 @@ class FitObjectGeometryStage:
     stage_category: str | None = "geometry"
 
     def run(self, context: PipelineContext) -> None:
+        _assert_not_preview_semantic(context, stage_name=self.name)
         components: list[dict[str, Any]] = context.require_artifact("components")
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
         pixel_area = frame.pixel_area_mm2()
@@ -1470,6 +2225,15 @@ class ComputeHeightMetricsStage:
     stage_category: str | None = "measurement"
 
     def run(self, context: PipelineContext) -> None:
+        _assert_not_preview_semantic(context, stage_name=self.name)
+        # Canonical geometry invariant:
+        # measurements must be computed from height_above_belt (not raw_sensor_z or preview artifacts).
+        semantic_raster = resolve_height_artifact(
+            context,
+            semantic_field="height_above_belt",
+            representation="numeric_raster",
+        )
+        numeric_source_artifact_id = str((semantic_raster or {}).get("artifact_id") or "height_above_belt_raster")
         components: list[dict[str, Any]] = context.require_artifact("components")
         normalized = np.asarray(context.require_artifact("normalized_heightmap_mm"), dtype=np.float32)
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
@@ -1482,14 +2246,23 @@ class ComputeHeightMetricsStage:
                 continue
             pos_values = np.maximum(values, 0.0)
             gy, gx = np.gradient(np.where(mask, normalized, 0.0))
-            edge = cv2.Canny((mask.astype(np.uint8) * 255), 50, 100)
-            edge_heights = normalized[edge > 0]
+            inner_mask = cv2.erode(mask.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1).astype(bool)
+            if int(np.count_nonzero(inner_mask)) < max(25, int(0.15 * np.count_nonzero(mask))):
+                inner_mask = mask
+            smoothed_surface = cv2.GaussianBlur(np.where(mask, normalized, 0.0).astype(np.float32), (7, 7), 0)
+            surface_residuals = normalized[inner_mask] - smoothed_surface[inner_mask]
             asym = float(abs(np.mean(pos_values[::2]) - np.mean(pos_values[1::2]))) if pos_values.size > 4 else 0.0
             flatness = float(1.0 - np.std(pos_values) / max(np.mean(pos_values), 1e-6))
             curvature = float(np.mean(np.abs(gx[mask])) + np.mean(np.abs(gy[mask])))
-            roughness = float(np.std(edge_heights)) if edge_heights.size else 0.0
+            roughness = float(1.4826 * np.median(np.abs(surface_residuals - np.median(surface_residuals)))) if surface_residuals.size else 0.0
             volume_proxy = float(np.sum(pos_values) * pixel_area)
             centroid = _mask_centroid(mask)
+            max_height = float(np.max(values))
+            footprint_x = float(comp.get("major_axis_mm") or comp["bbox"][2] * frame.x_resolution_mm)
+            footprint_y = float(comp.get("minor_axis_mm") or comp["bbox"][3] * frame.y_resolution_mm)
+            sphere_radius_mm = float(max(footprint_x, footprint_y, max_height) / 2.0)
+            sphere_diameter_mm = float(sphere_radius_mm * 2.0)
+            truncation_ratio = float(max(0.0, 1.0 - (max_height / max(1e-6, sphere_diameter_mm))))
             object_row = {
                 "object_id": int(comp["object_id"]),
                 "class_name": "unknown",
@@ -1503,7 +2276,7 @@ class ComputeHeightMetricsStage:
                 "dimensions_mm": (
                     round(float(comp["bbox"][2] * frame.x_resolution_mm), 4),
                     round(float(comp["bbox"][3] * frame.y_resolution_mm), 4),
-                    round(float(np.max(values) - np.min(values)), 4),
+                    round(max_height, 4),
                 ),
                 "diameter_estimate_mm": round(float(max(comp["bbox"][2] * frame.x_resolution_mm, comp["bbox"][3] * frame.y_resolution_mm)), 4),
                 "bbox_min_mm": (
@@ -1522,21 +2295,24 @@ class ComputeHeightMetricsStage:
                 "sphericity_score": round(float(comp.get("roundness") or 0.0), 4),
                 "fit_rmse_mm": None,
                 "height_above_belt_mm": {
-                    "max_height_mm": round(float(np.max(values)), 4),
+                    "max_height_mm": round(max_height, 4),
                     "mean_height_mm": round(float(np.mean(values)), 4),
                     "median_height_mm": round(float(np.median(values)), 4),
                     "p95_height_mm": round(float(np.percentile(values, 95)), 4),
                     "height_std_mm": round(float(np.std(values)), 4),
                 },
+                "height_metrics_semantic_field": "height_above_belt",
                 "fraction_points_inside_belt": 1.0,
                 "filter_status": "kept",
                 "filter_reason": None,
                 "feature_volume_proxy_mm3": round(volume_proxy, 4),
                 "feature_flatness": round(flatness, 4),
                 "feature_eccentricity": round(float(comp.get("eccentricity") or 0.0), 4),
+                "feature_sphericity_3d": round(_axis_balance_3d(footprint_x, footprint_y, max_height), 4),
                 "feature_edge_roughness": round(roughness, 4),
                 "feature_local_curvature_proxy": round(curvature, 4),
                 "feature_height_asymmetry": round(asym, 4),
+                "feature_footprint_roundness": round(float(comp.get("roundness") or 0.0), 4),
                 "footprint_area_mm2": round(float(comp.get("footprint_area_mm2") or 0.0), 4),
                 "bbox_px": [
                     int(comp["bbox"][0]),
@@ -1550,6 +2326,24 @@ class ComputeHeightMetricsStage:
                     if comp.get("contour") is not None and len(comp.get("contour")) > 0
                     else None
                 ),
+                "measurement_provenance": {
+                    "raw_bbox_px": [int(comp["bbox"][0]), int(comp["bbox"][1]), int(comp["bbox"][2]), int(comp["bbox"][3])],
+                    "segmented_bbox_px": [int(comp["bbox"][0]), int(comp["bbox"][1]), int(comp["bbox"][2]), int(comp["bbox"][3])],
+                    "segmentation_coverage": float(np.count_nonzero(mask) / max(1, comp["bbox"][2] * comp["bbox"][3])),
+                    "removed_points": 0,
+                    "morphology_removals": 0,
+                    "contour_point_count": int(len(comp.get("contour"))) if comp.get("contour") is not None else 0,
+                    "height_point_count": int(values.size),
+                },
+                "sphere_fit_diagnostics": {
+                    "estimated_center_mm": [round((frame.origin_x_mm + centroid[0] * frame.x_resolution_mm), 4), round((frame.origin_y_mm + centroid[1] * frame.y_resolution_mm), 4), round(float(np.mean(values)), 4)],
+                    "estimated_radius_mm": round(sphere_radius_mm, 4),
+                    "estimated_diameter_mm": round(sphere_diameter_mm, 4),
+                    "fit_rmse_mm": None,
+                    "residual_percentiles_mm": {"p50": round(float(np.percentile(values, 50)), 4), "p95": round(float(np.percentile(values, 95)), 4)},
+                    "estimated_truncation_ratio": round(truncation_ratio, 4),
+                    "fit_confidence": round(float(max(0.0, min(1.0, 1.0 - truncation_ratio))), 4),
+                },
             }
             objects.append(object_row)
             oid = object_row["object_id"]
@@ -1559,7 +2353,15 @@ class ComputeHeightMetricsStage:
                 object_id=oid,
                 kind="json",
                 title=f"Object #{oid} measurements",
-                metadata={"source": "native_pipeline", "producer": self.name, "modality": "heightmap"},
+                metadata=_numeric_source_meta(
+                    {
+                        "source": "native_pipeline",
+                        "producer": self.name,
+                        "modality": "heightmap",
+                        "numeric_source_artifact": numeric_source_artifact_id,
+                        "semantic_field": "height_above_belt",
+                    }
+                ),
             )
         context.set_artifact("objects", objects)
 
@@ -1575,14 +2377,45 @@ class ValidateKnownObjectScale25DStage:
 
     def run(self, context: PipelineContext) -> None:
         metadata = context.get_artifact("metadata", {})
-        cfg = metadata.get("known_object_25d") if isinstance(metadata, dict) else None
-        if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
-            context.set_artifact("known_object_scale_validation", {"enabled": False, "status": "skipped"})
+        runtime_cfg = context.get_artifact("stage_params.known_object_25d", {})
+        cfg = runtime_cfg if isinstance(runtime_cfg, dict) and runtime_cfg else (metadata.get("known_object_25d") if isinstance(metadata, dict) else None)
+        if not isinstance(cfg, dict):
+            self._record_result(context, {"enabled": False, "status": "skipped"})
             return
 
         objects = context.get_artifact("objects", [])
         if not isinstance(objects, list) or not objects:
-            context.set_artifact("known_object_scale_validation", {"enabled": True, "status": "failed", "reason": "no_objects"})
+            self._record_result(context, {"enabled": bool(cfg.get("enabled", False)), "status": "failed", "reason": "no_objects"})
+            return
+
+        saved_scale_x = cfg.get("persisted_scale_correction_x")
+        saved_scale_y = cfg.get("persisted_scale_correction_y")
+        saved_scale_z = cfg.get("persisted_scale_correction_z")
+        has_saved_scale = saved_scale_x is not None and saved_scale_y is not None and saved_scale_z is not None
+        apply_saved_correction = bool(cfg.get("apply_persisted_correction", has_saved_scale))
+        calibration_enabled = bool(cfg.get("enabled", False))
+        if has_saved_scale and apply_saved_correction and not calibration_enabled:
+            _apply_known_object_scale_correction(
+                objects,
+                scale_x=float(saved_scale_x),
+                scale_y=float(saved_scale_y),
+                scale_z=float(saved_scale_z),
+            )
+            context.set_artifact("objects", objects)
+
+        if not calibration_enabled:
+            self._record_result(
+                context,
+                {
+                    "enabled": False,
+                    "status": "saved_correction_applied" if has_saved_scale and apply_saved_correction else "skipped",
+                    "applied_correction": has_saved_scale and apply_saved_correction,
+                    "applied_persisted_correction": has_saved_scale and apply_saved_correction,
+                    "persisted_scale_correction_x": float(saved_scale_x) if saved_scale_x is not None else None,
+                    "persisted_scale_correction_y": float(saved_scale_y) if saved_scale_y is not None else None,
+                    "persisted_scale_correction_z": float(saved_scale_z) if saved_scale_z is not None else None,
+                },
+            )
             return
 
         selection_mode = str(cfg.get("target_selection") or "largest_component")
@@ -1600,8 +2433,9 @@ class ValidateKnownObjectScale25DStage:
         known_d = float(cfg.get("known_depth_mm") or 0.0)
         known_h = float(cfg.get("known_height_mm") or 0.0)
         tol_pct = float(cfg.get("tolerance_percent") or 5.0)
-        measured_w = float(target.get("major_axis_mm") or target.get("dimensions_mm", [0, 0, 0])[0] or 0.0)
-        measured_d = float(target.get("minor_axis_mm") or target.get("dimensions_mm", [0, 0, 0])[1] or 0.0)
+        dims = target.get("dimensions_mm") if isinstance(target.get("dimensions_mm"), (list, tuple)) else [0, 0, 0]
+        measured_w = float(dims[0] or target.get("major_axis_mm") or 0.0)
+        measured_d = float(dims[1] or target.get("minor_axis_mm") or 0.0)
         measured_h = float((target.get("height_above_belt_mm") or {}).get("max_height_mm") or 0.0)
 
         def _err(measured: float, known: float) -> float:
@@ -1610,6 +2444,19 @@ class ValidateKnownObjectScale25DStage:
         err_x = _err(measured_w, known_w)
         err_y = _err(measured_d, known_d)
         err_z = _err(measured_h, known_h)
+        scale_x = (known_w / measured_w) if measured_w > 1e-9 else 1.0
+        scale_y = (known_d / measured_d) if measured_d > 1e-9 else 1.0
+        scale_z = (known_h / measured_h) if measured_h > 1e-9 else 1.0
+        apply_correction = bool(cfg.get("apply_correction", True))
+        if apply_correction:
+            _apply_known_object_scale_correction(objects, scale_x=scale_x, scale_y=scale_y, scale_z=scale_z)
+            context.set_artifact("objects", objects)
+            corrected_target = next((item for item in objects if int(item.get("object_id") or -1) == int(target.get("object_id") or -2)), target)
+            corrected_dims = corrected_target.get("dimensions_mm") if isinstance(corrected_target.get("dimensions_mm"), (list, tuple)) else [None, None, None]
+            corrected_height = (corrected_target.get("height_above_belt_mm") or {}).get("max_height_mm") if isinstance(corrected_target.get("height_above_belt_mm"), dict) else None
+        else:
+            corrected_dims = [None, None, None]
+            corrected_height = None
         result = {
             "enabled": True,
             "status": "ok",
@@ -1621,17 +2468,28 @@ class ValidateKnownObjectScale25DStage:
             "measured_width_mm": measured_w,
             "measured_depth_mm": measured_d,
             "measured_height_mm": measured_h,
+            "corrected_width_mm": float(corrected_dims[0]) if corrected_dims[0] is not None else None,
+            "corrected_depth_mm": float(corrected_dims[1]) if corrected_dims[1] is not None else None,
+            "corrected_height_mm": float(corrected_height) if corrected_height is not None else None,
             "scale_error_x_percent": err_x,
             "scale_error_y_percent": err_y,
             "scale_error_z_percent": err_z,
             "pass_x": abs(err_x) <= tol_pct,
             "pass_y": abs(err_y) <= tol_pct,
             "pass_z": abs(err_z) <= tol_pct,
-            "recommended_scale_correction_x": (known_w / measured_w) if measured_w > 1e-9 else 1.0,
-            "recommended_scale_correction_y": (known_d / measured_d) if measured_d > 1e-9 else 1.0,
-            "recommended_scale_correction_z": (known_h / measured_h) if measured_h > 1e-9 else 1.0,
+            "recommended_scale_correction_x": scale_x,
+            "recommended_scale_correction_y": scale_y,
+            "recommended_scale_correction_z": scale_z,
+            "applied_correction": apply_correction,
+            "applied_persisted_correction": False,
+            "persisted_scale_correction_x": float(saved_scale_x) if saved_scale_x is not None else None,
+            "persisted_scale_correction_y": float(saved_scale_y) if saved_scale_y is not None else None,
+            "persisted_scale_correction_z": float(saved_scale_z) if saved_scale_z is not None else None,
             "tolerance_percent": tol_pct,
         }
+        self._record_result(context, result)
+
+    def _record_result(self, context: PipelineContext, result: dict[str, Any]) -> None:
         output_dir: Path = context.require_artifact("output_dir")
         (output_dir / "known_object_scale_validation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         context.set_artifact("known_object_scale_validation", result)
@@ -1646,8 +2504,63 @@ class ValidateKnownObjectScale25DStage:
             path="known_object_scale_validation.json",
             mime_type="application/json",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **result}),
         )
+
+
+def _apply_known_object_scale_correction(objects: list[dict[str, Any]], *, scale_x: float, scale_y: float, scale_z: float) -> None:
+    def _scale_tuple(value: Any, scales: tuple[float, ...]) -> tuple[float, ...] | Any:
+        if not isinstance(value, (list, tuple)):
+            return value
+        out: list[float] = []
+        for idx, item in enumerate(value):
+            factor = scales[min(idx, len(scales) - 1)]
+            out.append(round(float(item) * factor, 4))
+        return tuple(out)
+
+    def _scale_number(row: dict[str, Any], key: str, factor: float) -> None:
+        if row.get(key) is not None:
+            row[key] = round(float(row[key]) * factor, 4)
+
+    for row in objects:
+        # NOTE: Keep positional fields (center_mm, bbox_*_mm) in heightmap coordinates so that
+        # overlay rendering (which converts mm -> pixel using the original x/y resolution) still
+        # draws markers on the actual object. Only physical size fields get scaled.
+        row["dimensions_mm"] = _scale_tuple(row.get("dimensions_mm"), (scale_x, scale_y, scale_z))
+        _scale_number(row, "major_axis_mm", scale_x)
+        _scale_number(row, "minor_axis_mm", scale_y)
+        if row.get("major_axis_mm") is not None and row.get("minor_axis_mm") is not None:
+            major = max(float(row["major_axis_mm"]), float(row["minor_axis_mm"]))
+            minor = min(float(row["major_axis_mm"]), float(row["minor_axis_mm"]))
+            row["major_axis_mm"] = round(major, 4)
+            row["minor_axis_mm"] = round(minor, 4)
+            row["feature_eccentricity"] = round(float(np.sqrt(max(0.0, 1.0 - (minor * minor) / max(major * major, 1e-9)))), 4)
+            row["sphericity_score"] = round(float(minor / max(major, 1e-9)), 4)
+        dims = row.get("dimensions_mm")
+        if isinstance(dims, (list, tuple)) and len(dims) >= 2:
+            row["diameter_estimate_mm"] = round(float(max(float(dims[0]), float(dims[1]))), 4)
+        if row.get("major_axis_mm") is not None or row.get("minor_axis_mm") is not None:
+            row["diameter_mm"] = round(max(float(row.get("major_axis_mm") or 0.0), float(row.get("minor_axis_mm") or 0.0)), 4)
+        heights = row.get("height_above_belt_mm")
+        if isinstance(heights, dict):
+            for key in ("max_height_mm", "mean_height_mm", "median_height_mm", "p95_height_mm", "height_std_mm"):
+                if heights.get(key) is not None:
+                    heights[key] = round(float(heights[key]) * scale_z, 4)
+        if row.get("major_axis_mm") is not None and row.get("minor_axis_mm") is not None and isinstance(heights, dict):
+            max_h = float(heights.get("max_height_mm") or 0.0)
+            row["feature_sphericity_3d"] = round(_axis_balance_3d(float(row["major_axis_mm"]), float(row["minor_axis_mm"]), max_h), 4)
+        _scale_number(row, "feature_volume_proxy_mm3", scale_x * scale_y * scale_z)
+        _scale_number(row, "feature_edge_roughness", scale_z)
+        _scale_number(row, "footprint_area_mm2", scale_x * scale_y)
+        row["scale_correction_applied"] = {"x": scale_x, "y": scale_y, "z": scale_z}
+
+
+def _axis_balance_3d(x_mm: float, y_mm: float, z_mm: float) -> float:
+    axes = [abs(float(x_mm)), abs(float(y_mm)), abs(float(z_mm))]
+    largest = max(axes)
+    if largest <= 1e-9:
+        return 0.0
+    return min(axes) / largest
 
 
 @dataclass
@@ -1660,15 +2573,63 @@ class ClassifyMiningBall25DStage:
     stage_category: str | None = "classification"
 
     def run(self, context: PipelineContext) -> None:
+        _assert_not_preview_semantic(context, stage_name=self.name)
+        # Canonical geometry invariant:
+        # classification consumes height_above_belt semantics only.
+        semantic_raster = resolve_height_artifact(
+            context,
+            semantic_field="height_above_belt",
+            representation="numeric_raster",
+        )
+        numeric_source_artifact_id = str((semantic_raster or {}).get("artifact_id") or "height_above_belt_raster")
+        if str(context.get_artifact("height_processing_semantic_field", "")) != "height_above_belt":
+            raise ValueError("classification cannot use raw_sensor_z unless explicitly debug")
         objects = context.get_artifact("objects", [])
         ball_count = 0
         non_ball = 0
         for item in objects:
-            label, class_name, confidence = _classify_25d(item)
+            label, display_label, class_name, confidence = _classify_25d(item)
+            superclass = map_label_to_superclass(label)
+            label, display_label, class_name, confidence, superclass = apply_sphericity_3d_fallback_to_object(
+                item,
+                label=label,
+                display_label=display_label,
+                class_name=class_name,
+                confidence=confidence,
+                superclass=superclass,
+            )
             item["class_name"] = class_name
             item["confidence"] = confidence
             item["label"] = label
-            item["class_group"] = _class_group(label)
+            item["superclass"] = superclass
+            item["display_label"] = display_label
+            item["class_group"] = _class_group(superclass)
+            item["classification"] = {
+                "label": label,
+                "display_label": display_label,
+                "superclass": superclass,
+                "confidence": confidence,
+            }
+            reasons: list[str] = []
+            if float(item.get("sphericity_score") or 0.0) < 0.75:
+                reasons.append("low_sphericity")
+            trunc = float(((item.get("sphere_fit_diagnostics") or {}).get("estimated_truncation_ratio") or 0.0) if isinstance(item.get("sphere_fit_diagnostics"), dict) else 0.0)
+            if trunc > 0.2:
+                reasons.append("missing_lower_hemisphere")
+            if float(item.get("feature_eccentricity") or 0.0) > 0.6:
+                reasons.append("excessive_eccentricity")
+            if float(((item.get("height_above_belt_mm") or {}).get("height_std_mm") or 0.0) if isinstance(item.get("height_above_belt_mm"), dict) else 0.0) < 0.5:
+                reasons.append("truncated_height_distribution")
+            item["classification_explanation"] = {
+                "contributing_metrics": {
+                    "sphericity_score": item.get("sphericity_score"),
+                    "feature_eccentricity": item.get("feature_eccentricity"),
+                    "feature_sphericity_3d": item.get("feature_sphericity_3d"),
+                    "height_max_mm": ((item.get("height_above_belt_mm") or {}).get("max_height_mm") if isinstance(item.get("height_above_belt_mm"), dict) else None),
+                    "truncation_ratio": trunc,
+                },
+                "rejected_ball_reasons": reasons,
+            }
             if class_name == "ball":
                 ball_count += 1
             elif class_name == "non_ball":
@@ -1680,10 +2641,20 @@ class ClassifyMiningBall25DStage:
                 object_id=oid,
                 kind="json",
                 title=f"Object #{oid} classification",
-                metadata={"source": "native_pipeline", "producer": self.name, "label": label},
+                metadata=_numeric_source_meta(
+                    {
+                        "source": "native_pipeline",
+                        "producer": self.name,
+                        "label": label,
+                        "superclass": superclass,
+                        "numeric_source_artifact": numeric_source_artifact_id,
+                        "semantic_field": "height_above_belt",
+                    }
+                ),
             )
         object_count = len(objects)
         decision = "accept" if object_count > 0 and non_ball == 0 else "review"
+        canonical = select_dominant_classification({"objects": objects})
         context.set_artifact(
             "summary",
             {
@@ -1691,8 +2662,44 @@ class ClassifyMiningBall25DStage:
                 "ball_count": ball_count,
                 "non_ball_count": non_ball,
                 "decision": decision,
-                "confidence": round(ball_count / max(1, object_count), 3) if object_count else None,
+                "confidence": canonical.get("confidence"),
+                "label": canonical.get("label"),
+                "superclass": canonical.get("superclass"),
             },
+        )
+        context.set_artifact(
+            "classification_result_25d",
+            {
+                "label": canonical.get("label"),
+                "superclass": canonical.get("superclass"),
+                "confidence": canonical.get("confidence"),
+                "object_count": object_count,
+                "objects": [
+                    {
+                        "object_id": item.get("object_id"),
+                        "label": item.get("label"),
+                        "display_label": item.get("display_label"),
+                        "superclass": item.get("superclass"),
+                        "confidence": item.get("confidence"),
+                    }
+                    for item in objects
+                ],
+            },
+        )
+        context.add_processing_artifact(
+            artifact_id="classification_result_25d",
+            stage_id="classification",
+            kind="json",
+            title="25D classification result",
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "superclass": canonical.get("superclass"),
+                    "numeric_source_artifact": numeric_source_artifact_id,
+                    "semantic_field": "height_above_belt",
+                }
+            ),
         )
         context.set_artifact("algorithm_stage", "classification")
         context.set_artifact("objects", objects)
@@ -1739,7 +2746,38 @@ class Generate25DOverlaysStage:
                 cv2.rectangle(meas, (x0, y0), (x1, y1), (255, 255, 255), 1)
 
         cv2.imwrite(str(output_dir / "measurement_overlay.png"), meas)
-        cv2.imwrite(str(output_dir / "classification_overlay.png"), meas)
+
+        classification = meas.copy()
+        for item in objects:
+            center = item.get("center_mm")
+            if not isinstance(center, (list, tuple)) or len(center) < 2:
+                continue
+            cx = int(round((float(center[0]) - frame.origin_x_mm) / frame.x_resolution_mm))
+            cy = int(round((float(center[1]) - frame.origin_y_mm) / frame.y_resolution_mm))
+            metrics = item.get("height_above_belt_mm") or {}
+            max_h = metrics.get("max_height_mm") if isinstance(metrics, dict) else None
+            lines = [
+                f"max_h={float(max_h):.1f}mm" if max_h is not None else "max_h=-",
+                f"ecc={float(item.get('feature_eccentricity') or 0.0):.3f}",
+                f"sph3d={float(item.get('feature_sphericity_3d') or 0.0):.3f}",
+                f"flat={float(item.get('feature_flatness') or 0.0):.3f}",
+                f"rough={float(item.get('feature_edge_roughness') or 0.0):.1f}",
+            ]
+            x = min(max(cx + 8, 4), max(4, classification.shape[1] - 150))
+            y = min(max(cy + 26, 14), max(14, classification.shape[0] - 72))
+            for idx, line in enumerate(lines):
+                cv2.putText(
+                    classification,
+                    line,
+                    (x, y + idx * 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (245, 245, 245),
+                    1,
+                    cv2.LINE_AA,
+                )
+        cv2.imwrite(str(output_dir / "classification_overlay.png"), classification)
+        classification_result = context.get_artifact("classification_result_25d", {})
 
         files = dict(context.get_artifact("files", {}))
         files.update(
@@ -1766,13 +2804,29 @@ class Generate25DOverlaysStage:
                 path=path,
                 mime_type="image/png",
                 preview_available=True,
-                metadata={"source": "native_pipeline", "producer": self.name, "modality": "heightmap"},
+                metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "modality": "heightmap", "numeric_source_artifact": "normalized_heightmap.npz"}),
             )
+        context.add_processing_artifact(
+            artifact_id="classification_overlay_metadata",
+            stage_id="classification",
+            kind="json",
+            title="Classification overlay metadata",
+            metadata={
+                "source": "native_pipeline",
+                "producer": self.name,
+                "classification": classification_result if isinstance(classification_result, dict) else {},
+            },
+        )
 
 
 def _load_heightmap_frame(height_path: Path, reflectance_path: Path | None, metadata: dict[str, Any]) -> HeightmapFrame:
     if not height_path.is_file():
         raise FileNotFoundError(f"Heightmap file not found: {height_path}")
+    if height_path.suffix.lower() in _PREVIEW_IMAGE_SUFFIXES:
+        raise ValueError(
+            f"Preview image cannot be used as numeric height source: {height_path.name}. "
+            "Use canonical numeric height artifacts (height16.tif or heightmap_frame.npz)."
+        )
     if height_path.suffix.lower() == ".npz":
         frame = load_heightmap_npz(height_path)
     else:
@@ -2213,7 +3267,7 @@ def _roi_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
 def _roi_mask(shape: tuple[int, int], roi: dict[str, Any]) -> np.ndarray:
     h, w = shape
     mask = np.zeros((h, w), dtype=bool)
-    roi_type = str(roi.get("type") or "rectangle").lower()
+    roi_type = str(roi.get("type") or roi.get("roi_type") or "rectangle").lower()
     if roi_type == "polygon":
         points = roi.get("points")
         if isinstance(points, list) and len(points) >= 3:
@@ -2226,9 +3280,13 @@ def _roi_mask(shape: tuple[int, int], roi: dict[str, Any]) -> np.ndarray:
                 cv2.fillPoly(tmp, [np.asarray(poly, dtype=np.int32)], 255)
                 return tmp > 0
     x = max(0, int(roi.get("x") or 0))
-    y = max(0, int(roi.get("y") or 0))
     rw = max(1, int(roi.get("width") or w))
-    rh = max(1, int(roi.get("height") or h))
+    if roi_type == "vertical_band":
+        y = 0
+        rh = h
+    else:
+        y = max(0, int(roi.get("y") or 0))
+        rh = max(1, int(roi.get("height") or h))
     x2 = min(w, x + rw)
     y2 = min(h, y + rh)
     mask[y:y2, x:x2] = True
@@ -2245,27 +3303,28 @@ def _encoder_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _classify_25d(item: dict[str, Any]) -> tuple[str, str, float]:
+def _classify_25d(item: dict[str, Any]) -> tuple[str, str, str, float]:
     metrics = item.get("height_above_belt_mm") or {}
     max_h = float(metrics.get("max_height_mm") or 0.0)
     p95_h = float(metrics.get("p95_height_mm") or 0.0)
     ecc = float(item.get("feature_eccentricity") or 0.0)
+    sph3d = float(item.get("feature_sphericity_3d") or 0.0)
     flat = float(item.get("feature_flatness") or 0.0)
     rough = float(item.get("feature_edge_roughness") or 0.0)
     vol = float(item.get("feature_volume_proxy_mm3") or 0.0)
-    if 8.0 <= max_h <= 95.0 and ecc < 0.45 and flat > 0.15 and rough < 8.0:
-        return "Bola buena", "ball", 0.82
+    if 8.0 <= max_h <= 95.0 and sph3d >= 0.8 and ecc < 0.45 and flat > 0.15 and rough < 8.0:
+        return "bola_buena", "Bola buena", "ball", 0.82
     if ecc >= 0.75 or flat < -0.2 or rough > 12.0:
-        return "Scrap de Bola - Bola deformada", "non_ball", 0.78
+        return "bola_deformada", "Scrap de Bola - Bola deformada", "non_ball", 0.78
     if max_h < 6.0 or p95_h < 4.0 or vol < 4000.0:
-        return "Chatarra - Planchuelas", "non_ball", 0.72
-    return "Scrap de Bola - Bola con chip", "non_ball", 0.66
+        return "planchuela", "Chatarra - Planchuelas", "non_ball", 0.72
+    return "bola_con_chip", "Scrap de Bola - Bola con chip", "non_ball", 0.66
 
 
-def _class_group(label: str) -> str:
-    if label.startswith("Bola buena"):
+def _class_group(superclass: str) -> str:
+    if superclass == "BALL_GOOD":
         return "Bola buena"
-    if label.startswith("Scrap de Bola"):
+    if superclass == "BALL_SCRAP":
         return "Scrap de Bola"
     return "Chatarra"
 

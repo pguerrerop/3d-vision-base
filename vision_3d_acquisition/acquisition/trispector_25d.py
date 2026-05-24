@@ -38,12 +38,40 @@ def parse_trispector_2_5d_image(input_file: Path, output_dir: Path) -> dict[str,
     Image.fromarray(reflectance).save(reflectance_path)
     Image.fromarray(height16.astype(np.uint16)).save(heightmap_path)
     _write_heightmap_preview(height16, preview_path)
+    valid_mask = np.isfinite(height16) & (height16 > 0)
+    valid_vals = height16[valid_mask]
+    raw_min = float(np.min(valid_vals)) if valid_vals.size else 0.0
+    raw_max = float(np.max(valid_vals)) if valid_vals.size else 0.0
+    p01 = float(np.percentile(valid_vals, 1)) if valid_vals.size else 0.0
+    p99 = float(np.percentile(valid_vals, 99)) if valid_vals.size else 0.0
+    unique_count = int(np.unique(valid_vals).size) if valid_vals.size else 0
+    effective_range = max(0.0, raw_max - raw_min)
+    effective_bits = float(np.log2(max(1.0, effective_range + 1.0)))
+    encoding_warning: str | None = None
+    if effective_bits <= 13.0:
+        encoding_warning = "effective_range_low_for_uint16_possible_packed_12_14bit"
     parser_metadata = {
         "parser": "trispector_2_5d_image_v1",
         "input_shape": [int(h_full), int(w)],
         "output_shape": [int(h), int(w)],
         "has_reflectance": True,
         "height_encoding": "little_endian_uint16_pairs",
+        "reconstruction_mode": "little_endian_uint16_default",
+        "effective_bit_depth_stats": {
+            "effective_bits_estimate": effective_bits,
+            "raw_min": raw_min,
+            "raw_max": raw_max,
+            "p01": p01,
+            "p99": p99,
+            "unique_value_count": unique_count,
+            "warnings": [encoding_warning] if encoding_warning else [],
+        },
+        "height_preview_range_raw": {
+            "min": raw_min,
+            "max": raw_max,
+            "valid_count": int(valid_vals.size),
+            "units": "sensor_raw",
+        },
     }
     parser_metadata_path.write_text(json.dumps(parser_metadata, indent=2), encoding="utf-8")
     return {
@@ -82,6 +110,11 @@ class TriSpectorFtpAcquisitionAdapter:
                     "source_id": self.source_id,
                     "acquisition_process_id": "trispector_ftp_acquisition",
                     "uploaded_filename": upload_path.name,
+                    "height_preview_range_raw": (
+                        (parsed.get("diagnostics") or {}).get("height_preview_range_raw")
+                        if isinstance(parsed.get("diagnostics"), dict)
+                        else None
+                    ),
                 },
                 mode="live",
                 created_at=created_at,

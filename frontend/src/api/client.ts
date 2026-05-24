@@ -405,7 +405,7 @@ export interface ProcessingResult {
     created_at?: string | null;
     metadata?: Record<string, unknown>;
     generated?: "explicit" | "derived";
-    overlay_type?: "bbox" | "mask" | "ellipse" | "sphere_fit" | "centroid" | "polyline" | "text" | null;
+    overlay_type?: "bbox" | "mask" | "ellipse" | "footprint_roundness" | "centroid" | "polyline" | "text" | null;
     coordinate_space?: "image_pixel" | "normalized_image" | "projection_pixel" | "world_mm" | "plot_pixel" | "point_cloud_projection" | null;
     target_artifact_id?: string | null;
     geometry?: Record<string, unknown>;
@@ -763,7 +763,7 @@ export interface InspectionPublishedResult {
 export interface OperationsCard {
   take_id: string;
   status: "acquired" | "queued" | "processing" | "completed" | "failed" | string;
-  superclass: "BALL_GOOD" | "BALL_SCRAP" | "SCRAP" | "UNKNOWN" | string;
+  superclass: "BALL_GOOD" | "BALL_SCRAP" | "SCRAP_METAL" | "UNKNOWN" | string;
   label: string;
   confidence?: number | null;
   object_count?: number;
@@ -775,6 +775,16 @@ export interface OperationsCard {
   source?: string | null;
   error?: string | null;
   pipeline_id?: string | null;
+  classification_variables?: {
+    max_height_mm?: number | null;
+    p95_height_mm?: number | null;
+    eccentricity?: number | null;
+    sphericity_3d?: number | null;
+    flatness?: number | null;
+    edge_roughness?: number | null;
+    footprint_roundness?: number | null;
+    volume_proxy_mm3?: number | null;
+  } | null;
 }
 
 export interface ProcessBinding {
@@ -1151,6 +1161,10 @@ export const api = {
     ),
   processTake: (takeId: string, payload: { pipeline_id: string; run_until_stage?: string | null; reprocess?: boolean; stage_params?: Record<string, unknown> | null }) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/process`, payload),
+  pipelineDefaults25d: () => request<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d"),
+  savePipelineDefaults25d: (defaults: Record<string, unknown>) =>
+    put<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d", defaults),
+  clearPipelineDefaults25d: () => del<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d"),
   previewSegmentation: (payload: { take_id: string; pipeline_id: string; stage_id?: string; params: Record<string, unknown> }) =>
     post<SegmentationPreviewResponse>("/api/pipelines/preview-segmentation", payload),
   clearTakeOutputs: (takeId: string) => del<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/outputs`),

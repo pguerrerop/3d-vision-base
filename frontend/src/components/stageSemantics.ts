@@ -144,6 +144,8 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
         { id: "raw_heightmap", label: "Raw heightmap", rendererType: "image", priority: 1, emptyState: { title: "No raw heightmap preview available yet." } },
         { id: "reference_surface", label: "Reference surface model", rendererType: "json", priority: 2, emptyState: { title: "No reference-surface model available yet." } },
         { id: "normalized_height", label: "Normalized height", rendererType: "image", priority: 1, emptyState: { title: "No normalized height preview available yet." } },
+        { id: "residuals", label: "Residuals", rendererType: "image", priority: 3, emptyState: { title: "No residual visualization available yet." } },
+        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 4, emptyState: { title: "No normalization diagnostics available yet." } },
         { id: "below_reference", label: "Below/equal reference", rendererType: "image", priority: 4, emptyState: { title: "No below-reference mask available yet." } },
         { id: "above_threshold", label: "Above threshold", rendererType: "image", priority: 5, emptyState: { title: "No above-threshold mask available yet." } },
         { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 6, emptyState: { title: "No normalized-height histogram available yet." } },
@@ -165,6 +167,8 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
         { id: "selected_surface", label: "Selected surface", rendererType: "image", priority: 6, emptyState: { title: "No selected surface mask available yet." } },
         { id: "plane_inliers", label: "Plane inliers", rendererType: "image", priority: 7, emptyState: { title: "No plane inlier mask available yet." } },
         { id: "residual_heatmap", label: "Residual heatmap", rendererType: "image", priority: 8, emptyState: { title: "No residual heatmap available yet." } },
+        { id: "residual_histogram", label: "Residual histogram", rendererType: "table", priority: 9, emptyState: { title: "No residual histogram available yet." } },
+        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 10, emptyState: { title: "No plane diagnostics available yet." } },
         { id: "depth_plot", label: "Depth plot", rendererType: "image", priority: 9, emptyState: { title: "No depth plot available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
@@ -191,6 +195,9 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       defaultViewId: "measurements_25d",
       views: [
         { id: "measurements_25d", label: "Measurements", rendererType: "table", priority: 1, emptyState: { title: "No 25D measurements available yet." } },
+        { id: "residuals", label: "Residuals", rendererType: "image", priority: 2, emptyState: { title: "No geometry residual view available yet." } },
+        { id: "profiles", label: "Profiles", rendererType: "image", priority: 3, emptyState: { title: "Select image artifact to inspect object profiles." } },
+        { id: "provenance", label: "Provenance", rendererType: "table", priority: 4, emptyState: { title: "No object provenance available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };
@@ -202,6 +209,7 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       defaultViewId: "classification_25d",
       views: [
         { id: "classification_25d", label: "Classification", rendererType: "table", priority: 1, emptyState: { title: "No 25D classifications available yet." } },
+        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 2, emptyState: { title: "No classification diagnostics available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };

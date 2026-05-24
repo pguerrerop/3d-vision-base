@@ -133,8 +133,8 @@ def test_calibration_save_load_round_trip(tmp_path: Path) -> None:
 
     assert path.name == "belt_setup_test.json"
     assert loaded.calibration_id == original.calibration_id
-    assert loaded.belt_plane().plane_id == "plane_1"
-    assert loaded.belt_plane().roi_polygon_xy_mm[0] == (-4.0, -4.0)
+    assert loaded.belt_plane_3d().plane_id == "plane_1"
+    assert loaded.belt_plane_3d().roi_polygon_xy_mm[0] == (-4.0, -4.0)
 
 
 def test_only_one_belt_allowed() -> None:

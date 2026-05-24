@@ -6,6 +6,9 @@ import { canonicalStageId, stageSemanticDefinition } from "./stageSemantics";
 import { primarySourceImageUrl } from "./stage_sources";
 import { normalizeBlobDetectionArtifacts } from "../studio/blobDetectionModel";
 import { artifactLineage, objectGeneratingStages, selectedObject, stageInspectorSummary, type StudioArtifact, type StudioObject } from "./studioWorkspaceModel";
+import type { HoverInspectionSample } from "./hoverInspectionModel";
+import HeightLegend from "./HeightLegend";
+import { resolveHeightColorMapping, toHeightLegendSemantic } from "./heightSemantics";
 
 type Props = {
   detail: TakeDetail | null;
@@ -15,10 +18,11 @@ type Props = {
   selectedObjectId: number | null;
   selectedArtifact: StudioArtifact | null;
   overlayDebug: OverlayDebugInfo | null;
+  hoverSample?: HoverInspectionSample | null;
   onUpsertObjectAnnotation?: (payload: Record<string, unknown>) => void;
 };
 
-export default function StudioInspector({ detail, pipeline, stageId, compatible, selectedObjectId, selectedArtifact, overlayDebug, onUpsertObjectAnnotation }: Props) {
+export default function StudioInspector({ detail, pipeline, stageId, compatible, selectedObjectId, selectedArtifact, overlayDebug, hoverSample = null, onUpsertObjectAnnotation }: Props) {
   const objects = [...(detail?.result?.objects ?? []), ...(detail?.result?.rejected_objects ?? [])];
   const objectCandidates = detail?.result?.object_candidates ?? [];
   const artifacts = detail?.result?.artifacts ?? [];
@@ -84,6 +88,24 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
   const selectedCandidate = selectedObjectId == null
     ? null
     : objectCandidates.find((item) => Number(item.local_object_index) === selectedObjectId) ?? null;
+  const artifactMeta = ((selectedArtifact?.metadata ?? {}) as Record<string, unknown>);
+  const transformMeta = (artifactMeta.transform && typeof artifactMeta.transform === "object") ? (artifactMeta.transform as Record<string, unknown>) : null;
+  // Resolve the canonical HeightColorMapping for the current take so we can
+  // render the colorbar on every stage (not only when a height image is the
+  // selected preview). Falls back to a legacy semantic range when no metadata
+  // is available, so the legend is always actionable.
+  const heightColorMappingResolution = useMemo(
+    () => resolveHeightColorMapping(artifacts, {
+      semanticField: String(artifactMeta.semantic_field ?? "height_above_belt"),
+      preferredArtifactId: selectedArtifact?.artifact_id ?? null,
+    }),
+    [artifacts, artifactMeta.semantic_field, selectedArtifact?.artifact_id],
+  );
+  const heightColorMapping = heightColorMappingResolution.mapping;
+  const inspectorLegendSemantic = useMemo(
+    () => toHeightLegendSemantic(artifactMeta) ?? null,
+    [artifactMeta],
+  );
   return (
     <aside className="studio-inspector">
       <div className="studio-sidebar-title">
@@ -269,6 +291,36 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         <small>Target artifact: {selectedArtifact?.target_artifact_id ?? "-"}</small>
         <small>Path: {selectedArtifact?.path ?? "-"}</small>
         <small>Derived from: {lineage.length ? lineage.join(" | ") : "-"}</small>
+      </div>
+      <div className="inspector-section">
+        <span>Height semantics</span>
+        <strong>{String(artifactMeta.semantic_field ?? heightColorMapping.semanticField ?? selectedArtifact?.artifact_id ?? "-")}</strong>
+        <small>Source semantic: {String(artifactMeta.derived_from ?? "-")}</small>
+        <small>Transform lineage: {transformMeta ? JSON.stringify(transformMeta) : "-"}</small>
+        <small>Units: {String(artifactMeta.units ?? heightColorMapping.units ?? "-")}</small>
+        <small>Authoritative: {String(artifactMeta.is_measurement_authoritative ?? "-")}</small>
+        <small>Hover semantic source: {String(hoverSample?.semanticField ?? hoverSample?.displaySemantic ?? "-")}</small>
+        <small>Numeric raster source: {String(artifactMeta.numeric_values_path ?? artifactMeta.numeric_source_artifact ?? "-")}</small>
+        <small>Preview source: {String(selectedArtifact?.path ?? "-")}</small>
+        <small>Color scale range: {heightColorMapping.colorScaleMin.toFixed(2)} .. {heightColorMapping.colorScaleMax.toFixed(2)} {heightColorMapping.units ?? "mm"}</small>
+        <small>Colormap: {heightColorMapping.colorMap} ({heightColorMapping.source})</small>
+        {heightColorMappingResolution.warning && (
+          <small className="hover-recon-error">{heightColorMappingResolution.warning}</small>
+        )}
+        {/* Always show the canonical colorbar so users can read the active
+            scale on every stage, not only when a height image is selected. */}
+        <div className="inspector-height-legend">
+          <HeightLegend
+            colorMapping={heightColorMapping}
+            semanticLabel={inspectorLegendSemantic?.semanticLabel}
+            positiveDirection={inspectorLegendSemantic?.positiveDirection}
+            authoritative={inspectorLegendSemantic?.authoritative ?? heightColorMapping.source !== "legacy_fallback"}
+            compact
+            showTicks
+            tickCount={5}
+            percentileLabels={inspectorLegendSemantic?.percentileLabels}
+          />
+        </div>
       </div>
       {selectedArtifact?.kind === "overlay" && (
         <div className="inspector-section">

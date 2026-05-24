@@ -338,11 +338,11 @@ Legacy takes without sidecar metadata are resolved with synthesized defaults at 
 
 The 2D calibration lane now uses a source-discovery contract (`/api/sources`) with explicit freshness status so calibration UI can distinguish live vs stale previews and gate calibration actions accordingly.
 
-ChArUco detection diagnostics now include dictionary name, marker IDs, API mode, sharpness estimate, board coverage estimate, and failure reason to support fast debugging when marker-only detections occur.
+Corner-detection hardening now includes dictionary-aware ChArUco detection metadata (dictionary name, marker IDs, API mode, sharpness estimate, board coverage, failure reason) and selected-capture-first detection semantics.
 
-2D calibration runtime now includes camera-control tuning plus live image diagnostics (histogram/clipping/brightness) to guide exposure/focus adjustments before corner detection.
+Runtime tuning for calibration adds camera-control diagnostics (exposure/focus/gain family) and image-quality telemetry (brightness histogram, clipping, sharpness) to improve marker detection consistency before calibration solve.
 
-Modal-based separation formalizes boundaries between runtime streaming/control state and persisted calibration capture/detection state.
+UI architecture now separates runtime tuning from calibration solving via dedicated modals, reducing overloaded page state and keeping calibration persistence concerns independent from live stream concerns.
 
 ## Object annotation boundary (computed vs reviewed)
 
@@ -363,21 +363,32 @@ At take-detail load time, object annotations are associated to current run candi
 
 This association is exposed as metadata (`matched_candidate_id`, `matched_by`) and does not mutate run outputs.
 
-2D calibration now uses explicit capture-first workflow states (`NO_CAPTURES`, `CAPTURES_READY`, `CORNERS_DETECTED`, `CALIBRATION_VALID`) to avoid stale-preview deadlock UX.
+## Capture-first calibration state machine
+
+2D calibration workflow exposes explicit states:
+
+- `NO_CAPTURES`
+- `CAPTURES_READY`
+- `CORNERS_DETECTED`
+- `CALIBRATION_VALID`
+
+Detect corners is gated by capture existence + valid target parameters.
+Calibrate is gated by successful corner detection.
+Preview stale state does not gate calibration progression.
 
 ## ProcessBinding + immutable recipe runtime (step 1)
 
-Studio stays the editing/debugging surface, while runtime workers and manual execution resolve `ProcessBinding` when available.
+Studio remains the editor/debugger for process templates and recipes, but runtime execution now resolves an explicit `ProcessBinding` before running when available.
 
-- Resolve key: `source_id + modality + purpose`
-- Bound target: `pipeline_id + active_recipe_version_id + optional calibration_profile_id`
-- Purpose enum: `acquisition_inspection`, `manual_debug`, `fusion_input`, `fusion`
+- Binding key: `source_id + modality + purpose`
+- Binding target: `pipeline_id + active_recipe_version_id + optional calibration_profile_id`
+- Purposes: `acquisition_inspection`, `manual_debug`, `fusion_input`, `fusion`
 
-For process-service pipelines, execution is pinned to immutable recipe snapshots (`active_recipe_version_id`) instead of mutable instance state.
+Runtime execution uses immutable recipe-version snapshots for process-service pipelines: workers/manual runs execute the bound recipe snapshot instead of mutable live instance config.
 
-Manual Studio runs and worker runtime now share the same backend execution path and run metadata contract.
+`PipelineRunner`/single backend execution path is now shared between manual Studio-triggered runs and worker-style processing entrypoints.
 
-Persisted run metadata includes:
+Run metadata persistence now records:
 
 - `pipeline_id`
 - `recipe_version_id`
@@ -387,70 +398,52 @@ Persisted run metadata includes:
 - `acquisition_group_id` (nullable)
 - `calibration_profile_id` (nullable)
 
-Fusion execution is intentionally deferred in this step.
+Fusion behavior is intentionally not implemented in this step; `fusion_input`/`fusion` purposes are reserved binding semantics only.
 
-## AcquisitionGroup for multimodal capture grouping (step 2)
+## Acquisition Process Split: 2D vs 2.5D
 
-System now supports `AcquisitionGroup` as the cross-modality synchronization boundary for the same conveyor event.
+- Acquisition is a source/process layer and is separate from classification/inspection stages.
+- 2D USB capture is treated as acquisition source output (`source_id=usb_camera_<index>`, modality `rgb`).
+- 2.5D TriSpector ingest is treated as acquisition source output (`source_id=trispector_ftp_<n>`, modality `heightmap`).
+- Both flows publish raw/normalized assets to `incoming/<take_id>/` through the shared acquisition publisher contract (`metadata.json` + `READY`).
 
-Fields:
+## TriSpector FTP Ingestion Contract
 
-- `id`
-- `name` (nullable)
-- `station_id` (nullable)
-- `trigger_id` (nullable)
-- `encoder_position` (nullable)
-- `started_at`
-- `completed_at` (nullable)
-- `status` (`open | complete | failed`)
-- `metadata`
+- FTP upload ingestion only performs:
+  - file stability/ingest,
+  - TriSpector 2.5D parsing,
+  - persistence of parsed assets and parser diagnostics,
+  - take registration with modality metadata.
+- Ingestion does **not** run classification directly in the FTP handler.
+- Parser output contract for registered takes includes:
+  - `height16.tif` as `files.heightmap`,
+  - `reflectance.png` when available as `files.reflectance`,
+  - `parser_metadata.json` as `files.parser_metadata`,
+  - `heightmap_preview.png` as `files.heightmap_preview`,
+  - original uploaded file as `files.raw_upload`.
 
-Initial grouping workflow can be manual via API. Capture and processing paths propagate `acquisition_group_id` when present while preserving legacy behavior when omitted.
+## Binding-Driven Processing Trigger After Acquisition
 
-Future grouping can be trigger-based, encoder-position-based, or timestamp-window-based. Fusion is intentionally not implemented in this step.
-
-## Acquisition split for 2D and 2.5D
-
-- Acquisition remains a source/process boundary, separate from classification.
-- 2D USB capture is a first-class acquisition source producing `rgb` takes.
-- 2.5D TriSpector FTP ingest is a first-class acquisition source producing `heightmap` takes (labeled as `heightmap_2_5d` in take views).
-
-### TriSpector FTP ingest responsibilities
-
-- Ingest/upload stability and registration
-- Parse using TriSpector parser contract
-- Persist parsed assets + diagnostics + original upload
-- Publish take as ready
-
-FTP ingest explicitly does **not** run classification in the upload handler.
-
-### TriSpector parser output contract
-
-- `height16.tif` as `files.heightmap`
-- `reflectance.png` as `files.reflectance` (when available)
-- `parser_metadata.json` as parser diagnostics
-- `heightmap_preview.png` as preview artifact
-- original upload as `files.raw_upload`
-
-### Binding connection after acquisition
-
-- On take creation, resolve binding key:
-  - `source_id`
-  - `modality`
-  - `purpose` (runtime defaults to `acquisition_inspection`)
-- If active binding exists, trigger immutable recipe-version execution path.
-- If no binding exists, keep ingestion successful and expose warning:
+- After a take is registered, acquisition resolves bindings by:
+  - `source_id`,
+  - `modality`,
+  - `purpose` (default `acquisition_inspection` for runtime ingestion).
+- If an active binding exists, the bound immutable recipe version execution path is triggered.
+- If no binding exists, ingestion succeeds and the take remains `READY` with warning:
   - `No active processing binding found for this source/modality/purpose.`
-- No modality-mismatched fallback for 2.5D acquisition paths.
+- No modality-cross fallback is allowed for 2.5D bindings.
 
-Studio/manual and runtime acquisition-triggered processing remain aligned by using the same binding resolution semantics.
+## Studio and Runtime Alignment
 
-## Acquisition-to-processing seam (read-only contract)
+- Studio/manual processing and runtime acquisition-triggered processing both resolve through the same `ProcessBindingService` key (`source_id + modality + purpose`).
+- This keeps source-to-recipe routing consistent across interactive and unattended workflows.
 
-Ownership boundaries:
+## Acquisition-to-Processing Seam (read-only contract)
 
-- Acquisition owns ingestion/capture/parsing/upload/raw persistence/take creation.
-- Processing owns binding resolution and execution through the shared runner path.
+Ownership split:
+
+- Acquisition owns capture/ingest/parsing/upload/raw persistence/take creation.
+- Processing owns binding resolution + pipeline execution through the existing runner path.
 
 Shared contract: `AcquiredTakeReady`
 
@@ -467,24 +460,24 @@ Shared contract: `AcquiredTakeReady`
 - `warnings`
 - `created_at`
 
-Modality normalization:
+Modality normalization rule:
 
-- Canonical processing modalities remain `rgb` (2D) and `heightmap` (2.5D).
-- `heightmap_2_5d` is accepted as an alias and normalized to `heightmap`.
-- Original value is preserved in `metadata.original_modality`.
+- Canonical processing modality is `rgb` for 2D and `heightmap` for 2.5D.
+- Alias `heightmap_2_5d` is normalized to `heightmap` for binding resolution.
+- Original alias is preserved at `metadata.original_modality`.
 
-Resolver service:
+Resolution service:
 
-- `process_acquired_take_if_bound(...)` resolves active `ProcessBinding` by:
-  - `source_id`
-  - normalized `modality`
-  - `purpose` (default `acquisition_inspection`)
-- If `auto_process=False`: `ready_not_processed`.
-- If no binding: `processing_binding_missing` warning, no failure.
-- If binding exists: route through shared dispatch/runner path with bound `pipeline_id`, `recipe_version_id`, and optional `calibration_profile_id`.
-- No hardcoded 2.5D fallback to 2D/3D pipelines.
+- `process_acquired_take_if_bound(acquired_take, purpose=\"acquisition_inspection\", auto_process=True)`
+- If `auto_process=False`: status `ready_not_processed`.
+- If no binding: status `processing_binding_missing` with warning (non-fatal).
+- If binding exists: dispatch via shared processing path (`dispatch_take_processing`) with bound:
+  - `pipeline_id`
+  - `active_recipe_version_id`
+  - `calibration_profile_id` (optional)
+- No modality-cross fallback and no direct FTP-handler classification trigger.
 
-Status lifecycle per take (`data/acquisition_processing/status/<take_id>.json`):
+Status lifecycle (`data/acquisition_processing/status/<take_id>.json`):
 
 - `acquired`
 - `ready_for_processing`
@@ -495,7 +488,7 @@ Status lifecycle per take (`data/acquisition_processing/status/<take_id>.json`):
 - `processing_failed`
 - `ready_not_processed`
 
-Run metadata persisted with seam context:
+Persisted run metadata includes seam context:
 
 - `take_id`, `source_id`
 - `acquisition_group_id`, `acquisition_process_id`, `acquisition_run_id`
@@ -509,29 +502,32 @@ API seam endpoints:
 
 Studio visibility:
 
-- `TakeSummary` and `TakeDetail` now carry `acquisition_processing_status` for generic status rendering in existing pages.
+- Take summary/detail include `acquisition_processing_status`.
+- This is rendered in existing take-detail/Studio flows, without a separate acquisition UI implementation path.
 
-Fusion-forward note:
+Future fusion dependency:
 
-- `acquisition_group_id` remains the correlation key for future RGB+25D fusion execution.
+- `acquisition_group_id` remains the grouping key for future RGB+25D fusion stages.
 
-## First RGB + 25D fusion preparation layer
+## Fusion preparation layer (RGB + 25D, group-scoped)
 
-Added a read-only group resolver that consumes existing processed outputs by `acquisition_group_id`.
+This step adds a read-only fusion readiness resolver over existing processed outputs, keyed by `acquisition_group_id`.
 
-### FusionInputBundle
+### Fusion input bundle contract
+
+`FusionInputBundle`:
 
 - `acquisition_group_id`
-- `rgb_take_id` / `heightmap_take_id`
-- `rgb_run_id` / `heightmap_run_id`
-- `rgb_result_payload` / `heightmap_result_payload`
+- `rgb_take_id` / `heightmap_take_id` (optional)
+- `rgb_run_id` / `heightmap_run_id` (optional)
+- `rgb_result_payload` / `heightmap_result_payload` (optional)
 - `rgb_artifacts` / `heightmap_artifacts`
 - `readiness_status`
 - `missing_inputs`
 - `warnings`
 - `created_at` / `resolved_at`
 
-Readiness states:
+Readiness lifecycle:
 
 - `waiting_for_rgb`
 - `waiting_for_heightmap`
@@ -540,135 +536,200 @@ Readiness states:
 - `incomplete`
 - `failed_input`
 
-Selection behavior:
+Rules:
 
-- Discover takes in group.
-- Resolve RGB and 25D candidates.
-- Choose latest successful candidate by default.
-- Emit warnings and debug candidate lists when multiple candidates exist.
+- Resolver consumes existing takes/runs only.
+- No acquisition triggering, no FTP coupling, no forced processing mutation.
+- Latest successful RGB/25D run is selected by default.
+- Multiple candidates are surfaced in warnings + debug candidate list.
 
-### Object pairing prep
+### Preliminary object-level alignment
 
-Introduced `FusionObjectCandidate` for non-final debug alignment:
+`FusionObjectCandidate` is generated for debug pairing with tolerant, non-fatal matching:
 
 - `centroid_projection`
 - `bbox_overlap`
-- `object_index_fallback` (MVP fallback)
+- `object_index_fallback` (current MVP default when transforms are absent)
 - `unmatched_rgb`
 - `unmatched_heightmap`
 
-Missing optional object fields do not fail resolution; warnings are returned.
+Missing optional fields (bbox/centroid/class/confidence) emit warnings instead of failing.
 
-### FusionPreviewResult and APIs
+### Preview payload + APIs
 
-`FusionPreviewResult` includes:
+`FusionPreviewResult` returns:
 
-- readiness
-- pairing candidates
+- readiness status
+- object pairing candidates
 - merged feature summary
 - recommended next action
 - warnings
 
-API endpoints:
+APIs:
 
 - `GET /api/acquisition-groups/{group_id}/fusion-inputs`
 - `GET /api/acquisition-groups/{group_id}/fusion-preview`
 
-### Studio visibility
+### Studio debug visibility
 
-In Studio, when the selected take belongs to an acquisition group, the processing workspace now shows:
+When a selected take has `acquisition_group_id`, Studio shows fusion-readiness status, selected run IDs, missing inputs, and a compact object pairing table.
 
-- RGB and 25D input readiness
-- selected run IDs
-- missing inputs
-- pairing table and warnings
+### Current limitation and future path
 
-### Deferred items
+- Current pairing is debug-oriented and may fall back to index pairing.
+- Calibration-based geometric matching/projection is a future step.
+- Operator-facing fused classification/publication is intentionally deferred.
 
-- Calibration-aware geometric matching.
-- Final fused operator classification/publication.
+## Persisted fusion pipeline/run (RGB + 25D)
 
-## Persisted RGB+25D fusion run path
-
-Pipeline:
+New pipeline definition:
 
 - `pipeline_id = mining_steel_ball_fusion_rgb_25d`
 - `pipeline_family = fusion`
 - `execution_backend = native`
-- group-scoped by `acquisition_group_id`
+- group-scoped execution keyed by `acquisition_group_id`
 
-Fusion run persistence:
+### Fusion run contract
+
+`FusionRun` persisted under:
 
 - `data/fusion/runs/group_<acquisition_group_id>/run_<fusion_run_id>/`
-- `fusion_run.json` stores run metadata:
-  - pipeline id/family
-  - source RGB/25D take + run refs
-  - optional recipe/config snapshot refs
-  - status/timestamps
-  - result/artifact paths
-  - warnings
 
-Fusion result payload:
+Fields:
+
+- `fusion_run_id`
+- `acquisition_group_id`
+- `pipeline_id`
+- `pipeline_family = fusion`
+- `recipe_version_id` (optional)
+- `config_snapshot_hash` (optional/configurable)
+- `rgb_take_id`, `heightmap_take_id`
+- `rgb_run_id`, `heightmap_run_id`
+- `status`, `started_at`, `completed_at`
+- `result_path`
+- `artifact_paths`
+- `warnings`
+
+### Fusion result contract
+
+`FusionClassificationResult` persisted in `fusion_result.json` with:
+
+- `acquisition_group_id`
+- `fusion_run_id`
+- `status`
+- `final_objects`
+- `class_counts`
+- `warnings`
+- `source_refs`
+- `artifact_refs`
+
+Each `FinalInspectionObject` includes:
+
+- `final_object_id`
+- `rgb_object_id` / `heightmap_object_id`
+- `final_class`
+- `final_class_group`
+- `confidence`
+- `decision_reasons`
+- `rgb_evidence`
+- `heightmap_evidence`
+- `measurements`
+- `matching_method`
+- `matching_confidence`
+
+### Rule-based MVP classification
+
+Initial fusion rules (configurable thresholds):
+
+- 25D scrap-like elongated/flat evidence -> `Chatarra`
+- high 25D deformation -> `Scrap de Bola / Bola deformada`
+- RGB chip/crack hints -> `Scrap de Bola / Bola con chip` or `Bola partida`
+- healthy round consensus -> `Bola buena`
+
+Decision reasons are always emitted for traceability.
+
+### Persisted fusion artifacts
 
 - `fusion_result.json`
 - `fusion_summary.json`
 - `fusion_object_table.json`
 - `fusion_debug_pairing.json`
 
-Final object payload includes:
+Optional overlay generation is deferred; failure to generate overlay should not fail fusion run.
 
-- object linkage (`rgb_object_id`, `heightmap_object_id`)
-- final class + class group
-- confidence + explicit decision reasons
-- RGB + 25D evidence blocks
-- measurements + matching metadata
-
-Rule-based MVP classification:
-
-- 25D elongated/flat scrap-like -> `Chatarra`
-- high 25D deformation -> `Bola deformada` (`Scrap de Bola`)
-- RGB chip/crack hints -> `Bola con chip` / `Bola partida` (`Scrap de Bola`)
-- healthy round consensus -> `Bola buena`
-
-APIs:
+### Fusion APIs
 
 - `POST /api/acquisition-groups/{group_id}/fusion-runs`
 - `GET /api/acquisition-groups/{group_id}/fusion-runs`
 - `GET /api/fusion-runs/{fusion_run_id}`
 - `GET /api/acquisition-groups/{group_id}/fusion-result/latest`
 
-Readiness enforcement:
+Readiness gate:
 
-- default: requires `ready_for_fusion`
-- override: `force=true`
+- POST requires `ready_for_fusion` by default.
+- `force=true` allows execution with incomplete readiness.
 
-Operator publication is intentionally deferred; this step is for persisted fusion traceability/debug validation and reproducible review.
+### Why operator publication remains deferred
 
-Future extension:
+This step focuses on persisted, reviewable fusion evidence and reproducible debug outputs. Operator publication requires a separate acceptance contract, station-level fallback behavior, and production confidence policy.
 
-- bind fusion execution to process bindings/recipes (`purpose=fusion`) using existing metadata (`recipe_version_id`, `config_snapshot_hash`).
+### Future recipe-bound execution
+
+Fusion run metadata already carries `recipe_version_id` and `config_snapshot_hash`, preparing later binding semantics:
+
+- station/source + `purpose=fusion`
+- `mining_steel_ball_fusion_rgb_25d`
+- immutable fusion recipe/config snapshots
+
+## AcquisitionGroup for multimodal capture grouping (step 2)
+
+`acquisition_group_id` is now the synchronization primitive for grouping captures from the same physical conveyor event across 2D and 2.5D/3D lanes.
+
+`AcquisitionGroup` includes:
+
+- `id`
+- `name` (nullable)
+- `station_id` (nullable)
+- `trigger_id` (nullable)
+- `encoder_position` (nullable)
+- `started_at`
+- `completed_at` (nullable)
+- `status` (`open | complete | failed`)
+- `metadata` (dict)
+
+Grouping can be created and attached manually first. Capture APIs now accept optional `acquisition_group_id` and propagate it into take metadata and pipeline run metadata.
+
+This `AcquisitionGroup` boundary is the future fusion boundary. Automatic grouping strategies (trigger/encoder/timestamp window) are planned later. Fusion execution remains intentionally deferred.
 
 ## ObjectCandidate semantic contract for pre-fusion pipelines (step 3)
 
-System now standardizes inter-pipeline object semantics through `result_payload.object_candidates`.
+2D and 2.5D pipelines now emit a shared object-level semantic contract under `result_payload.object_candidates` while preserving all legacy fields (`objects`, artifacts, diagnostics).
 
-- Contract is shared across 2D and 2.5D outputs.
-- Legacy result fields remain backward compatible.
-- Pipelines may still emit modality-specific artifacts and diagnostics.
-- Empty detection cases emit `object_candidates: []`.
+`ObjectCandidate` is the inter-pipeline semantic output boundary and includes identity, source provenance, image/world localization, geometry/appearance/measurement dictionaries, classification hints, and diagnostics.
 
-This semantic layer is the intended input to future fusion. Fusion logic remains intentionally deferred.
+- 2D pipelines populate candidates from contour/blob + ellipse + classification artifacts.
+- 2.5D pipelines populate candidates from connected components, height metrics, and classification overlays.
+- Empty detections emit `object_candidates: []` (field present, not omitted).
+
+Fusion is intentionally not implemented in this step. Future fusion will consume `ObjectCandidate[]` from each modality, while pipelines continue to expose modality-specific artifacts and diagnostics.
 
 ## Fusion pipeline over ObjectCandidates (step 4)
 
-System now executes a first fusion pipeline (`mining_steel_ball_fusion`) over grouped 2D + 2.5D `ObjectCandidate` outputs.
+A first executable fusion pipeline is now available as `mining_steel_ball_fusion`.
 
-- Fusion consumes per-modality `ObjectCandidate[]` by `acquisition_group_id`.
-- Matching is initially pixel-space (centroid then bbox IoU fallback).
-- Unmatched candidates remain explicit in `FusionResult`.
-- `FinalObject` emits fused class/measurements with traceable decision reasons.
+- Input boundary: `ObjectCandidate[]` emitted independently by 2D and 2.5D pipelines.
+- Grouping boundary: `acquisition_group_id`.
+- Output contracts: `FusionResult` and `FinalObject`.
 
-Calibrated world-space matching is deferred.
+Initial matching is pixel-space POC only:
+
+- centroid distance threshold first
+- optional bbox IoU fallback
+- unmatched candidates preserved
+
+Initial classification is transparent/rule-based with explicit `decision_reasons`, combining strong 2D hints with 2.5D deformation/shape/height hints.
+
+World/calibrated matching is intentionally deferred.
 
 ## PublishedInspectionResult operator contract (step 5)
 
@@ -887,66 +948,77 @@ Scope of Studio runtime UI:
 - Processing Lab shows compact runtime health badges for RGB worker, 2.5D worker, and fusion publisher worker.
 - Processing Lab shows latest published inspection result id/status as runtime context only.
 
-## Lightweight worker orchestration (local-first)
+## Lightweight live orchestration layer
 
-Runtime supervision remains process-oriented; workers now provide continuous local orchestration without distributed infrastructure.
+Runtime keeps process supervision and now adds worker-oriented orchestration on top of existing binding and pipeline execution contracts.
 
 ### Worker model
 
-- Worker classes/types: `acquisition`, `processing`, `fusion`, `publication`
-- Worker state contracts include:
+- Worker types: `acquisition`, `processing`, `fusion`, `publication`
+- Core contracts: `WorkerDefinition`, `WorkerStatus`/health fields, `WorkerEvent`
+- Required health fields exposed per worker:
   - `worker_id`, `worker_type`, `status`
   - `source_id`, `pipeline_id`, `modality`
   - `queue_depth`, `last_activity_at`, `last_success_at`
   - `error_count`, `processed_count`
 
-### Queue/index contract
+### Processing queue semantics
+
+Persistent lightweight queue/index files:
 
 - `data/runtime/queues/pending_processing.jsonl`
 - `data/runtime/queues/processing_claims.json`
 - `data/runtime/queues/completed_processing.jsonl`
 - `data/runtime/queues/failed_processing.jsonl`
 
-This queue is filesystem-backed and intentionally lightweight.
+No broker is introduced; workers coordinate through filesystem state.
 
-### Claim + retry semantics
+### Claim semantics
 
-- Worker must claim before processing.
+- Workers claim a take before processing.
 - Claim is released on completion/failure.
-- Stale claim recovery is timeout-based.
-- Failures support bounded retries + backoff.
-- Duplicate processing is prevented through claim/terminal checks and worker markers.
+- Stale claims are recovered after timeout.
+- Failed takes use bounded retry with backoff and `next_retry_at`.
+- Duplicate processing is prevented through terminal/claim checks and worker markers.
 
-### Acquisition-processing flow
+### Acquisition -> processing orchestration
 
-- Acquisition paths enqueue pending entries with fusion-readiness metadata:
-  - `acquisition_group_id`
-  - `frameset_id`
-  - capture timestamp window fields
-- Processing workers resolve bindings (`source_id + modality + purpose`) and execute immutable recipe versions using existing execution APIs.
-- Family-aware routing is preserved.
+- Acquisition workers enqueue eligible takes with source/modality/purpose/fusion-readiness metadata (`acquisition_group_id`, `frameset_id`, capture timestamp).
+- Processing workers resolve active bindings and execute immutable recipe-version runs using existing dispatch paths.
+- Family-aware routing remains by modality/pipeline family; no cross-family silent fallback.
 
 ### Publication layer
 
-- Publication workers consume completed entries and emit operator-facing published summaries independent from Studio artifact trees.
-- Operator/runtime remains summary-oriented; Studio remains artifact/stage-oriented.
+- Publication workers consume completed processing entries and emit lightweight operator-facing `PublishedInspectionResult` summaries.
+- Publication output remains independent from Studio debug artifact trees.
 
-### Runtime env + recovery hardening
+### Runtime execution environment hardening
 
-- Runtime subprocess interpreter is resolved deterministically:
-  - prefer `sys.executable`, then `python3`, then `python`.
-- FTP commands using `python -m ...` / `python3 -m ...` are normalized automatically to the resolved interpreter.
-- `pyftpdlib` commands auto-inject `-d <upload_dir>` when missing; mismatched roots emit `FTP_ROOT_MISMATCH`.
+- Runtime subprocess interpreter resolution is venv-safe and deterministic:
+  - prefer `sys.executable`
+  - fallback to `python3`
+  - fallback to `python`
+- FTP commands that start with `python -m ...` or `python3 -m ...` are normalized to the resolved interpreter.
+- For `pyftpdlib` commands, `-d <upload_dir>` is injected when missing.
+- If configured `-d` root differs from runtime upload dir, runtime emits `FTP_ROOT_MISMATCH` warning.
 
-### Cross-invocation supervisor recovery
+### Recovery semantics across short-lived CLI/API invocations
 
-- New supervisor instances recover runtime state from PID + instance metadata and mark valid owned processes as `running`.
-- Recovery does not depend on prior in-memory state (supports short-lived CLI/API invocations).
-- Ownership mismatch warnings are guarded by command-signature and cwd checks to reduce false orphan detection.
+- Supervisor recovers active processes from persisted PID + instance metadata on each new process.
+- Recovered running PID with matching ownership/signature is marked `running` without requiring in-memory continuity.
+- Ownership mismatch warnings (`STALE_PID_OWNERSHIP_MISMATCH`) are emitted only after command/cwd/signature checks fail.
 
-### Foreground runtime CLI mode
+### Foreground debug mode
 
-- `scripts/runtime.py start <process_id> --foreground` runs runtime attached to terminal output for direct debugging.
+- CLI supports foreground runtime start:
+  - `python scripts/runtime.py start trispector_ftp --foreground`
+- This runs attached to the terminal for live debugging/log visibility while preserving the same normalized command preparation.
+
+### Operator vs Studio separation
+
+- Studio keeps stage-level engineering/debug views.
+- Operator-facing publication is reduced to decision/result summaries and overlays.
+- Runtime/worker APIs expose operational state without forcing raw pipeline complexity into operator flows.
 - Processing Lab includes read-only active binding visibility (`source_id`, `modality`, `purpose`, `pipeline_id`, `active_recipe_version_id`).
 
 Boundary rules:
@@ -1001,3 +1073,20 @@ Boundary rules:
 6. Verify `upload_dir` path exists and is writable by runtime process owner.
 7. Inspect runtime events for connection/login/upload/parse/processing boundaries.
 8. If upload events exist but no take is created, focus on parsing errors (`FTP_UPLOAD_FAILED`/`PARSE_FAILED`).
+# Engineering Debug Layer (Additive)
+
+Sensor Studio now supports a renderer-driven `Operator` vs `Engineering` mode without route or pipeline forks.
+
+- Operator mode keeps compact stage overlays and summaries.
+- Engineering mode enables semantic diagnostics through existing stage registries and artifact contracts.
+- This is additive: stages still publish native artifacts; renderers decide compact vs deep debug behavior.
+
+## Engineering Renderer Model
+
+- Mode toggle is Studio-level state, propagated to stage semantic renderers.
+- Stage views remain stage-native; engineering-only tabs (`residuals`, `diagnostics`, `profiles`, `provenance`) are additional view ids.
+- Inspectors consume stage artifacts/metadata, not ad-hoc side channels.
+
+## Compatibility Direction
+
+The model stays compatible with future `RGB + 25D` fusion, point-cloud viewers, multimodal overlays, ML classifiers, and live runtime monitoring because contracts remain artifact-first and stage-scoped.

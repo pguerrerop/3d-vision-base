@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from vision_3d_acquisition.api.filesystem import get_take_detail
 from vision_3d_acquisition.api.histogram import resolve_source_image_path
+from vision_3d_acquisition.api.pipeline_defaults_25d import merge_with_25d_defaults
 from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.apps.ball_inspection import run_ball_inspection_flow
 from vision_3d_acquisition.apps.ball_inspection_25d import run_ball_inspection_25d_flow
@@ -131,6 +132,7 @@ def dispatch_take_processing(
         }
 
     if pipeline_id == "mining_steel_ball_classification_25d":
+        merged_stage_params = merge_with_25d_defaults(settings.state_dir, stage_params)
         result = run_ball_inspection_25d_flow(
             settings.data_dir,
             take_id=take_id,
@@ -138,7 +140,7 @@ def dispatch_take_processing(
             source_id=source_id or None,
             acquisition_group_id=acquisition_group_id,
             calibration_profile_id=str(calibration_profile_id) if calibration_profile_id else None,
-            stage_params=stage_params or None,
+            stage_params=merged_stage_params or None,
         )
         logger.info(
             "25d_processing_completed take_id=%s output_dir=%s status=%s artifacts=%s",

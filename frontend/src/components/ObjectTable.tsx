@@ -49,8 +49,8 @@ export default function ObjectTable({ objects, selectedObjectId = null, hoveredO
             <th>Subclass</th>
             <th>Points</th>
             <th>Confidence</th>
-            <th>Center (mm)</th>
-            <th>Dimensions (mm)</th>
+            <th>Center X/Y/Z (mm)</th>
+            <th>Dimensions X/Y/Z (mm)</th>
             <th>Diameter estimate (mm)</th>
             <th>Diameter (mm)</th>
             <th>Height above belt (mm)</th>

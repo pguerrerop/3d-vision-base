@@ -214,6 +214,14 @@ ROI semantics now support both:
 - `roi_type=rectangle` with x/y/width/height
 - `roi_type=polygon` with `roi_polygon_points` rasterized once per run and applied as ROI mask during threshold/morphology
 
+2.5D reference-surface ROI semantics are explicitly extended with:
+
+- `roi_type=vertical_band` with `x/width` only
+- runtime normalization to `y=0,height=image_height` during mask generation
+- preserved source ROI type in metadata/debug payloads (not a hidden UI-only rectangle transform)
+
+This keeps ROI semantics explicit and extensible for future additions (`horizontal_band`, `rotated_rectangle`, belt-relative ROI, normalized-coordinate ROI).
+
 ## Segmentation cleanup generalization
 
 Segmentation cleanup is now generic candidate-mask conditioning, not ball-specific shaping.
@@ -1073,3 +1081,20 @@ Boundary rules:
 6. Verify `upload_dir` path exists and is writable by runtime process owner.
 7. Inspect runtime events for connection/login/upload/parse/processing boundaries.
 8. If upload events exist but no take is created, focus on parsing errors (`FTP_UPLOAD_FAILED`/`PARSE_FAILED`).
+# Engineering Debug Layer (Additive)
+
+Sensor Studio now supports a renderer-driven `Operator` vs `Engineering` mode without route or pipeline forks.
+
+- Operator mode keeps compact stage overlays and summaries.
+- Engineering mode enables semantic diagnostics through existing stage registries and artifact contracts.
+- This is additive: stages still publish native artifacts; renderers decide compact vs deep debug behavior.
+
+## Engineering Renderer Model
+
+- Mode toggle is Studio-level state, propagated to stage semantic renderers.
+- Stage views remain stage-native; engineering-only tabs (`residuals`, `diagnostics`, `profiles`, `provenance`) are additional view ids.
+- Inspectors consume stage artifacts/metadata, not ad-hoc side channels.
+
+## Compatibility Direction
+
+The model stays compatible with future `RGB + 25D` fusion, point-cloud viewers, multimodal overlays, ML classifiers, and live runtime monitoring because contracts remain artifact-first and stage-scoped.

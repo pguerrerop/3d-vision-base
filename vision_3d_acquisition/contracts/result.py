@@ -17,7 +17,7 @@ CalibrationResolutionSource = Literal["explicit", "runtime_default", "none"]
 AlgorithmStage = Literal["mock", "segmentation", "calibrated_segmentation", "classification", "production"]
 ObjectClass = Literal["ball", "non_ball", "unknown"]
 ArtifactKind = Literal["image", "point_cloud", "table", "json", "metric", "overlay", "video", "text", "file"]
-OverlayType = Literal["bbox", "mask", "ellipse", "sphere_fit", "centroid", "polyline", "text", "segmentation"]
+OverlayType = Literal["bbox", "mask", "ellipse", "footprint_roundness", "centroid", "polyline", "text", "segmentation"]
 OverlayCoordinateSpace = Literal["image_pixel", "normalized_image", "projection_pixel", "world_mm", "plot_pixel", "point_cloud_projection"]
 ProjectionType = Literal["xy_topdown", "xz_side", "yz_side", "object_crop", "heightmap", "depthmap"]
 StageExecutionStatus = Literal["success", "warning", "failed", "skipped"]
@@ -30,12 +30,18 @@ class ResultSummary(BaseModel):
     non_ball_count: int = Field(ge=0)
     decision: Decision
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    label: str | None = None
+    superclass: str | None = None
 
 
 class DetectedObject(BaseModel):
     object_id: int
     class_name: ObjectClass
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    label: str | None = None
+    display_label: str | None = None
+    superclass: str | None = None
+    class_group: str | None = None
     point_count: int | None = Field(default=None, ge=0)
     center_mm: tuple[float, float, float] | None = None
     dimensions_mm: tuple[float, float, float] | None = None
@@ -49,6 +55,14 @@ class DetectedObject(BaseModel):
     fraction_points_inside_belt: float | None = None
     filter_status: Literal["kept", "rejected"] | None = None
     filter_reason: str | None = None
+    feature_volume_proxy_mm3: float | None = None
+    feature_flatness: float | None = None
+    feature_eccentricity: float | None = None
+    feature_sphericity_3d: float | None = None
+    feature_edge_roughness: float | None = None
+    feature_local_curvature_proxy: float | None = None
+    feature_height_asymmetry: float | None = None
+    feature_footprint_roundness: float | None = None
     artifact_ids: list[str] = Field(default_factory=list)
 
 
@@ -329,6 +343,7 @@ class ProcessingResult(BaseModel):
     acquisition_group_id: str | None = None
     calibration_profile_id: str | None = None
     object_candidates: list[ObjectCandidate] = Field(default_factory=list)
+    classification: dict[str, Any] | None = None
 
     @field_validator("take_id")
     @classmethod

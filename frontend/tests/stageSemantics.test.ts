@@ -27,11 +27,13 @@ test("25D remove-belt segmentation defaults to overlay", () => {
   assert.ok(semantic.views.some((view) => view.id === "overlay"));
 });
 
-test("25D detect belt plane defaults to background candidates view", () => {
+test("25D detect belt plane defaults to selected surface view", () => {
   const semantic = stageSemanticDefinition("detect_belt_plane");
   assert.equal(semantic.category, "plane_qa");
-  assert.equal(semantic.defaultViewId, "background_candidates");
-  assert.ok(semantic.views.some((view) => view.id === "background_candidates"));
+  assert.equal(semantic.defaultViewId, "selected_surface");
+  assert.ok(semantic.views.some((view) => view.id === "selected_surface"));
+  assert.ok(semantic.views.some((view) => view.id === "low_gradient_mask"));
+  assert.ok(semantic.views.some((view) => view.id === "depth_gradient"));
   assert.ok(semantic.views.some((view) => view.id === "raw_heightmap"));
   assert.ok(semantic.views.some((view) => view.id === "valid_mask"));
   assert.ok(semantic.views.some((view) => view.id === "residual_heatmap"));

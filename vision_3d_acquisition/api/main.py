@@ -45,6 +45,11 @@ from vision_3d_acquisition.api.filesystem import (
 )
 from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
+from vision_3d_acquisition.api.pipeline_defaults_25d import (
+    clear_25d_defaults,
+    read_25d_defaults,
+    write_25d_defaults,
+)
 from vision_3d_acquisition.api.processing_dispatch import dispatch_take_processing
 from vision_3d_acquisition.api.schemas import DatasetSessionSummary, DatasetSummary, HealthResponse, RuntimeState, TakeDetail, TakeSummary
 from vision_3d_acquisition.api.settings import ApiSettings, get_cors_origins, get_settings
@@ -1310,6 +1315,23 @@ def delete_default_calibration() -> dict[str, Any]:
     return _runtime_config_payload()
 
 
+@app.get("/api/pipeline-defaults/25d")
+def get_pipeline_defaults_25d(settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    return {"defaults": read_25d_defaults(settings.state_dir)}
+
+
+@app.put("/api/pipeline-defaults/25d")
+def put_pipeline_defaults_25d(payload: dict[str, Any], settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    saved = write_25d_defaults(settings.state_dir, payload or {})
+    return {"defaults": saved}
+
+
+@app.delete("/api/pipeline-defaults/25d")
+def delete_pipeline_defaults_25d(settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    clear_25d_defaults(settings.state_dir)
+    return {"defaults": {}}
+
+
 @app.get("/api/takes", response_model=list[TakeSummary])
 def takes(
     session_id: str | None = None,
@@ -1818,6 +1840,29 @@ def take_file(
     path = safe_take_file(settings, take_id, filename)
     if path is None:
         raise HTTPException(status_code=404, detail="File not found")
+    if filename in {
+        "height_above_belt.values.f32",
+        "normalized_heightmap.values.f32",
+        "raw_sensor_z.values.f32",
+        "raw_heightmap.values.f32",
+        "valid_mask.u8",
+        "normalized_heightmap.render_context.json",
+        "normalized_heightmap_display.json",
+        "normalized_heightmap.png",
+    }:
+        size_bytes = path.stat().st_size if path.exists() else -1
+        if filename.endswith(".values.f32"):
+            sample_count = size_bytes // 4 if size_bytes >= 0 else -1
+            detail = f"float32_count={sample_count}"
+        elif filename.endswith(".u8"):
+            detail = f"uint8_count={size_bytes}"
+        else:
+            detail = f"bytes={size_bytes}"
+        print(
+            "[api-hover-debug] serving hover/render file "
+            f"take_id={take_id} filename={filename} path={path} {detail}",
+            flush=True,
+        )
     return FileResponse(path)
 
 

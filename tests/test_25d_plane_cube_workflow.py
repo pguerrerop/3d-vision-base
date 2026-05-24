@@ -6,10 +6,21 @@ from pathlib import Path
 import numpy as np
 
 from vision_3d_acquisition.api.main import latest_operator_inspection_result, publish_25d_take_result
+from vision_3d_acquisition.api.pipeline_defaults_25d import (
+    merge_with_25d_defaults,
+    read_25d_defaults,
+    write_25d_defaults,
+)
 from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.apps.ball_inspection_25d.pipeline import run_ball_inspection_25d_flow
-from vision_3d_acquisition.vision_core.heightmap import HeightmapFrame, save_heightmap_npz
-from vision_3d_acquisition.vision_core.pipelines.stages_25d import _fit_plane_ransac, _least_squares_plane, _reference_height_gate_from_distribution
+from vision_3d_acquisition.vision_core.heightmap import HeightmapFrame, load_heightmap_npz, save_heightmap_npz
+from vision_3d_acquisition.vision_core.pipelines.stages_25d import (
+    _apply_known_object_scale_correction,
+    _classify_25d,
+    _fit_plane_ransac,
+    _least_squares_plane,
+    _reference_height_gate_from_distribution,
+)
 
 
 def _settings(data_dir: Path) -> ApiSettings:
@@ -74,9 +85,9 @@ def test_plane_normalization_and_cube_scale_validation(tmp_path: Path) -> None:
         known_object={
             "enabled": True,
             "object_label": "cubo",
-            "known_width_mm": 40.0,
-            "known_depth_mm": 40.0,
-            "known_height_mm": 25.0,
+            "known_width_mm": 57.0,
+            "known_depth_mm": 57.0,
+            "known_height_mm": 57.0,
             "tolerance_percent": 35.0,
             "target_selection": "largest_component",
         },
@@ -86,9 +97,111 @@ def test_plane_normalization_and_cube_scale_validation(tmp_path: Path) -> None:
     plane_debug = json.loads((out / "plane_fit_debug.json").read_text(encoding="utf-8"))
     norm_debug = json.loads((out / "normalization_debug.json").read_text(encoding="utf-8"))
     scale = json.loads((out / "known_object_scale_validation.json").read_text(encoding="utf-8"))
+    obj = result.result_payload["objects"][0]
     assert plane_debug["status"] in {"success", "failed"}
     assert norm_debug["background_height_p95_abs_after_normalization_mm"] < 2.5
     assert abs(float(scale["measured_height_mm"]) - 25.0) < 6.0
+    assert abs(float(obj["dimensions_mm"][2]) - float(obj["height_above_belt_mm"]["max_height_mm"])) < 1e-6
+
+
+def test_cube_recalibration_ignores_persisted_identity_scale(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    _write_take(
+        settings,
+        "take_cube_recalibrate",
+        _tilted_plane_with_cube(),
+        known_object={
+            "enabled": True,
+            "apply_correction": True,
+            "object_label": "cube",
+            "known_width_mm": 57.0,
+            "known_depth_mm": 57.0,
+            "known_height_mm": 57.0,
+            "tolerance_percent": 35.0,
+            "target_selection": "largest_component",
+            "apply_persisted_correction": True,
+            "persisted_scale_correction_x": 1.0,
+            "persisted_scale_correction_y": 1.0,
+            "persisted_scale_correction_z": 1.0,
+        },
+    )
+
+    result = run_ball_inspection_25d_flow(settings.data_dir, take_id="take_cube_recalibrate")
+    scale = json.loads((result.output_dir / "known_object_scale_validation.json").read_text(encoding="utf-8"))
+
+    assert scale["applied_correction"] is True
+    assert scale["applied_persisted_correction"] is False
+    assert abs(float(scale["recommended_scale_correction_x"]) - 1.0) > 0.01
+    assert abs(float(scale["recommended_scale_correction_z"]) - 1.0) > 0.01
+
+
+def test_scale_correction_recomputes_eccentricity_from_corrected_axes() -> None:
+    objects = [
+        {
+            "center_mm": (100.0, 100.0, 10.0),
+            "bbox_min_mm": (50.0, 50.0, 0.0),
+            "bbox_max_mm": (150.0, 150.0, 20.0),
+            "dimensions_mm": (100.0, 100.0, 20.0),
+            "major_axis_mm": 100.0,
+            "minor_axis_mm": 80.0,
+            "feature_eccentricity": 0.9,
+            "sphericity_score": 0.8,
+            "height_above_belt_mm": {"max_height_mm": 20.0},
+        }
+    ]
+
+    _apply_known_object_scale_correction(objects, scale_x=0.5, scale_y=1.0, scale_z=2.0)
+    row = objects[0]
+
+    assert row["center_mm"] == (100.0, 100.0, 10.0)
+    assert row["bbox_min_mm"] == (50.0, 50.0, 0.0)
+    assert row["bbox_max_mm"] == (150.0, 150.0, 20.0)
+    assert row["major_axis_mm"] == 80.0
+    assert row["minor_axis_mm"] == 50.0
+    assert row["sphericity_score"] == 0.625
+    assert abs(float(row["feature_eccentricity"]) - 0.7806) < 0.0001
+    assert row["height_above_belt_mm"]["max_height_mm"] == 40.0
+    assert row["feature_sphericity_3d"] == 0.5
+
+
+def test_25d_good_ball_requires_min_3d_sphericity() -> None:
+    base = {
+        "height_above_belt_mm": {"max_height_mm": 57.0, "p95_height_mm": 55.0},
+        "feature_eccentricity": 0.2,
+        "feature_sphericity_3d": 0.8,
+        "feature_flatness": 0.5,
+        "feature_edge_roughness": 2.0,
+        "feature_volume_proxy_mm3": 100000.0,
+    }
+
+    assert _classify_25d(base)[2] == "ball"
+    assert _classify_25d({**base, "feature_sphericity_3d": 0.79})[2] == "non_ball"
+
+
+def test_25d_defaults_merge_keeps_persisted_scale_factors(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    saved_defaults = {
+        "known_object_25d": {
+            "apply_persisted_correction": True,
+            "persisted_scale_correction_x": 0.5,
+            "persisted_scale_correction_y": 0.6,
+            "persisted_scale_correction_z": 0.04,
+        },
+        "remove_belt_segment_objects": {"min_height_mm": 8.0},
+    }
+    write_25d_defaults(state_dir, saved_defaults)
+    assert read_25d_defaults(state_dir)["known_object_25d"]["persisted_scale_correction_z"] == 0.04
+
+    incoming = {"known_object_25d": {"enabled": False}}
+    merged = merge_with_25d_defaults(state_dir, incoming)
+    known = merged["known_object_25d"]
+    assert known["enabled"] is False
+    assert known["apply_persisted_correction"] is True
+    assert known["persisted_scale_correction_x"] == 0.5
+    assert known["persisted_scale_correction_y"] == 0.6
+    assert known["persisted_scale_correction_z"] == 0.04
+    assert merged["remove_belt_segment_objects"]["min_height_mm"] == 8.0
 
 
 def test_reference_plane_fit_is_constrained_to_heightmap_surface() -> None:
@@ -256,3 +369,59 @@ def test_normalization_and_segmentation_emit_reference_masks(tmp_path: Path) -> 
     assert norm_debug.get("model_type") in {"plane", "constant_z"}
     assert "below_reference_pixel_count" in norm_debug
     assert "above_threshold_pixel_count" in norm_debug
+
+
+def test_normalized_display_transform_metadata_matches_percentile_scaling(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    _write_take(settings, "take_display_meta", _tilted_plane_with_cube(width=180, height=130))
+    result = run_ball_inspection_25d_flow(settings.data_dir, take_id="take_display_meta")
+    out = result.output_dir
+    display = json.loads((out / "normalized_heightmap_display.json").read_text(encoding="utf-8"))
+    render_context = json.loads((out / "normalized_heightmap.render_context.json").read_text(encoding="utf-8"))
+    norm = load_heightmap_npz(out / "normalized_heightmap.npz")
+    valid = norm.z_mm[norm.valid_mask]
+    p2 = float(np.percentile(valid, 2))
+    p98 = float(np.percentile(valid, 98))
+    assert display["display_scaling"] == "percentile_clipped"
+    assert display["display_percentiles"] == [2, 98]
+    assert abs(float(display["display_vmin"]) - p2) < 1e-5
+    assert abs(float(display["display_vmax"]) - p98) < 1e-5
+    assert int(display["valid_count"]) == int(np.count_nonzero(norm.valid_mask))
+    assert int(display["invalid_count"]) == int(norm.valid_mask.size - np.count_nonzero(norm.valid_mask))
+    assert (out / str(display["numeric_values_path"])).is_file()
+    assert (out / str(display["valid_mask_path"])).is_file()
+    assert abs(float(render_context["render_vmin"]) - float(display["display_vmin"])) < 1e-5
+    assert abs(float(render_context["render_vmax"]) - float(display["display_vmax"])) < 1e-5
+    assert render_context["clipping_mode"] == "percentile_clipped"
+    assert render_context["clipping_percentiles"] == [2.0, 98.0]
+    assert render_context["colormap_id"] == "turbo"
+    assert render_context["interpolation_mode"] == "nearest"
+    assert render_context["roi_purpose"] == "plane_fit_only"
+    assert render_context["render_coordinate_space"] == "full_frame"
+    assert render_context["source_shape"] == display["shape"]
+    assert render_context["rendered_png_shape"] == display["shape"]
+
+
+def test_failed_plane_fit_marks_normalization_quality_degraded(tmp_path: Path) -> None:
+    settings = _settings(tmp_path / "data")
+    z = np.zeros((80, 80), dtype=np.float32)
+    valid = np.zeros_like(z, dtype=bool)
+    valid[0:4, 0:4] = True
+    z[0:4, 0:4] = 12.0
+    frame = HeightmapFrame(
+        z_mm=z,
+        valid_mask=valid,
+        reflectance=None,
+        x_resolution_mm=1.0,
+        y_resolution_mm=1.0,
+        origin_x_mm=0.0,
+        origin_y_mm=0.0,
+        coordinate_system="sensor_xy_z_mm",
+    )
+    _write_take(settings, "take_degraded_norm", frame)
+    result = run_ball_inspection_25d_flow(settings.data_dir, take_id="take_degraded_norm")
+    out = result.output_dir
+    norm_debug = json.loads((out / "normalization_debug.json").read_text(encoding="utf-8"))
+    quality = (norm_debug.get("normalization_quality") or {})
+    assert quality.get("status") == "degraded"
+    assert quality.get("reason") == "plane_fit_failed_constant_z_fallback"

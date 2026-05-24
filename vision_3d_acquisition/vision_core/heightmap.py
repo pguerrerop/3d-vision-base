@@ -80,6 +80,9 @@ def write_heightmap_preview_png(
     *,
     colormap: int = cv2.COLORMAP_TURBO,
     colorbar_label: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    clipping_percentiles: tuple[float, float] = (2.0, 98.0),
 ) -> None:
     values = np.asarray(values_mm, dtype=np.float32)
     mask = np.asarray(valid_mask, dtype=bool)
@@ -88,8 +91,13 @@ def write_heightmap_preview_png(
     max_v = 1.0
     if np.count_nonzero(mask) > 0:
         valid_values = values[mask]
-        min_v = float(np.nanpercentile(valid_values, 2.0))
-        max_v = float(np.nanpercentile(valid_values, 98.0))
+        if vmin is None or vmax is None:
+            p_lo, p_hi = clipping_percentiles
+            min_v = float(np.nanpercentile(valid_values, p_lo))
+            max_v = float(np.nanpercentile(valid_values, p_hi))
+        else:
+            min_v = float(vmin)
+            max_v = float(vmax)
         if max_v <= min_v:
             max_v = min_v + 1.0
         scaled = np.clip((values - min_v) / (max_v - min_v), 0.0, 1.0)

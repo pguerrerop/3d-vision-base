@@ -50,7 +50,7 @@ Stage categories follow Studio semantics:
 ## Belt Plane and Normalized Measurement Space
 - `DetectBeltPlane` now uses a **seed -> fit -> residual-expand -> refit** strategy:
   - valid-point extraction from heightmap
-  - ROI filtering
+  - ROI filtering (reference-surface estimation only)
   - depth-percentile seed selection (`background_selection_mode`, `background_percentile`)
   - optional morphology + border-connected filtering on seeds
   - initial plane fit from seeds
@@ -108,7 +108,18 @@ Known failure mode guards:
 
 ## Segmentation, Geometry, and Measurement Definitions
 - Segmentation is height-threshold based (`min_height_mm`, optional `max_height_mm`) with morphology and component area filtering.
-- ROI support for 2.5D is available from metadata (`roi_25d`) with rectangle/polygon support, applied before segmentation.
+- ROI semantics for 2.5D:
+  - ROI is the trusted search region for reference-surface detection only.
+  - ROI affects low-gradient computation, candidate selection, plane/reference fitting, and residual expansion.
+  - ROI does not crop normalized output, segmentation output, object measurements, or classification overlays.
+  - Normalization and segmentation continue on the full valid frame.
+  - ROI types are explicit and extensible: `rectangle`, `polygon`, `vertical_band`.
+  - `vertical_band` exists for conveyor workflows where scan/image height changes between takes due to encoder/trigger timing; it constrains only X-range and always rasterizes as full-height.
+  - `vertical_band` serialization:
+    - `{"type":"vertical_band","x":120,"width":340}`
+    - runtime mask normalization resolves to `y=0,height=image_height` while preserving `type` in debug/config metadata.
+- Studio includes visual ROI editing for reference-surface tuning (raw heightmap, depth gradient, low-gradient mask, selected surface), with `Apply ROI` / `Reset to full-frame`.
+- Recommended workflow: set ROI on conveyor/background -> tune low-gradient params -> verify selected surface -> verify normalized height -> verify segmentation.
 - Footprint geometry per component includes contour, hull, ellipse-derived geometry, area, roundness/eccentricity.
 - Height metrics:
   - `max_height_mm`, `mean_height_mm`, `median_height_mm`, `p95_height_mm`, `height_std_mm`
@@ -128,6 +139,45 @@ Known failure mode guards:
   - `Bola buena`
   - `Scrap de Bola` variants
   - `Chatarra` variants
+
+### Execution order (conservative sph3d refinement)
+Classification runs in two passes per object:
+
+1. **Primary heuristic classifier** (`_classify_25d` in `stages_25d.py`) — unchanged thresholds for good-ball detection:
+   - height, 3D sphericity, eccentricity, flatness, edge roughness, volume
+   - objects matching good-ball rules become `bola_buena` / `BALL_GOOD`
+2. **Secondary sph3d fallback** (`apply_sphericity_3d_fallback_to_object` in `classification_superclass.py`) — runs only when primary result is **not** `BALL_GOOD` or `SCRAP_METAL`
+
+Good-ball objects return immediately; fallback logic is never applied to them.
+Primary `SCRAP_METAL` results (e.g. `planchuela` from low height/volume) are also preserved.
+
+### sph3d fallback thresholds (calibration-oriented)
+Uses only `feature_sphericity_3d` (`sph3d`), while the old `sphere_fit` display has been renamed to `feature_footprint_roundness` because it is only a 2D ellipse-axis ratio:
+
+| Condition | Label | Superclass |
+|-----------|-------|------------|
+| `sph3d < 0.30` | `chatarra` | `SCRAP_METAL` |
+| `0.30 <= sph3d < 0.75` | `bola_con_chip` | `BALL_SCRAP` |
+| `sph3d >= 0.75` | unchanged (primary result) | unchanged |
+
+Thresholds are intentionally heuristic, derived from observed data, and meant for iterative calibration — not ML or multi-feature fusion.
+
+Each non-good object receives debug metadata on the result payload:
+
+```json
+{
+  "debug": {
+    "sph3d_rule": {
+      "sph3d": 0.42,
+      "threshold_scrap_metal": 0.30,
+      "threshold_ball_scrap": 0.75
+    }
+  },
+  "classification_reason": "BALL_SCRAP because 0.30 <= sph3d=0.420 < 0.75"
+}
+```
+
+Superclass aggregation (`select_dominant_classification`) is unchanged.
 
 ## Overlay and Artifact Contracts
 - Added explicit 2.5D overlays/artifacts consistent with existing explorer/inspector flows:
@@ -173,6 +223,29 @@ When this pipeline is selected, Studio stage views are exposed through the exist
 - `JSON`
 
 ### 25D preview artifacts rendered in Studio
+
+## Height Semantics Contract (Canonical)
+- Canonical semantic fields:
+  - `raw_sensor_z`: decoded sensor Z (little-endian 16-bit reconstruction); higher numeric means higher decoded Z.
+  - `plane_signed_distance`: signed distance to fitted belt plane.
+  - `height_above_belt`: authoritative physical measurement (`0 = belt`, positive above belt).
+  - `preview_normalized`: display-only normalization field, never used for measurement/classification.
+- Every height-related artifact metadata now carries:
+  - `semantic_field`, `units`, `value_min`, `value_max`
+  - `color_scale_min`, `color_scale_max`, `color_map`
+  - `positive_direction`, `is_measurement_authoritative`
+  - `source_artifact_id`, `stage_id`
+- Studio contract:
+  - Legend labels and colorbar min/max are sourced from artifact metadata.
+  - Hover values come from the active semantic field of the selected view.
+  - Legacy previews with missing semantic metadata must be marked as unknown semantics.
+- Processing contract:
+  - Segmentation/measurement/classification consume `height_above_belt`.
+  - `preview_normalized` is blocked from measurement/classification paths.
+  - Height metrics explicitly carry `height_metrics_semantic_field = "height_above_belt"`.
+- Parser contract:
+  - Keep little-endian `uint16` reconstruction as default.
+  - `parser_metadata.json` includes effective bit-depth diagnostics (`raw min/max`, `p01/p99`, `unique count`, warnings for possible packed 12/14-bit ranges).
 The following artifact previews are produced and visible through current artifact/viewer components:
 - raw heightmap preview (`heightmap`)
 - normalized heightmap preview (`normalized_heightmap`)
@@ -181,6 +254,12 @@ The following artifact previews are produced and visible through current artifac
 - segmentation overlay (`height_segmentation` / `segmentation_overlay.png`)
 - measurement overlay (`measurement_overlay`)
 - classification overlay (`classification_overlay`)
+
+### Canonical numeric source contract (2.5D)
+- Numeric processing stages read canonical numeric sources only, in priority: `height16.tif` -> `heightmap_frame.npz` -> `normalized_heightmap.npz`.
+- Preview images (`heightmap_preview.png`, `normalized_heightmap.png`, overlays) are `display_only=true` and are never valid computation inputs.
+- Numeric artifacts/metadata are marked `numeric_source=true`.
+- Normalized hover, histogram, and legend share one numeric source (`normalized_heightmap.npz`) with transform metadata from `normalized_heightmap_display.json`.
 
 ### Inspector 25D diagnostics
 Inspector now surfaces:
@@ -383,3 +462,114 @@ Model selection diagnostics explicitly report:
 - `model_residual_mean_mm`
 - `model_residual_p95_mm`
 - `model_selection_reason`
+# Engineering Observability Extensions
+
+## Semantic Height Visualization
+
+Engineering stage views now support explicit semantic modes over existing artifacts:
+
+- `Absolute Z`
+- `Height Above Belt` (default engineering interpretation)
+- `Normalized Height`
+- `Residual To Plane`
+- `Sphere Fit Residual` (contract-ready; populated when produced)
+
+Color semantics are renderer-configurable with:
+
+- `auto`
+- `symmetric around zero`
+- `manual min/max`
+- `percentile clipping`
+- optional outlier saturation
+
+## Residual Artifact Contracts
+
+`detect_belt_plane` publishes residual-focused diagnostics in additive form:
+
+- `belt_plane_residuals` (heatmap)
+- `plane_residual_histogram` (json histogram)
+- existing ROI/candidate/inlier masks remain the source of plane-fit explainability.
+
+## Object Provenance and Geometry Diagnostics
+
+Per-object 25D rows include:
+
+- `measurement_provenance` (bbox/coverage/contour/point lineage)
+- `sphere_fit_diagnostics` (estimated radius/diameter/truncation/confidence)
+- `classification_explanation` (metric contributions + rejected-ball reasons)
+
+This preserves current stage contracts while making classification and geometric behavior explainable.
+
+## Second-pass canonical height semantics
+
+This pipeline now treats height semantics as an explicit architectural layer.
+
+### Canonical geometry domains
+
+- `raw_sensor_z`: acquisition/debug domain (sensor-space heights).
+- `plane_signed_distance`: intermediate geometry domain (signed residual to fitted belt plane).
+- `height_above_belt`: canonical physical geometry domain used by measurements, classification, reports, exports, and default overlays.
+
+### Semantic transform chain
+
+- `raw_sensor_z` is produced by `raw_decode`.
+- `plane_signed_distance` is produced from `raw_sensor_z` by `signed_distance` (plane-aware residual transform).
+- `height_above_belt` is produced from `plane_signed_distance` by `invert_signed_distance`.
+- Display-only `preview_normalized` is produced from canonical semantic rasters via `normalization`; it is never a measurement source.
+
+All major height artifacts now include transform lineage metadata:
+
+- `semantic_field`
+- `derived_from`
+- `transform` (`type`, and optional transform details like `plane_id`)
+
+### Numeric raster contract
+
+The pipeline persists canonical semantic numeric rasters:
+
+- `raw_sensor_z.values.f32`
+- `plane_signed_distance.values.f32`
+- `height_above_belt.values.f32`
+
+Each semantic raster carries metadata for runtime-safe consumption:
+
+- `semantic_field`
+- `coordinate_space`
+- `units`
+- `dtype`
+- `source_stage`
+
+### Semantic-first artifact model
+
+Consumers should resolve artifacts by `(semantic_field, representation)` rather than filename. This is additive and backward-compatible with legacy file names.
+
+### Hover/render consistency guarantee
+
+Hover sampling and numeric diagnostics consume semantic rasters only. Colorized previews are visualization artifacts and are not used as numeric sources.
+
+### Canonical color mapping contract (`HeightColorMapping`)
+
+To eliminate any visual disagreement between the rendered preview, the legend, hover sampling and debug reconstructions, all height visualization consumers share a single canonical contract:
+
+```
+{
+  "semantic_field": "height_above_belt",
+  "units": "mm",
+  "value_min": <raw data min>,
+  "value_max": <raw data max>,
+  "color_scale_min": <LUT lower bound>,
+  "color_scale_max": <LUT upper bound>,
+  "color_map": "turbo" | "viridis" | "magma" | "gray" | <id>,
+  "direction": "higher_is_hotter" | "lower_is_hotter",
+  "clamp": true,
+  "source": "artifact_metadata" | "render_context" | "legacy_fallback"
+}
+```
+
+Rules:
+
+- the LUT is always anchored data-natively (`value_min` → cool, `value_max` → hot); `direction` only changes label/tick orientation in the legend.
+- backend writes a `color_mapping` block on the rendered preview artifact, on the display metadata JSON, on the render context artifact and on the canonical numeric raster artifact (`height_above_belt_raster`).
+- frontend resolution priority: explicit `color_mapping` block → render context (`render_vmin/vmax`, `colormap_id`) → display metadata (`color_scale_min/max`, `color_map`) → legacy fallback (warning).
+- `HeightLegend` renders the colorbar gradient from the same named LUT (`turbo`/`viridis`/`magma`/`gray`) the image renderer uses; no hard-coded CSS gradients.
+- hover sampling and reconstruction diffs use the same `colorMap` name + `colorScaleMin/Max`, so scalar→RGB and RGB→t inferences are LUT-consistent.

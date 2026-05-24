@@ -37,6 +37,23 @@ export function mapClientToImagePoint(
   return { x, y };
 }
 
+export function mapClientToImagePointStrict(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  imageWidth: number,
+  imageHeight: number
+): { x: number; y: number } | null {
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const rx = (clientX - rect.left) / rect.width;
+  const ry = (clientY - rect.top) / rect.height;
+  if (rx < 0 || rx > 1 || ry < 0 || ry > 1) return null;
+  return {
+    x: Math.max(0, Math.min(imageWidth, rx * imageWidth)),
+    y: Math.max(0, Math.min(imageHeight, ry * imageHeight)),
+  };
+}
+
 export function sourceToDisplay(
   point: { x: number; y: number },
   sourceWidth: number,

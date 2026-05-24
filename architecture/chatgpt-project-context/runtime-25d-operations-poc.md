@@ -62,6 +62,18 @@ Operational classes:
 
 Mapping is additive and non-breaking for evolving stage outputs.
 
+### sph3d fallback (25D classifier refinement)
+After primary `_classify_25d` heuristics, a secondary fallback runs for objects **not** already classified as `BALL_GOOD` or `SCRAP_METAL`:
+
+1. Primary good-ball rules run first (unchanged).
+2. If result is `BALL_GOOD` or `SCRAP_METAL`, skip fallback entirely.
+3. Otherwise apply `feature_sphericity_3d` (`sph3d`) thresholds:
+   - `< 0.30` → `chatarra` / `SCRAP_METAL`
+   - `0.30–0.75` → `bola_con_chip` / `BALL_SCRAP`
+   - `>= 0.75` → keep primary label/superclass
+
+Thresholds are heuristic and calibration-oriented. Objects include `debug.sph3d_rule` and optional `classification_reason` for traceability. The previous `sphere_fit` object metric is now named `feature_footprint_roundness`.
+
 ## Preview Fallback Behavior
 Operations card preview resolves in this order:
 1. `classification_overlay.png`
@@ -80,3 +92,13 @@ Operations remains production-style monitoring:
 - confidence
 - previews
 - failure visibility
+
+## Canonical height semantics alignment
+
+Operations cards remain lightweight, but semantic contracts are now explicit:
+
+- production metrics and labels are derived from canonical `height_above_belt` geometry semantics;
+- preview imagery remains display-only and does not serve as numeric measurement input;
+- semantic lineage metadata (`derived_from`, `transform`) is preserved in processing artifacts so replay/debug tools can reconstruct geometry provenance without filename heuristics.
+
+This keeps Operations additive while preserving a single geometry truth across Studio and runtime views.

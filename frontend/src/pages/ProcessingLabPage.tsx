@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   fileUrl,
@@ -28,7 +28,6 @@ import StageParameterPanel from "../components/StageParameterPanel";
 import type { OverlayDebugInfo } from "../components/overlayModel";
 import {
   chooseBestPipelineForTake,
-  compactTakeFamilyStatus,
   incompatibleModalityMessage,
   modalityCompatible,
   stageTimingMs,
@@ -38,12 +37,63 @@ import { artifactsForObject, artifactsForStage, objectsForTake, selectedObject }
 import { renderStageSemanticView } from "../components/stage_view_renderers";
 import { canonicalStageId, stageSemanticDefinition, stageSemanticSummary } from "../components/stageSemantics";
 import type { RoiPolygon, RoiRect } from "../components/roiMapping";
+import type { RoiType } from "../components/ProjectionArtifactViewer";
+import type { StudioDebugMode } from "../components/studioDebugMode";
+import type { HoverInspectionSample } from "../components/hoverInspectionModel";
 import { nextDatasetSelectionAfterCreate, nextSessionSelectionAfterCreate } from "../components/datasetSidebarModel";
 import { buildCapturePayload, captureDisabledReason, nextSelectedTakeAfterCapture } from "../components/captureWorkflowModel";
+import { resolveNextSelectedTakeId } from "../components/takeSelectionModel";
 
 type TakeFilter = "all" | "processed" | "unprocessed" | "warnings";
 type SegmentationTuningParams = Record<string, unknown>;
 type PlaneQaTuningParams = Record<string, unknown>;
+type RoiEditStatus = "idle" | "active" | "unsaved" | "saved" | "rerun_required";
+type ScaleCorrection = { x: number; y: number; z: number };
+const SENSOR_STUDIO_25D_DEFAULTS_KEY = "sensor_studio.25d.stage_params.defaults.v1";
+
+function read25dSavedDefaults(): Record<string, unknown> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(SENSOR_STUDIO_25D_DEFAULTS_KEY);
+    return raw ? JSON.parse(raw) as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function scaleCorrectionFromRecord(record: Record<string, unknown> | null | undefined): ScaleCorrection | null {
+  if (!record) return null;
+  const knownX = Number(record.known_width_mm);
+  const knownY = Number(record.known_depth_mm);
+  const knownZ = Number(record.known_height_mm);
+  const measuredX = Number(record.measured_width_mm);
+  const measuredY = Number(record.measured_depth_mm);
+  const measuredZ = Number(record.measured_height_mm);
+  if (
+    Number.isFinite(knownX) && Number.isFinite(knownY) && Number.isFinite(knownZ) &&
+    Number.isFinite(measuredX) && Number.isFinite(measuredY) && Number.isFinite(measuredZ) &&
+    measuredX > 1e-9 && measuredY > 1e-9 && measuredZ > 1e-9
+  ) {
+    return { x: knownX / measuredX, y: knownY / measuredY, z: knownZ / measuredZ };
+  }
+  const x = Number(record.recommended_scale_correction_x ?? record.persisted_scale_correction_x ?? record.x);
+  const y = Number(record.recommended_scale_correction_y ?? record.persisted_scale_correction_y ?? record.y);
+  const z = Number(record.recommended_scale_correction_z ?? record.persisted_scale_correction_z ?? record.z);
+  return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) ? { x, y, z } : null;
+}
+
+function isIdentityScaleCorrection(scale: ScaleCorrection | null): boolean {
+  if (!scale) return false;
+  return Math.abs(scale.x - 1) < 1e-6 && Math.abs(scale.y - 1) < 1e-6 && Math.abs(scale.z - 1) < 1e-6;
+}
+
+function persistedScaleFromKnown(known: Record<string, unknown>): ScaleCorrection | null {
+  return scaleCorrectionFromRecord({
+    persisted_scale_correction_x: known.persisted_scale_correction_x,
+    persisted_scale_correction_y: known.persisted_scale_correction_y,
+    persisted_scale_correction_z: known.persisted_scale_correction_z,
+  });
+}
 
 export default function ProcessingLabPage() {
   const [takes, setTakes] = useState<TakeSummary[]>([]);
@@ -71,6 +121,7 @@ export default function ProcessingLabPage() {
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [hoveredObjectId, setHoveredObjectId] = useState<number | null>(null);
   const [hoveredArtifactId, setHoveredArtifactId] = useState<string | null>(null);
+  const [hoverSample, setHoverSample] = useState<HoverInspectionSample | null>(null);
   const [overlayDebug, setOverlayDebug] = useState<OverlayDebugInfo | null>(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState("mining_steel_ball_classification_2d_reflectance_mvp");
   const [selectedInputType, setSelectedInputType] = useState("rgb_image");
@@ -113,6 +164,7 @@ export default function ProcessingLabPage() {
   const [planeQaParams, setPlaneQaParams] = useState<PlaneQaTuningParams | null>(null);
   const [planeQaPersistedParams, setPlaneQaPersistedParams] = useState<PlaneQaTuningParams | null>(null);
   const [planeQaDirty, setPlaneQaDirty] = useState(false);
+  const [pipelineDefaults25d, setPipelineDefaults25d] = useState<Record<string, unknown>>({});
   const [fusionInputs, setFusionInputs] = useState<FusionInputBundle | null>(null);
   const [fusionPreview, setFusionPreview] = useState<FusionPreviewResult | null>(null);
   const [fusionRuns, setFusionRuns] = useState<FusionRunRecord[]>([]);
@@ -126,7 +178,16 @@ export default function ProcessingLabPage() {
   const [bindingPurpose, setBindingPurpose] = useState<"acquisition_inspection" | "fusion">("acquisition_inspection");
   const [pipelineActionBusy, setPipelineActionBusy] = useState(false);
   const [pipelineActionMessage, setPipelineActionMessage] = useState<string | null>(null);
+  const [roiEditModeActive, setRoiEditModeActive] = useState(false);
+  const [roiEditStatus, setRoiEditStatus] = useState<RoiEditStatus>("idle");
   const [resultStale, setResultStale] = useState(false);
+  const [debugMode, setDebugMode] = useState<StudioDebugMode>("operator");
+  const selectedTakeIdRef = useRef(selectedTakeId);
+
+  useEffect(() => {
+    selectedTakeIdRef.current = selectedTakeId;
+  }, [selectedTakeId]);
+
 
   const load = useCallback(async () => {
     const [
@@ -173,14 +234,33 @@ export default function ProcessingLabPage() {
     setLatestPublishedResult(nextLatestPublished);
     setSelectedPipelineInstanceId((current) => current || nextInstances[0]?.id || "");
     setSelectedPipelineId((current) => current || nextPipelines[0]?.id || "3d_ball_inspection");
-    const nextTakeId = selectedTakeId || nextTakes[0]?.take_id || "";
+    const nextTakeId = resolveNextSelectedTakeId({
+      currentSelectedTakeId: selectedTakeIdRef.current,
+      availableTakeIds: nextTakes.map((take) => take.take_id),
+      preferredTakeId: nextTakes[0]?.take_id ?? null,
+    }) ?? "";
     setSelectedTakeId(nextTakeId);
-    setDetail(nextTakeId ? await api.take(nextTakeId) : null);
-  }, [selectedSession, selectedDataset, selectedTakeId, validationFilter, tagFilter, takeSearch, showArchived]);
+  }, [selectedSession, selectedDataset, validationFilter, tagFilter, takeSearch, showArchived]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedTakeId) {
+      setDetail(null);
+      return () => { cancelled = true; };
+    }
+    void api.take(selectedTakeId).then((nextDetail) => {
+      if (cancelled) return;
+      setDetail(nextDetail);
+    }).catch(() => {
+      if (cancelled) return;
+      setDetail(null);
+    });
+    return () => { cancelled = true; };
+  }, [selectedTakeId]);
 
   const selectedPipeline = useMemo(
     () => pipelines.find((pipeline) => pipeline.id === selectedPipelineId) ?? pipelines[0] ?? null,
@@ -223,10 +303,45 @@ export default function ProcessingLabPage() {
     setTabFallbackMessage(null);
   }, [canonicalSelectedStageId]);
   useEffect(() => {
+    let cancelled = false;
+    void api.pipelineDefaults25d().then((response) => {
+      if (cancelled) return;
+      setPipelineDefaults25d(response.defaults || {});
+    }).catch(() => {
+      if (cancelled) return;
+      setPipelineDefaults25d({});
+    });
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
     if (selectedPipeline?.id !== "mining_steel_ball_classification_25d" || !detail) return;
+    const localSaved = read25dSavedDefaults();
+    const saved: Record<string, unknown> = { ...localSaved, ...pipelineDefaults25d };
     const fromResult = (((detail.result as unknown as Record<string, unknown> | null) ?? {})["stage_params"] as Record<string, unknown> | undefined) ?? {};
-    const detect = (fromResult.detect_belt_plane as Record<string, unknown> | undefined) ?? {};
-    const seg = (fromResult.remove_belt_segment_objects as Record<string, unknown> | undefined) ?? {};
+    const detect = {
+      ...((saved.detect_belt_plane as Record<string, unknown> | undefined) ?? {}),
+      ...((fromResult.detect_belt_plane as Record<string, unknown> | undefined) ?? {}),
+    };
+    const seg = {
+      ...((saved.remove_belt_segment_objects as Record<string, unknown> | undefined) ?? {}),
+      ...((fromResult.remove_belt_segment_objects as Record<string, unknown> | undefined) ?? {}),
+    };
+    const savedKnown = (saved.known_object_25d as Record<string, unknown> | undefined) ?? {};
+    const resultKnown = (fromResult.known_object_25d as Record<string, unknown> | undefined) ?? {};
+    const savedPersistedScale = persistedScaleFromKnown(savedKnown);
+    const resultPersistedScale = persistedScaleFromKnown(resultKnown);
+    const persistedScale =
+      savedPersistedScale && !isIdentityScaleCorrection(savedPersistedScale)
+        ? savedPersistedScale
+        : resultPersistedScale ?? savedPersistedScale;
+    const known: Record<string, unknown> = {
+      ...savedKnown,
+      ...resultKnown,
+      apply_persisted_correction: savedKnown.apply_persisted_correction ?? resultKnown.apply_persisted_correction ?? true,
+      persisted_scale_correction_x: persistedScale?.x ?? savedKnown.persisted_scale_correction_x ?? resultKnown.persisted_scale_correction_x,
+      persisted_scale_correction_y: persistedScale?.y ?? savedKnown.persisted_scale_correction_y ?? resultKnown.persisted_scale_correction_y,
+      persisted_scale_correction_z: persistedScale?.z ?? savedKnown.persisted_scale_correction_z ?? resultKnown.persisted_scale_correction_z,
+    };
     const defaults: PlaneQaTuningParams = {
       background_detection_strategy: String(detect.background_detection_strategy ?? "low_gradient_surface"),
       gradient_smoothing_kernel: Number(detect.gradient_smoothing_kernel ?? 3),
@@ -241,6 +356,13 @@ export default function ProcessingLabPage() {
       reference_surface_selection_mode: String(detect.reference_surface_selection_mode ?? "largest_constant_z"),
       reference_surface_model: String(detect.reference_surface_model ?? "auto"),
       reference_surface_max_plane_residual_p95_mm: Number(detect.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+      plane_fit_roi_enabled: Boolean((detect.plane_fit_roi as Record<string, unknown> | undefined)?.enabled ?? false),
+      plane_fit_roi_type: String((detect.plane_fit_roi as Record<string, unknown> | undefined)?.type ?? "rectangle"),
+      plane_fit_roi_x: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.x ?? 0),
+      plane_fit_roi_y: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.y ?? 0),
+      plane_fit_roi_width: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.width ?? 0),
+      plane_fit_roi_height: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.height ?? 0),
+      plane_fit_roi_points: ((detect.plane_fit_roi as Record<string, unknown> | undefined)?.points as Array<[number, number]> | undefined) ?? [],
       object_min_height_mm: Number(seg.min_height_mm ?? 8.0),
       object_max_height_mm: seg.max_height_mm == null ? null : Number(seg.max_height_mm),
       reference_tolerance_mm: Number(seg.reference_tolerance_mm ?? 0.0),
@@ -249,11 +371,24 @@ export default function ProcessingLabPage() {
       min_component_area: Number(seg.min_component_area ?? 120),
       fill_holes: Boolean(seg.fill_holes ?? true),
       smoothing_kernel: Number(seg.smoothing_kernel ?? 3),
+      known_object_enabled: Boolean(known.enabled ?? false),
+      known_object_apply_correction: Boolean(known.apply_correction ?? true),
+      known_object_label: String(known.object_label ?? "cube"),
+      known_object_target_selection: String(known.target_selection ?? "largest_component"),
+      known_object_manual_component_id: Number(known.manual_component_id ?? 1),
+      known_width_mm: Number(known.known_width_mm ?? 40),
+      known_depth_mm: Number(known.known_depth_mm ?? 40),
+      known_height_mm: Number(known.known_height_mm ?? 25),
+      known_tolerance_percent: Number(known.tolerance_percent ?? 5),
+      known_object_apply_persisted_correction: Boolean(known.apply_persisted_correction ?? true),
+      known_object_persisted_scale_correction_x: known.persisted_scale_correction_x == null ? null : Number(known.persisted_scale_correction_x),
+      known_object_persisted_scale_correction_y: known.persisted_scale_correction_y == null ? null : Number(known.persisted_scale_correction_y),
+      known_object_persisted_scale_correction_z: known.persisted_scale_correction_z == null ? null : Number(known.persisted_scale_correction_z),
     };
     setPlaneQaParams(defaults);
     setPlaneQaPersistedParams(defaults);
     setPlaneQaDirty(false);
-  }, [selectedPipeline?.id, detail?.take_id, detail?.result]);
+  }, [selectedPipeline?.id, detail?.take_id, detail?.result, pipelineDefaults25d]);
   const detectionViewResolutionError = useMemo(() => {
     if (canonicalSelectedStageId !== "detection") return null;
     const ids = new Set(stageSemantic.views.map((view) => view.id));
@@ -275,18 +410,22 @@ export default function ProcessingLabPage() {
   const morphologyStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "morphology");
   const ellipseStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "ellipse_fitting");
   const blobStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "blob_detection");
-  const roiEnabled = Boolean(thresholdStep?.params?.roi_enabled);
-  const roiType = (String(thresholdStep?.params?.roi_type ?? "rectangle") === "polygon" ? "polygon" : "rectangle") as "rectangle" | "polygon";
-  const activeRoi = roiEnabled
+  const roiEnabled = Boolean(planeQaParams?.plane_fit_roi_enabled ?? false);
+  const roiType = (() => {
+    const raw = String(planeQaParams?.plane_fit_roi_type ?? "rectangle");
+    if (raw === "polygon" || raw === "vertical_band") return raw;
+    return "rectangle";
+  })() as RoiType;
+  const activeRoi = roiEnabled && roiType !== "polygon"
     ? {
-      x: Number(thresholdStep?.params?.roi_x ?? 0),
-      y: Number(thresholdStep?.params?.roi_y ?? 0),
-      width: Number(thresholdStep?.params?.roi_width ?? 0),
-      height: Number(thresholdStep?.params?.roi_height ?? 0),
+      x: Number(planeQaParams?.plane_fit_roi_x ?? 0),
+      y: roiType === "vertical_band" ? 0 : Number(planeQaParams?.plane_fit_roi_y ?? 0),
+      width: Number(planeQaParams?.plane_fit_roi_width ?? 0),
+      height: roiType === "vertical_band" ? Number(planeQaParams?.plane_fit_roi_height ?? 0) : Number(planeQaParams?.plane_fit_roi_height ?? 0),
     }
     : null;
   const activeRoiPolygon = roiEnabled && roiType === "polygon"
-    ? (((thresholdStep?.params?.roi_polygon_points as Array<[number, number]> | undefined) ?? []).map((point) => [Number(point[0]), Number(point[1])] as [number, number]))
+    ? (((planeQaParams?.plane_fit_roi_points as Array<[number, number]> | undefined) ?? []).map((point) => [Number(point[0]), Number(point[1])] as [number, number]))
     : null;
   useEffect(() => {
     if (!thresholdStep) {
@@ -578,6 +717,32 @@ export default function ProcessingLabPage() {
   function selectStage(stageId: string) {
     setSelectedStageId(stageId);
     setSelectedArtifactId(null);
+    setRoiEditModeActive(false);
+    setRoiEditStatus("idle");
+  }
+
+  function detectStageIdFromPipeline(): string | null {
+    const stages = selectedPipeline?.stages ?? [];
+    const found = stages.find((stage) => canonicalStageId(stage.id, stage.display_name) === "detect_belt_plane");
+    return found?.id ?? null;
+  }
+
+  function startVisualRoiEdit() {
+    const detectStageId = detectStageIdFromPipeline();
+    if (detectStageId && detectStageId !== selectedStageId) {
+      setSelectedStageId(detectStageId);
+      setSelectedArtifactId(null);
+    }
+    setActiveTab("raw_heightmap");
+    setRoiEditModeActive(true);
+    setRoiEditStatus("active");
+    setPipelineActionMessage("Draw reference-surface ROI");
+  }
+
+  function cancelVisualRoiEdit() {
+    setRoiEditModeActive(false);
+    setRoiEditStatus("idle");
+    setPipelineActionMessage("ROI edit cancelled.");
   }
 
   function selectPipeline(pipelineId: string) {
@@ -641,6 +806,31 @@ export default function ProcessingLabPage() {
         reference_surface_selection_mode: String(planeQaParams.reference_surface_selection_mode ?? "largest_constant_z"),
         reference_surface_model: String(planeQaParams.reference_surface_model ?? "auto"),
         reference_surface_max_plane_residual_p95_mm: Number(planeQaParams.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+        plane_fit_roi: Boolean(planeQaParams.plane_fit_roi_enabled ?? false)
+          ? (
+            String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "polygon"
+              ? {
+                enabled: true,
+                type: "polygon",
+                points: ((planeQaParams.plane_fit_roi_points as Array<[number, number]> | undefined) ?? []).map(([x, y]) => [Math.round(Number(x)), Math.round(Number(y))]),
+              }
+              : String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band"
+                ? {
+                  enabled: true,
+                  type: "vertical_band",
+                  x: Number(planeQaParams.plane_fit_roi_x ?? 0),
+                  width: Number(planeQaParams.plane_fit_roi_width ?? 0),
+                }
+              : {
+                enabled: true,
+                type: "rectangle",
+                x: Number(planeQaParams.plane_fit_roi_x ?? 0),
+                y: Number(planeQaParams.plane_fit_roi_y ?? 0),
+                width: Number(planeQaParams.plane_fit_roi_width ?? 0),
+                height: Number(planeQaParams.plane_fit_roi_height ?? 0),
+              }
+          )
+          : null,
       },
       remove_belt_segment_objects: {
         min_height_mm: Number(planeQaParams.object_min_height_mm ?? 8.0),
@@ -651,6 +841,21 @@ export default function ProcessingLabPage() {
         min_component_area: Number(planeQaParams.min_component_area ?? 120),
         fill_holes: Boolean(planeQaParams.fill_holes ?? true),
         smoothing_kernel: Number(planeQaParams.smoothing_kernel ?? 3),
+      },
+      known_object_25d: {
+        enabled: Boolean(planeQaParams.known_object_enabled ?? false),
+        apply_correction: Boolean(planeQaParams.known_object_apply_correction ?? true),
+        object_label: String(planeQaParams.known_object_label ?? "cube"),
+        target_selection: String(planeQaParams.known_object_target_selection ?? "largest_component"),
+        manual_component_id: Number(planeQaParams.known_object_manual_component_id ?? 1),
+        known_width_mm: Number(planeQaParams.known_width_mm ?? 40),
+        known_depth_mm: Number(planeQaParams.known_depth_mm ?? 40),
+        known_height_mm: Number(planeQaParams.known_height_mm ?? 25),
+        tolerance_percent: Number(planeQaParams.known_tolerance_percent ?? 5),
+        apply_persisted_correction: Boolean(planeQaParams.known_object_apply_persisted_correction ?? true),
+        persisted_scale_correction_x: planeQaParams.known_object_persisted_scale_correction_x == null ? null : Number(planeQaParams.known_object_persisted_scale_correction_x),
+        persisted_scale_correction_y: planeQaParams.known_object_persisted_scale_correction_y == null ? null : Number(planeQaParams.known_object_persisted_scale_correction_y),
+        persisted_scale_correction_z: planeQaParams.known_object_persisted_scale_correction_z == null ? null : Number(planeQaParams.known_object_persisted_scale_correction_z),
       },
     };
   }
@@ -673,6 +878,9 @@ export default function ProcessingLabPage() {
       const refreshed = await api.take(detail.take_id);
       setDetail(refreshed);
       setPipelineActionMessage(`Run updated: ${response.run_id ?? refreshed?.result?.processed_at ?? "completed"}`);
+      if (roiEditStatus === "rerun_required" || roiEditStatus === "saved") {
+        setRoiEditStatus("saved");
+      }
       if (response.run_id) {
         setSelectedArtifactId(null);
         setSelectedObjectId(null);
@@ -692,6 +900,73 @@ export default function ProcessingLabPage() {
     if (rerun) {
       void runSelectedPipeline(false, build25dStageParams());
     }
+  }
+
+  async function save25dParamsAsDefaults() {
+    const params = build25dStageParams();
+    if (!params || typeof window === "undefined") return;
+    const existingSaved = read25dSavedDefaults();
+    const existingSavedScale = persistedScaleFromKnown((existingSaved.known_object_25d as Record<string, unknown> | undefined) ?? {});
+    const knownScale = detail?.result?.artifacts?.find((item) => item.artifact_id === "known_object_scale_validation");
+    const knownMeta = (knownScale?.metadata ?? {}) as Record<string, unknown>;
+    let scale = scaleCorrectionFromRecord(knownMeta);
+    if (!scale && knownScale?.path && detail?.take_id) {
+      try {
+        const response = await fetch(fileUrl(detail.take_id, knownScale.path));
+        if (response.ok) {
+          scale = scaleCorrectionFromRecord(await response.json() as Record<string, unknown>);
+        }
+      } catch {
+        scale = null;
+      }
+    }
+    if (!scale) {
+      const correctedObject = detail?.result?.objects?.find((item) => {
+        const applied = (item as Record<string, unknown>).scale_correction_applied;
+        return applied && typeof applied === "object";
+      }) as Record<string, unknown> | undefined;
+      scale = scaleCorrectionFromRecord(correctedObject?.scale_correction_applied as Record<string, unknown> | undefined);
+    }
+    if (isIdentityScaleCorrection(scale) && existingSavedScale && !isIdentityScaleCorrection(existingSavedScale)) {
+      scale = existingSavedScale;
+    }
+    const nextKnown = { ...(params.known_object_25d as Record<string, unknown>) };
+    if (scale) {
+      nextKnown.enabled = false;
+      nextKnown.apply_persisted_correction = true;
+      nextKnown.persisted_scale_correction_x = scale.x;
+      nextKnown.persisted_scale_correction_y = scale.y;
+      nextKnown.persisted_scale_correction_z = scale.z;
+    }
+    const nextParams = { ...params, known_object_25d: nextKnown };
+    window.localStorage.setItem(SENSOR_STUDIO_25D_DEFAULTS_KEY, JSON.stringify(nextParams));
+    let nextPlaneQaParams = planeQaParams;
+    if (scale && planeQaParams) {
+      nextPlaneQaParams = {
+        ...planeQaParams,
+        known_object_enabled: false,
+        known_object_apply_persisted_correction: true,
+        known_object_persisted_scale_correction_x: scale.x,
+        known_object_persisted_scale_correction_y: scale.y,
+        known_object_persisted_scale_correction_z: scale.z,
+      };
+      setPlaneQaParams(nextPlaneQaParams);
+    }
+    setPipelineActionBusy(true);
+    setPipelineActionMessage("Saving 25D defaults to server…");
+    try {
+      const saved = await api.savePipelineDefaults25d(nextParams);
+      setPipelineDefaults25d(saved.defaults || nextParams);
+      setPipelineActionMessage(scale
+        ? `Saved 25D defaults to server with XYZ scale ${scale.x.toFixed(4)}, ${scale.y.toFixed(4)}, ${scale.z.toFixed(4)}.`
+        : "Saved 25D tuning defaults to server. No XYZ scale factors detected in this run.");
+    } catch (err) {
+      setPipelineActionMessage(`Save defaults failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setPipelineActionBusy(false);
+    }
+    setPlaneQaPersistedParams(nextPlaneQaParams);
+    setPlaneQaDirty(false);
   }
 
   async function clearSelectedOutputs() {
@@ -875,69 +1150,79 @@ export default function ProcessingLabPage() {
   }
 
   async function applyRoi(roi: RoiRect, rerun = false) {
-    if (!selectedPipelineInstance) return;
-    const configured_steps = selectedPipelineInstance.configured_steps.map((step) =>
-      step.step_id === "threshold"
-        ? {
-          ...step,
-          params: {
-            ...step.params,
-            roi_enabled: true,
-            roi_type: "rectangle",
-            roi_x: roi.x,
-            roi_y: roi.y,
-            roi_width: roi.width,
-            roi_height: roi.height,
-          },
-        }
-        : step
-    );
-    const next = await api.updatePipelineInstance(selectedPipelineInstance.id, { configured_steps });
-    setPipelineInstances((items) => items.map((item) => (item.id === next.id ? next : item)));
+    const nextType = (String(planeQaParams?.plane_fit_roi_type ?? "rectangle") === "vertical_band" ? "vertical_band" : "rectangle") as RoiType;
+    setPlaneQaParams((current) => current ? {
+      ...current,
+      plane_fit_roi_enabled: true,
+      plane_fit_roi_type: nextType,
+      plane_fit_roi_x: roi.x,
+      plane_fit_roi_y: nextType === "vertical_band" ? 0 : roi.y,
+      plane_fit_roi_width: roi.width,
+      plane_fit_roi_height: roi.height,
+      plane_fit_roi_points: [],
+    } : current);
+    setPlaneQaDirty(true);
+    setRoiEditStatus("unsaved");
     if (rerun && detail && selectedPipeline) {
-      await runSelectedPipeline(false);
+      await runSelectedPipeline(false, {
+        ...(build25dStageParams() ?? {}),
+        detect_belt_plane: {
+          ...((build25dStageParams()?.detect_belt_plane as Record<string, unknown> | undefined) ?? {}),
+          plane_fit_roi: {
+            enabled: true,
+            type: nextType,
+            x: roi.x,
+            width: roi.width,
+            ...(nextType === "vertical_band"
+              ? {}
+              : { y: roi.y, height: roi.height }),
+          },
+        },
+      });
+      setRoiEditModeActive(false);
+      setRoiEditStatus("saved");
+      return;
     }
+    setRoiEditModeActive(false);
+    setRoiEditStatus("rerun_required");
   }
 
   async function applyPolygonRoi(points: RoiPolygon, rerun = false) {
-    if (!selectedPipelineInstance) return;
-    const configured_steps = selectedPipelineInstance.configured_steps.map((step) =>
-      step.step_id === "threshold"
-        ? {
-          ...step,
-          params: {
-            ...step.params,
-            roi_enabled: true,
-            roi_type: "polygon",
-            roi_polygon_points: points.map(([x, y]) => [Math.round(x), Math.round(y)]),
-          },
-        }
-        : step
-    );
-    const next = await api.updatePipelineInstance(selectedPipelineInstance.id, { configured_steps });
-    setPipelineInstances((items) => items.map((item) => (item.id === next.id ? next : item)));
+    if (points.length < 3) return;
+    const normalized = points.map(([x, y]) => [Math.round(Number(x)), Math.round(Number(y))] as [number, number]);
+    setPlaneQaParams((current) => current ? {
+      ...current,
+      plane_fit_roi_enabled: true,
+      plane_fit_roi_type: "polygon",
+      plane_fit_roi_points: normalized,
+    } : current);
+    setPlaneQaDirty(true);
+    setRoiEditStatus("unsaved");
     if (rerun && detail && selectedPipeline) {
-      await runSelectedPipeline(false);
+      await runSelectedPipeline(false, {
+        ...(build25dStageParams() ?? {}),
+        detect_belt_plane: {
+          ...((build25dStageParams()?.detect_belt_plane as Record<string, unknown> | undefined) ?? {}),
+          plane_fit_roi: {
+            enabled: true,
+            type: "polygon",
+            points: normalized,
+          },
+        },
+      });
+      setRoiEditModeActive(false);
+      setRoiEditStatus("saved");
+      return;
     }
+    setRoiEditModeActive(false);
+    setRoiEditStatus("rerun_required");
   }
 
   async function clearRoi() {
-    if (!selectedPipelineInstance) return;
-    const configured_steps = selectedPipelineInstance.configured_steps.map((step) =>
-      step.step_id === "threshold"
-        ? {
-          ...step,
-          params: {
-            ...step.params,
-            roi_enabled: false,
-            roi_type: "rectangle",
-            roi_polygon_points: [],
-          },
-        }
-        : step
-    );
-    const next = await api.updatePipelineInstance(selectedPipelineInstance.id, { configured_steps });
-    setPipelineInstances((items) => items.map((item) => (item.id === next.id ? next : item)));
+    setPlaneQaParams((current) => current ? { ...current, plane_fit_roi_enabled: false, plane_fit_roi_type: "rectangle", plane_fit_roi_points: [] } : current);
+    setPlaneQaDirty(true);
+    setRoiEditModeActive(false);
+    setRoiEditStatus("rerun_required");
   }
 
   async function applyBlobParams(params: Record<string, unknown>, rerun = false) {
@@ -1265,15 +1550,18 @@ export default function ProcessingLabPage() {
           {filteredTakes.map((take) => (
             <button className={take.take_id === selectedTakeId ? "active" : ""} key={take.take_id} onClick={() => setSelectedTakeId(take.take_id)} type="button">
               <strong>{take.friendly_name || take.take_id}</strong>
-              <small>{take.take_id}</small>
-              {take.thumbnail_path && <img alt={take.friendly_name || take.take_id} className="take-thumb" src={fileUrl(take.take_id, take.thumbnail_path)} />}
-              <small>Operator tags: {take.tags?.join(", ") || "-"}</small>
-              <small>Semantic labels: {take.semantic_labels?.join(", ") || "-"}</small>
-              <small>Superclass: {take.superclass_labels?.join(", ") || "-"}</small>
-              <small>{take.modalities?.join(", ") || "no modalities"}</small>
-              <small>Validation: {take.validation_status ?? "unreviewed"}</small>
-              <small>Latest run: {take.latest_run_status ?? "never"}</small>
-              <small>{compactTakeFamilyStatus(take.processing_by_family, take.modalities)}</small>
+              {take.friendly_name && take.friendly_name !== take.take_id && <small>{take.take_id}</small>}
+              <div className="take-card-main">
+                {take.thumbnail_path ? (
+                  <img alt={take.friendly_name || take.take_id} className="take-thumb" src={fileUrl(take.take_id, take.thumbnail_path)} />
+                ) : (
+                  <div aria-hidden className="take-thumb take-thumb-empty" />
+                )}
+                <div className="take-class-meta">
+                  <small>Class: {take.semantic_labels?.join(", ") || "-"}</small>
+                  <small>Superclass: {take.superclass_labels?.join(", ") || "-"}</small>
+                </div>
+              </div>
             </button>
           ))}
         </div>
@@ -1381,205 +1669,35 @@ export default function ProcessingLabPage() {
       </aside>
 
       <section className="studio-center">
-        <header className="studio-workspace-header">
-          <div>
-            <span className="eyebrow">Selected take</span>
-            <h1>{detail?.take_id ?? "No take selected"}</h1>
-            <p>{detail?.modalities?.join(", ") || "Select a take to inspect modalities, stages, artifacts, and results."}</p>
-          </div>
-          <div className="studio-actions">
-            <button disabled={!compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(false)} type="button">Run pipeline</button>
-            <button
-              disabled={!compatible || !selectedStage || !selectedPipeline?.supports_partial_stages || pipelineActionBusy}
-              title={
-                !compatible
-                  ? "Cannot execute: incompatible modalities."
-                  : !selectedPipeline?.supports_partial_stages
-                    ? "This pipeline does not support partial stage execution."
-                    : ""
-              }
-              onClick={() => void runSelectedPipeline(false)}
-              type="button"
-            >
-              Run until selected stage
-            </button>
+        <header className="studio-workspace-toolbar">
+          <span className="toolbar-chip">Take: {detail?.take_id ?? "none"}</span>
+          <label className="toolbar-chip">
+            Pipeline
+            <select value={selectedPipelineId} onChange={(event) => selectPipeline(event.target.value)}>
+              {pipelines.map((pipeline) => (
+                <option key={pipeline.id} value={pipeline.id}>{pipeline.display_name}</option>
+              ))}
+            </select>
+          </label>
+          <label className="toolbar-chip">
+            Stage
+            <select value={selectedStageId} onChange={(event) => selectStage(event.target.value)}>
+              {(selectedPipeline?.stages ?? []).map((stage) => (
+                <option key={stage.id} value={stage.id}>{prettyStageLabel(stage.id, stage.display_name)}</option>
+              ))}
+            </select>
+          </label>
+          <span className={`toolbar-chip ${compatible ? "ok" : "warn"}`}>{compatible ? "compatible" : "incompatible"}</span>
+          <div className="studio-actions toolbar-actions">
+            <button disabled={!compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(false)} type="button">Run</button>
             <button disabled={!detail || !compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(true)} type="button">Reprocess</button>
-            <button disabled={!detail || pipelineActionBusy} onClick={() => void clearSelectedOutputs()} type="button">Clear outputs</button>
+            <button disabled={!detail || pipelineActionBusy} onClick={() => void clearSelectedOutputs()} type="button">Clear</button>
           </div>
-          {pipelineActionMessage && <small className={resultStale ? "preview-stale" : "section-note"}>{pipelineActionMessage}</small>}
-          {!compatible && selectedPipeline && (
-            <p>{incompatibleModalityMessage(selectedPipeline, detail?.modalities) ?? "Cannot execute: incompatible modalities."}</p>
-          )}
         </header>
-
-        <PipelineStatusPanel
-          compact
-          result={detail?.result ?? null}
-          runtimeState={runtimeState}
-          detail={detail}
-          pipelines={pipelines}
-          selectedPipelineId={selectedPipelineId}
-          onSelectPipeline={selectPipeline}
-          pipelineSearch={pipelineSearch}
-          onPipelineSearchChange={setPipelineSearch}
-          pipelineFamilyFilter={pipelineFamilyFilter}
-          onPipelineFamilyFilterChange={setPipelineFamilyFilter}
-        />
-        <section className="concept-panel compact studio-run-summary">
-          <div className="concept-heading">
-            <span className="eyebrow">Runtime worker health</span>
-            <strong>Engineering supervision only</strong>
-          </div>
-          <div className="pipeline-status-grid">
-            <div>
-              <span>RGB worker</span>
-              <strong><span className={`status-badge status-${workerBadgeLabel(rgbWorkerStatus)}`}>{workerBadgeLabel(rgbWorkerStatus)}</span></strong>
-            </div>
-            <div>
-              <span>2.5D worker</span>
-              <strong><span className={`status-badge status-${workerBadgeLabel(worker25dStatus)}`}>{workerBadgeLabel(worker25dStatus)}</span></strong>
-            </div>
-            <div>
-              <span>Fusion worker</span>
-              <strong><span className={`status-badge status-${workerBadgeLabel(fusionWorkerStatus)}`}>{workerBadgeLabel(fusionWorkerStatus)}</span></strong>
-            </div>
-            <div>
-              <span>Latest published result</span>
-              <strong>
-                {latestPublishedResult ? `${latestPublishedResult.id} (${latestPublishedResult.status})` : "none"}
-              </strong>
-            </div>
-          </div>
-        </section>
-        <section className="concept-panel compact studio-run-summary">
-          <div className="concept-heading">
-            <span className="eyebrow">Active binding visibility</span>
-            <strong>Read-only ProcessBinding lookup</strong>
-          </div>
-          <div className="studio-actions">
-            <label className="field-label">
-              Purpose
-              <select value={bindingPurpose} onChange={(event) => setBindingPurpose(event.target.value as "acquisition_inspection" | "fusion")}>
-                <option value="acquisition_inspection">acquisition_inspection</option>
-                <option value="fusion">fusion</option>
-              </select>
-            </label>
-          </div>
-          <div className="pipeline-status-grid">
-            <div>
-              <span>source_id</span>
-              <strong>{selectedBindingSource ?? "-"}</strong>
-            </div>
-            <div>
-              <span>modality</span>
-              <strong>{selectedModalityForBinding}</strong>
-            </div>
-            <div>
-              <span>pipeline_id</span>
-              <strong>{activeBinding?.pipeline_id ?? "-"}</strong>
-            </div>
-            <div>
-              <span>active_recipe_version_id</span>
-              <strong>{activeBinding?.active_recipe_version_id ?? "-"}</strong>
-            </div>
-          </div>
-          {!activeBinding && <small className="section-note">No active binding found for selected source/modality/purpose.</small>}
-        </section>
-
-        <section className="studio-stage-strip" aria-label="Stage navigator">
-          {(selectedPipeline?.stages ?? []).map((stage, index) => {
-            const canonicalStage = canonicalStageId(stage.id, stage.display_name);
-            const stageArtifacts = artifactsForStage(detail, canonicalStage);
-            const artifactCount = stageArtifacts.length;
-            const execStage = detail?.result?.pipeline_execution?.stages?.find((item) => item.stage_id === stage.id || item.stage_id === canonicalStage);
-            const timing = execStage?.duration_ms ?? stageTimingMs(detail?.result, stage.id) ?? stageTimingMs(detail?.result, canonicalStage);
-            const timingLabel = timing == null ? (artifactCount > 0 ? "completed" : "not run") : `${timing.toFixed(timing >= 100 ? 0 : 1)} ms`;
-            const semanticSummary = stageSemanticSummary(canonicalStage, detail, stageArtifacts, execStage);
-            return (
-              <button className={stage.id === selectedStageId ? "active" : ""} key={stage.id} onClick={() => selectStage(stage.id)} type="button">
-                <span>{index + 1}</span>
-                <strong>{prettyStageLabel(stage.id, stage.display_name)}</strong>
-                <small>{timingLabel}</small>
-                <small>{semanticSummary}</small>
-                <small>{artifactCount} artifacts • {execStage?.warnings?.length ?? 0} warnings • {execStage?.errors?.length ?? 0} errors</small>
-              </button>
-            );
-          })}
-        </section>
-        <section className="concept-panel compact studio-run-summary">
-          <div className="concept-heading">
-            <span className="eyebrow">Run context</span>
-            <strong>
-              {!selectedRunTrace ? "Never processed" : `${selectedRunTrace.id} • ${selectedRunTrace.status} • ${selectedRunTrace.duration.toFixed(1)} ms`}
-            </strong>
-          </div>
-          <div className="pipeline-status-grid">
-            <div><span>Pipeline</span><strong>{selectedPipeline?.display_name ?? "-"}</strong></div>
-            <div><span>Run</span><strong>{selectedRunTrace?.id ?? "-"}</strong></div>
-            <div><span>Status</span><strong>{selectedRunTrace?.status ?? familyStatus?.status ?? "-"}</strong></div>
-            <div><span>Timestamp</span><strong>{selectedRunTrace?.timestamp ?? familyStatus?.lastRunAt ?? "-"}</strong></div>
-          </div>
-          <details>
-            <summary>Trace details</summary>
-            <PipelineExecutionGraph execution={detail?.result?.pipeline_execution} selectedStageId={canonicalSelectedStageId} />
-          </details>
-        </section>
-        {activeAcquisitionGroupId && (
-          <section className="concept-panel compact studio-run-summary">
-            <div className="concept-heading">
-              <span className="eyebrow">Fusion readiness</span>
-              <strong>{activeAcquisitionGroupId}</strong>
-            </div>
-            {fusionLoading && <small>Loading fusion inputs...</small>}
-            {fusionError && <small>{fusionError}</small>}
-            {!fusionLoading && !fusionError && (
-              <>
-                <div className="pipeline-status-grid">
-                  <div><span>Status</span><strong>{fusionInputs?.readiness_status ?? "-"}</strong></div>
-                  <div><span>RGB take/run</span><strong>{fusionInputs?.rgb_take_id ?? "-"} / {fusionInputs?.rgb_run_id ?? "-"}</strong></div>
-                  <div><span>25D take/run</span><strong>{fusionInputs?.heightmap_take_id ?? "-"} / {fusionInputs?.heightmap_run_id ?? "-"}</strong></div>
-                  <div><span>Missing</span><strong>{(fusionInputs?.missing_inputs ?? []).join(", ") || "-"}</strong></div>
-                </div>
-                {!!(fusionPreview?.object_candidates?.length ?? 0) && (
-                  <div className="artifact-reference">
-                    <span>Object pairing</span>
-                    <strong>{fusionPreview?.object_candidates.length} candidates</strong>
-                    {(fusionPreview?.object_candidates ?? []).slice(0, 10).map((item) => (
-                      <small key={item.fusion_object_id}>
-                        {item.fusion_object_id}: rgb={item.rgb_object_id ?? "-"} / 25d={item.heightmap_object_id ?? "-"} / {item.matching_method} ({item.confidence.toFixed(2)})
-                      </small>
-                    ))}
-                  </div>
-                )}
-                <div className="studio-actions">
-                  <button type="button" onClick={() => void runFusionForGroup(false)} disabled={fusionLoading}>Run fusion</button>
-                  <button type="button" onClick={() => void runFusionForGroup(true)} disabled={fusionLoading}>Force run</button>
-                </div>
-                {latestFusionResult && (
-                  <div className="artifact-reference">
-                    <span>Latest fusion result</span>
-                    <strong>Run: {latestFusionRun?.fusion_run_id ?? fusionRuns[0]?.fusion_run_id ?? "-"}</strong>
-                    <small>Status: {latestFusionResult.status}</small>
-                    <small>Class counts: {JSON.stringify(latestFusionResult.class_counts ?? {})}</small>
-                    {!!latestFusionRun?.artifact_paths && <small>Artifacts: {Object.values(latestFusionRun.artifact_paths).join(" | ")}</small>}
-                    {(latestFusionResult.final_objects ?? []).slice(0, 10).map((row, idx) => (
-                      <small key={`fo_${idx}`}>
-                        {String(row.final_object_id ?? `obj_${idx + 1}`)} | {String(row.final_class ?? "-")} | {String(row.final_class_group ?? "-")} | {JSON.stringify(row.decision_reasons ?? [])}
-                      </small>
-                    ))}
-                  </div>
-                )}
-                {!!(fusionInputs?.warnings?.length ?? 0) && (
-                  <div className="artifact-reference">
-                    <span>Warnings</span>
-                    {(fusionInputs?.warnings ?? []).map((warning, idx) => <small key={`fw_${idx}`}>{warning}</small>)}
-                  </div>
-                )}
-              </>
-            )}
-          </section>
+        {pipelineActionMessage && <small className={resultStale ? "preview-stale" : "section-note"}>{pipelineActionMessage}</small>}
+        {!compatible && selectedPipeline && (
+          <small className="section-note">{incompatibleModalityMessage(selectedPipeline, detail?.modalities) ?? "Cannot execute: incompatible modalities."}</small>
         )}
-
         <section className="studio-result-workspace">
         <nav className="studio-workspace-tabs">
           {stageTabs.map((tab) => (
@@ -1593,9 +1711,11 @@ export default function ProcessingLabPage() {
 
         <section className="studio-workbench">
           <div className="studio-workbench-title">
-            <span className="eyebrow">Stage workspace</span>
+            <span className="eyebrow">Engineering workspace</span>
             <strong>{selectedStage ? prettyStageLabel(selectedStage.id, selectedStage.display_name) : "Workspace"}</strong>
           </div>
+          <div className="engineering-workbench-grid">
+          <aside className="engineering-parameter-sidebar">
           {canonicalSelectedStageId === "segmentation" && (
             <StageParameterPanel
               stage={selectedStage}
@@ -1643,6 +1763,58 @@ export default function ProcessingLabPage() {
                 <strong>Reference surface tuning</strong>
                 <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "In sync with last run payload")}</small>
               </div>
+              <div className="reference-surface-roi-block">
+                <strong>Reference surface region</strong>
+                <label>Enable ROI
+                  <input
+                    type="checkbox"
+                    checked={Boolean(planeQaParams.plane_fit_roi_enabled ?? false)}
+                    onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_enabled: e.target.checked } : c); setPlaneQaDirty(true); }}
+                  />
+                </label>
+                <div className="reference-surface-roi-grid">
+                  <label>Type
+                    <select value={String(planeQaParams.plane_fit_roi_type ?? "rectangle")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_type: e.target.value } : c); setPlaneQaDirty(true); }}>
+                      <option value="rectangle">rectangle</option>
+                      <option value="polygon">polygon</option>
+                      <option value="vertical_band">Vertical band ROI</option>
+                    </select>
+                  </label>
+                  <label>X
+                    <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_x ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_x: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                    <label>Y
+                      <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_y ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_y: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                    </label>
+                  )}
+                  <label>W
+                    <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_width ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_width: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                    <label>H
+                      <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_height ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_height: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                    </label>
+                  )}
+                </div>
+                <div className="reference-surface-roi-actions">
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => startVisualRoiEdit()}>Edit visually</button>
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => void clearRoi()}>Use full frame</button>
+                </div>
+                <div className="reference-surface-roi-status">
+                  <small>{roiEditModeActive ? "ROI edit mode active" : "ROI edit mode inactive"}</small>
+                  <small>{`ROI status: ${roiEditStatus}`}</small>
+                </div>
+                <small>
+                  ROI constrains only reference-surface estimation. Normalization and segmentation still run on the full valid frame.
+                </small>
+                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band" && (
+                  <small>Constrains processing to an X-range while preserving the full scan height.</small>
+                )}
+                <small>
+                  Workflow: 1) Set ROI on conveyor/background 2) Tune low-gradient parameters 3) Verify selected surface 4) Verify normalized height 5) Verify segmentation.
+                </small>
+              </div>
               <div className="segmentation-controls-row">
                 <label>Strategy
                   <select value={String(planeQaParams.background_detection_strategy ?? "low_gradient_surface")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, background_detection_strategy: e.target.value } : c); setPlaneQaDirty(true); }}>
@@ -1680,8 +1852,51 @@ export default function ProcessingLabPage() {
                 </label>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
               </div>
+            </section>
+          )}
+          {canonicalSelectedStageId === "load_heightmap" && planeQaParams && (
+            <section className="segmentation-controls-strip reference-surface-controls-strip">
+              <div className="stage-parameter-panel-header">
+                <strong>Reference surface region</strong>
+                <small>Set ROI here, then tune in Detect reference surface.</small>
+              </div>
+              <div className="reference-surface-roi-grid">
+                <label>Type
+                    <select value={String(planeQaParams.plane_fit_roi_type ?? "rectangle")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_type: e.target.value } : c); setPlaneQaDirty(true); }} >
+                    <option value="rectangle">rectangle</option>
+                    <option value="polygon">polygon</option>
+                    <option value="vertical_band">Vertical band ROI</option>
+                  </select>
+                </label>
+                <label>X
+                  <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_x ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_x: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                  <label>Y
+                    <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_y ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_y: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                )}
+                <label>W
+                  <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_width ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_width: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                  <label>H
+                    <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_height ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_height: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                )}
+              </div>
+              <div className="reference-surface-roi-actions">
+                <button type="button" disabled={pipelineActionBusy} onClick={() => startVisualRoiEdit()}>Edit visually</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => void clearRoi()}>Use full frame</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+              </div>
+              {String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band" && (
+                <small>Vertical band ROI constrains processing to an X-range while preserving the full scan height.</small>
+              )}
+              <small>ROI affects only reference-surface estimation (not full-frame normalization/segmentation).</small>
             </section>
           )}
           {canonicalSelectedStageId === "remove_belt_segment_objects" && planeQaParams && (
@@ -1717,29 +1932,49 @@ export default function ProcessingLabPage() {
                 </label>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
               </div>
             </section>
           )}
-          {canonicalSelectedStageId === "detect_belt_plane" && (() => {
-            const stageArtifacts = artifactsForStage(workspaceDetail, canonicalSelectedStageId);
-            const fit = (stageArtifacts.find((a) => a.artifact_id === "plane_fit_debug")?.metadata ?? {}) as Record<string, unknown>;
-            const sel = ((fit.background_selection as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-            const gdbg = ((sel.gradient_debug as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
-            const coeffs = (fit.plane_coefficients as unknown[] | undefined) ?? [];
-            return (
-              <section className="pipeline-status-grid">
-                <div><span>Strategy</span><strong>{String(sel.background_detection_strategy ?? fit.background_detection_strategy ?? "-")}</strong></div>
-                <div><span>Reference model</span><strong>{String(fit.reference_surface_model_type ?? "failed")}</strong></div>
-                <div><span>Plane calculated</span><strong>{String(fit.reference_surface_model_type ?? "") === "plane" ? "yes" : "no"}</strong></div>
-                <div><span>Constant Z</span><strong>{fit.constant_z_mm == null ? "-" : `${Number(fit.constant_z_mm).toFixed(3)} mm`}</strong></div>
-                <div><span>Surface coverage</span><strong>{`${(Number(gdbg.selected_component_area_ratio ?? 0) * 100).toFixed(1)}%`}</strong></div>
-                <div><span>Residual p95</span><strong>{fit.model_residual_p95_mm == null ? "-" : `${Number(fit.model_residual_p95_mm).toFixed(2)} mm`}</strong></div>
-                <div><span>Selection reason</span><strong>{String(fit.model_selection_reason ?? "-")}</strong></div>
-                <div><span>Plane coeffs</span><strong>{coeffs.length ? coeffs.map((v) => Number(v).toFixed(3)).join(", ") : "-"}</strong></div>
-              </section>
-            );
-          })()}
+          {(canonicalSelectedStageId === "fit_object_geometry" || canonicalSelectedStageId === "compute_height_metrics") && planeQaParams && (
+            <section className="segmentation-controls-strip reference-surface-controls-strip measurement-controls-strip">
+              <div className="stage-parameter-panel-header">
+                <strong>Measurement controls</strong>
+                <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "Known-cube calibration config")}</small>
+              </div>
+              <div className="measurement-controls-row">
+                <label>Enable
+                  <input type="checkbox" checked={Boolean(planeQaParams.known_object_enabled ?? false)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Apply correction
+                  <input type="checkbox" checked={Boolean(planeQaParams.known_object_apply_correction ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_apply_correction: e.target.checked, known_object_enabled: e.target.checked ? true : c.known_object_enabled } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Target
+                  <select value={String(planeQaParams.known_object_target_selection ?? "largest_component")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_target_selection: e.target.value } : c); setPlaneQaDirty(true); }}>
+                    <option value="largest_component">largest component</option>
+                    <option value="manual_component_id">object id</option>
+                    <option value="label_match">label match</option>
+                  </select>
+                </label>
+                <label>Width X mm
+                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_width_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_width_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Depth Y mm
+                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_depth_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_depth_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <label>Height Z mm
+                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_height_mm ?? 25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                </label>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
+                <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
+              </div>
+            </section>
+          )}
+          </aside>
+          <section className="engineering-visual-workspace">
           {renderStageSemanticView({
             detail: workspaceDetail,
             compatible,
@@ -1755,6 +1990,7 @@ export default function ProcessingLabPage() {
             hoveredArtifactId,
             onHoverArtifact: setHoveredArtifactId,
             onOverlayDebug: setOverlayDebug,
+            onHoverSample: setHoverSample,
             roi: activeRoi,
             roiPolygon: activeRoiPolygon,
             roiType,
@@ -1762,10 +1998,47 @@ export default function ProcessingLabPage() {
             onApplyRoi: (roi, rerun) => void applyRoi(roi, rerun),
             onApplyPolygonRoi: (points, rerun) => void applyPolygonRoi(points, rerun),
             onClearRoi: () => void clearRoi(),
+            roiEditModeActive,
+            roiEditStatus,
+            onCancelRoiEdit: () => cancelVisualRoiEdit(),
             blobParams: blobStep?.params ?? null,
             onApplyBlobParams: (params, rerun) => void applyBlobParams(params, rerun),
             onUpsertObjectAnnotation: (payload) => void upsertObjectAnnotation(payload),
+            debugMode: "engineering",
           })}
+          {canonicalSelectedStageId === "detect_belt_plane" && (() => {
+            const stageArtifacts = artifactsForStage(workspaceDetail, canonicalSelectedStageId);
+            const fit = (stageArtifacts.find((a) => a.artifact_id === "plane_fit_debug")?.metadata ?? {}) as Record<string, unknown>;
+            const sel = ((fit.background_selection as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+            const gdbg = ((sel.gradient_debug as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+            const roiDbg = ((fit.roi as Record<string, unknown> | undefined) ?? {}) as Record<string, unknown>;
+            const roiWarnings = (Array.isArray(fit.warnings) ? fit.warnings : []).map(String).filter((item) => item.startsWith("roi_"));
+            const coeffs = (fit.plane_coefficients as unknown[] | undefined) ?? [];
+            return (
+              <>
+                <section className="pipeline-status-grid">
+                  <div><span>Strategy</span><strong>{String(sel.background_detection_strategy ?? fit.background_detection_strategy ?? "-")}</strong></div>
+                  <div><span>Reference model</span><strong>{String(fit.reference_surface_model_type ?? "failed")}</strong></div>
+                  <div><span>Plane calculated</span><strong>{String(fit.reference_surface_model_type ?? "") === "plane" ? "yes" : "no"}</strong></div>
+                  <div><span>Constant Z</span><strong>{fit.constant_z_mm == null ? "-" : `${Number(fit.constant_z_mm).toFixed(3)} mm`}</strong></div>
+                  <div><span>Surface coverage</span><strong>{`${(Number(gdbg.selected_component_area_ratio ?? 0) * 100).toFixed(1)}%`}</strong></div>
+                  <div><span>Residual p95</span><strong>{fit.model_residual_p95_mm == null ? "-" : `${Number(fit.model_residual_p95_mm).toFixed(2)} mm`}</strong></div>
+                  <div><span>Selection reason</span><strong>{String(fit.model_selection_reason ?? "-")}</strong></div>
+                  <div><span>Plane coeffs</span><strong>{coeffs.length ? coeffs.map((v) => Number(v).toFixed(3)).join(", ") : "-"}</strong></div>
+                </section>
+                <section className="pipeline-status-grid">
+                  <div><span>ROI enabled</span><strong>{Boolean(roiDbg.enabled ?? false) ? "yes" : "no"}</strong></div>
+                  <div><span>ROI coverage</span><strong>{`${(Number(roiDbg.area_ratio ?? 1) * 100).toFixed(1)}%`}</strong></div>
+                  <div><span>ROI valid-pixel ratio</span><strong>{`${(Number(roiDbg.valid_pixel_ratio ?? 1) * 100).toFixed(1)}%`}</strong></div>
+                  <div><span>ROI candidate coverage</span><strong>{`${(Number(roiDbg.candidate_coverage_ratio ?? 0) * 100).toFixed(1)}%`}</strong></div>
+                  <div><span>ROI selected-surface coverage</span><strong>{`${(Number(roiDbg.selected_surface_coverage_ratio ?? 0) * 100).toFixed(1)}%`}</strong></div>
+                  <div><span>ROI warnings</span><strong>{roiWarnings.length ? roiWarnings.join(", ") : "-"}</strong></div>
+                </section>
+              </>
+            );
+          })()}
+          </section>
+          </div>
         </section>
         </section>
       </section>
@@ -1777,6 +2050,7 @@ export default function ProcessingLabPage() {
         selectedArtifact={focusedArtifact}
         overlayDebug={overlayDebug}
         selectedObjectId={focusedObject?.object_id ?? null}
+        hoverSample={hoverSample}
         stageId={canonicalSelectedStageId}
         onUpsertObjectAnnotation={(payload) => void upsertObjectAnnotation(payload)}
       />

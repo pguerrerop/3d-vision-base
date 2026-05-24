@@ -11,6 +11,7 @@ from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resol
 from vision_3d_acquisition.api.main import (
     health,
     latest,
+    list_operations_cards,
     pipelines,
     runtime_mjpeg_stream,
     runtime_preview_metadata,
@@ -141,6 +142,44 @@ def test_runtime_preview_metadata_endpoint(tmp_path: Path) -> None:
     assert payload["resolution"] == [640, 480]
     assert payload["stale"] is False
     assert payload["fps_estimate"] == 4.8
+
+
+def test_operations_cards_endpoint_returns_superclass_for_automatic_output(tmp_path: Path) -> None:
+    from vision_3d_acquisition.operations.summary import reindex_recent_operations_cards
+
+    settings = make_test_settings(tmp_path / "data")
+    take_id = "take_auto_25d"
+    incoming = settings.data_dir / "incoming" / take_id
+    processed = settings.data_dir / "processed" / take_id
+    incoming.mkdir(parents=True)
+    processed.mkdir(parents=True)
+    (incoming / "metadata.json").write_text(
+        json.dumps({"take_id": take_id, "created_at": "2026-05-22T11:00:00Z", "modalities": ["heightmap"], "source": "trispector_ftp"}),
+        encoding="utf-8",
+    )
+    (incoming / "runtime_state.json").write_text(
+        json.dumps({"take_id": take_id, "state": "completed", "source": "trispector_ftp"}),
+        encoding="utf-8",
+    )
+    (processed / "result.json").write_text(
+        json.dumps(
+            {
+                "take_id": take_id,
+                "status": "ok",
+                "processed_at": "2026-05-22T11:05:00Z",
+                "summary": {"label": "non_ball", "superclass": "SCRAP_METAL", "confidence": 0.77},
+                "objects": [{"object_id": 1, "label": "non_ball", "superclass": "SCRAP_METAL", "confidence": 0.77}],
+                "files": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reindex_recent_operations_cards(settings.data_dir, limit=10)
+    payload = list_operations_cards(limit=20, settings=settings)
+    card = next(item for item in payload["cards"] if item["take_id"] == take_id)
+    assert card["superclass"] == "SCRAP_METAL"
+    assert card["label"] == "non_ball"
 
 
 def test_sources_endpoint_reports_freshness(tmp_path: Path) -> None:

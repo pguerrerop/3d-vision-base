@@ -32,9 +32,23 @@ Files:
 
 Capabilities:
 - superclass mapping helper
+- sph3d fallback classifier (secondary pass for non-`BALL_GOOD`/non-`SCRAP_METAL` objects)
 - operations-card generation
 - preview fallback resolution
 - runtime index persistence (`data/runtime/operations_index.json`)
+
+### sph3d fallback (25D classifier refinement)
+Implemented in `classification_superclass.py`, invoked from `ClassifyMiningBall25DStage` after primary `_classify_25d` heuristics.
+
+Execution order:
+1. Primary good-ball rules run first (unchanged thresholds in `_classify_25d`).
+2. If result is `BALL_GOOD` or `SCRAP_METAL`, skip fallback entirely.
+3. Otherwise apply `feature_sphericity_3d` (`sph3d`) thresholds:
+   - `< 0.30` → `chatarra` / `SCRAP_METAL`
+   - `0.30–0.75` → `bola_con_chip` / `BALL_SCRAP`
+   - `>= 0.75` → keep primary label/superclass
+
+Thresholds are heuristic and calibration-oriented. Object payloads include `debug.sph3d_rule` and optional `classification_reason`. The previous `sphere_fit` object metric is now named `feature_footprint_roundness`. Superclass aggregation is unchanged.
 
 ### 4) Operations endpoint
 File: `vision_3d_acquisition/api/main.py`
@@ -85,3 +99,13 @@ No redesign/refactor of:
 - internal 2.5D pipeline architecture
 
 Operations path is additive and intentionally minimal.
+
+## Canonical height semantics alignment
+
+Operations remains lightweight, but semantic contracts are explicit:
+
+- classification and measurement-facing geometry semantics align to canonical `height_above_belt`;
+- preview imagery remains display-only and is not a numeric measurement source;
+- semantic lineage metadata (`derived_from`, `transform`) is retained so replay/debug tooling can reconstruct provenance without filename heuristics.
+
+This preserves the additive Operations design while keeping one geometry truth across Studio and runtime.

@@ -24,13 +24,41 @@ function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifa
       generated: "derived",
     } as StudioArtifact);
   };
+  const sourceMeta = (detail.metadata?.source && typeof detail.metadata.source === "object")
+    ? detail.metadata.source as Record<string, unknown>
+    : null;
+  const sourceRange = (sourceMeta?.height_preview_range_raw && typeof sourceMeta.height_preview_range_raw === "object")
+    ? sourceMeta.height_preview_range_raw as Record<string, unknown>
+    : null;
+  const sourceRangeMetadata = sourceRange ? {
+    min_mm: Number(sourceRange.min ?? 0),
+    max_mm: Number(sourceRange.max ?? 0),
+    units: String(sourceRange.units ?? "sensor_raw"),
+  } : {};
   const heightPreview = files.heightmap_preview;
+  const parserMetadataFile = typeof files.parser_metadata === "string" ? files.parser_metadata : null;
   if (typeof heightPreview === "string" && heightPreview) {
     pushNamed(
       "source_heightmap_preview",
       "Height preview",
       heightPreview,
-      { source_binding: true, source_group: "heightmap", source_key: "heightmap_preview", visualization_role: "primary" }
+      {
+        source_binding: true,
+        source_group: "heightmap",
+        source_key: "heightmap_preview",
+        visualization_role: "primary",
+        parser_metadata_file: parserMetadataFile,
+        // Source-bound heightmap previews are raw sensor-space heights. We tag
+        // them with the canonical semantic field so the height legend / hover
+        // resolver can derive a valid color mapping from `min_mm`/`max_mm`
+        // (from `height_preview_range_raw`) even before any processing runs.
+        // The LUT used by the third-party SDK preview is unknown; the canonical
+        // legend gradient may differ visually from the displayed PNG.
+        semantic_field: "raw_sensor_z",
+        is_measurement_authoritative: false,
+        source_preview_lut_unknown: true,
+        ...sourceRangeMetadata,
+      }
     );
   }
   const pick = (groupKey: string, keys: string[]) => {
@@ -38,11 +66,22 @@ function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifa
     for (const key of keys) {
       const filename = group[key];
       if (!filename) continue;
+      const meta: Record<string, unknown> = {
+        source_binding: true,
+        source_group: groupKey,
+        source_key: key,
+        visualization_role: groupKey === "heightmap" ? "primary" : "secondary",
+      };
+      if (groupKey === "heightmap") {
+        meta.semantic_field = "raw_sensor_z";
+        meta.source_preview_lut_unknown = true;
+        Object.assign(meta, sourceRangeMetadata);
+      }
       pushNamed(
         `source_${groupKey}_${key}`,
         `${groupKey.toUpperCase()} source`,
         filename,
-        { source_binding: true, source_group: groupKey, source_key: key, visualization_role: groupKey === "heightmap" ? "primary" : "secondary" }
+        meta,
       );
       return;
     }
