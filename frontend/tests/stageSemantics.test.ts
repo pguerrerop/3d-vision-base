@@ -8,6 +8,8 @@ test("classification stage defaults to overlay view", () => {
   assert.equal(semantic.category, "classification");
   assert.equal(semantic.defaultViewId, "overlay");
   assert.ok(semantic.views.some((view) => view.id === "overlay"));
+  assert.ok(semantic.views.some((view) => view.id === "rule_explanation"));
+  assert.ok(semantic.views.some((view) => view.id === "metric_details"));
 });
 
 test("25D load input defaults to height preview", () => {
@@ -44,4 +46,16 @@ test("25D normalize heights exposes histogram view", () => {
   assert.equal(semantic.category, "plane_qa");
   assert.equal(semantic.defaultViewId, "normalized_height");
   assert.ok(semantic.views.some((view) => view.id === "histogram"));
+});
+
+test("25D classify stage exposes rule explanation view", () => {
+  const semantic = stageSemanticDefinition("classify_25d");
+  assert.equal(semantic.category, "classification");
+  assert.ok(semantic.views.some((view) => view.id === "rule_explanation"));
+});
+
+test("25D measurement stage exposes geometry debug view", () => {
+  const semantic = stageSemanticDefinition("compute_height_metrics");
+  assert.equal(semantic.category, "measurement");
+  assert.ok(semantic.views.some((view) => view.id === "geometry_debug"));
 });

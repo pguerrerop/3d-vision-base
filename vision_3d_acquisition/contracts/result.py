@@ -156,6 +156,8 @@ class ResultFiles(BaseModel):
     heightmap: str | None = None
     heightmap_npz: str | None = None
     normalized_heightmap: str | None = None
+    classification_explanation: str | None = None
+    metric_explanation: str | None = None
     heightmap_metadata: str | None = None
     reflectance: str | None = None
     input_preview: str | None = None

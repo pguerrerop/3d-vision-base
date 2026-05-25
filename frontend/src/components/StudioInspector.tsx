@@ -88,6 +88,17 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
   const selectedCandidate = selectedObjectId == null
     ? null
     : objectCandidates.find((item) => Number(item.local_object_index) === selectedObjectId) ?? null;
+  const hasClassificationExplanationArtifact = artifacts.some((item) => item.artifact_id === "classification_explanation");
+  const explanationArtifact = artifacts.find((item) => item.artifact_id === "classification_explanation") ?? null;
+  const explanationRows = Array.isArray((explanationArtifact?.metadata as Record<string, unknown> | undefined)?.objects)
+    ? (((explanationArtifact?.metadata as Record<string, unknown> | undefined)?.objects as unknown[])
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null))
+    : [];
+  const explanationByObjectId = new Map<number, Record<string, unknown>>();
+  for (const row of explanationRows) {
+    const oid = Number(row.object_id ?? 0);
+    if (Number.isFinite(oid) && oid > 0) explanationByObjectId.set(oid, row);
+  }
   const artifactMeta = ((selectedArtifact?.metadata ?? {}) as Record<string, unknown>);
   const transformMeta = (artifactMeta.transform && typeof artifactMeta.transform === "object") ? (artifactMeta.transform as Record<string, unknown>) : null;
   // Resolve the canonical HeightColorMapping for the current take so we can
@@ -216,7 +227,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Connected components: {String(((componentsArtifact?.metadata as Record<string, unknown> | undefined)?.component_count) ?? detail?.result?.objects?.length ?? "-")}</small>
         </div>
       )}
-      <ObjectInspector object={object} producingStages={producingStages} />
+      <ObjectInspector object={object} producingStages={producingStages} explanationByObjectId={explanationByObjectId} />
       {!object && semantic.category === "geometry" && (
         <div className="inspector-section">
           <span>Blob candidate</span>
@@ -291,6 +302,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         <small>Target artifact: {selectedArtifact?.target_artifact_id ?? "-"}</small>
         <small>Path: {selectedArtifact?.path ?? "-"}</small>
         <small>Derived from: {lineage.length ? lineage.join(" | ") : "-"}</small>
+        <small>Debug: classification_explanation.json found: {hasClassificationExplanationArtifact ? "yes" : "no"}</small>
       </div>
       <div className="inspector-section">
         <span>Height semantics</span>
@@ -489,7 +501,15 @@ function ProjectionDebug({
   );
 }
 
-function ObjectInspector({ object, producingStages }: { object: StudioObject | null; producingStages: string[] }) {
+function ObjectInspector({
+  object,
+  producingStages,
+  explanationByObjectId,
+}: {
+  object: StudioObject | null;
+  producingStages: string[];
+  explanationByObjectId: Map<number, Record<string, unknown>>;
+}) {
   if (!object) {
     return (
       <div className="inspector-section">
@@ -499,6 +519,24 @@ function ObjectInspector({ object, producingStages }: { object: StudioObject | n
       </div>
     );
   }
+  const explanation = (
+    ((object as Record<string, unknown>).classification_explanation ?? null)
+    || explanationByObjectId.get(Number(object.object_id))
+    || null
+  ) as Record<string, unknown> | null;
+  const rules = (Array.isArray(explanation?.rules) ? explanation?.rules : [])
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+  const decisiveIds = Array.isArray((explanation?.decision_summary as Record<string, unknown> | undefined)?.decisive_rule_ids)
+    ? (((explanation?.decision_summary as Record<string, unknown> | undefined)?.decisive_rule_ids as unknown[]).map(String))
+    : [];
+  const decisiveRules = (
+    decisiveIds.length
+      ? decisiveIds.map((id) => rules.find((rule) => String(rule.rule_id ?? "") === id)).filter((item): item is Record<string, unknown> => Boolean(item))
+      : rules.filter((rule) => (
+        (String(rule.contribution ?? "neutral") === "negative" && !Boolean(rule.passed))
+        || (String(rule.contribution ?? "neutral") === "positive" && Boolean(rule.passed))
+      ))
+  ).slice(0, 3);
   return (
     <div className="inspector-section">
       <span>Selected object</span>
@@ -518,7 +556,17 @@ function ObjectInspector({ object, producingStages }: { object: StudioObject | n
       <small>Class hint/group: {String((object as Record<string, unknown>).class_group ?? "-")}</small>
       <small>Rejection: {object.filter_reason ?? "none"}</small>
       <small>Reasons: {Array.isArray((object as Record<string, unknown>).decision_reasons) ? ((object as Record<string, unknown>).decision_reasons as string[]).join(", ") : "-"}</small>
+      <small>Diameter sources: ellipse={String((object as Record<string, unknown>).diameter_ellipse_mm ?? "-")} / area={String((object as Record<string, unknown>).diameter_equivalent_area_mm ?? "-")} / circ={String((object as Record<string, unknown>).diameter_circumference_mm ?? "-")} / selected={String((object as Record<string, unknown>).diameter_selected_mm ?? object.diameter_mm ?? "-")} ({String((object as Record<string, unknown>).diameter_selected_source ?? "unknown")})</small>
+      <small>Geometry space: {String((object as Record<string, unknown>).geometry_coordinate_space ?? "-")} | Metrics space: {String((object as Record<string, unknown>).metrics_coordinate_space ?? "-")}</small>
+      <small>Raw vs corrected eccentricity: {String((((object as Record<string, unknown>).raw_metrics as Record<string, unknown> | undefined)?.feature_eccentricity ?? "-"))} / {String((object as Record<string, unknown>).feature_eccentricity ?? "-")}</small>
+      <small>Raw vs corrected roundness: {String((((object as Record<string, unknown>).raw_metrics as Record<string, unknown> | undefined)?.sphericity_score ?? "-"))} / {String((object as Record<string, unknown>).sphericity_score ?? "-")}</small>
+      <small>Raw vs corrected diameter: {String((((object as Record<string, unknown>).raw_metrics as Record<string, unknown> | undefined)?.diameter_mm ?? "-"))} / {String((object as Record<string, unknown>).diameter_mm ?? "-")} mm</small>
+      <small>Correction scales: {JSON.stringify((object as Record<string, unknown>).scale_correction_applied ?? null)}</small>
       <small>Generating stages: {producingStages.length ? producingStages.join(" -> ") : "-"}</small>
+      <small>Why this class?: {decisiveRules.length ? "" : "-"}</small>
+      {decisiveRules.map((rule, idx) => (
+        <small key={`decisive_rule_${idx}`}>[{String(rule.severity ?? "info")}] {String(rule.label ?? rule.rule_id ?? "-")} {"->"} {String(rule.message ?? "-")}</small>
+      ))}
     </div>
   );
 }

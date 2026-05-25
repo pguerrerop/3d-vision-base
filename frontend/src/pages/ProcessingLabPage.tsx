@@ -164,6 +164,7 @@ export default function ProcessingLabPage() {
   const [planeQaParams, setPlaneQaParams] = useState<PlaneQaTuningParams | null>(null);
   const [planeQaPersistedParams, setPlaneQaPersistedParams] = useState<PlaneQaTuningParams | null>(null);
   const [planeQaDirty, setPlaneQaDirty] = useState(false);
+  const [measurementConfigOpen, setMeasurementConfigOpen] = useState(false);
   const [pipelineDefaults25d, setPipelineDefaults25d] = useState<Record<string, unknown>>({});
   const [fusionInputs, setFusionInputs] = useState<FusionInputBundle | null>(null);
   const [fusionPreview, setFusionPreview] = useState<FusionPreviewResult | null>(null);
@@ -350,7 +351,7 @@ export default function ProcessingLabPage() {
       gradient_threshold_percentile: Number(detect.gradient_threshold_percentile ?? 70),
       low_gradient_morphology_enabled: Boolean(detect.low_gradient_morphology_enabled ?? true),
       low_gradient_open_kernel: Number(detect.low_gradient_open_kernel ?? 3),
-      low_gradient_close_kernel: Number(detect.low_gradient_close_kernel ?? 9),
+      low_gradient_close_kernel: Number(detect.low_gradient_close_kernel ?? 5),
       low_gradient_fill_holes: Boolean(detect.low_gradient_fill_holes ?? true),
       low_gradient_min_component_area: Number(detect.low_gradient_min_component_area ?? 1500),
       reference_surface_selection_mode: String(detect.reference_surface_selection_mode ?? "largest_constant_z"),
@@ -800,7 +801,7 @@ export default function ProcessingLabPage() {
         gradient_threshold_percentile: Number(planeQaParams.gradient_threshold_percentile ?? 70),
         low_gradient_morphology_enabled: Boolean(planeQaParams.low_gradient_morphology_enabled ?? true),
         low_gradient_open_kernel: Number(planeQaParams.low_gradient_open_kernel ?? 3),
-        low_gradient_close_kernel: Number(planeQaParams.low_gradient_close_kernel ?? 9),
+        low_gradient_close_kernel: Number(planeQaParams.low_gradient_close_kernel ?? 5),
         low_gradient_fill_holes: Boolean(planeQaParams.low_gradient_fill_holes ?? true),
         low_gradient_min_component_area: Number(planeQaParams.low_gradient_min_component_area ?? 1500),
         reference_surface_selection_mode: String(planeQaParams.reference_surface_selection_mode ?? "largest_constant_z"),
@@ -1689,11 +1690,60 @@ export default function ProcessingLabPage() {
           </label>
           <span className={`toolbar-chip ${compatible ? "ok" : "warn"}`}>{compatible ? "compatible" : "incompatible"}</span>
           <div className="studio-actions toolbar-actions">
+            {(canonicalSelectedStageId === "fit_object_geometry" || canonicalSelectedStageId === "compute_height_metrics") && planeQaParams && (
+              <button type="button" onClick={() => setMeasurementConfigOpen(true)}>Configure known-cube</button>
+            )}
             <button disabled={!compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(false)} type="button">Run</button>
             <button disabled={!detail || !compatible || pipelineActionBusy} title={!compatible ? "Cannot execute: incompatible modalities." : ""} onClick={() => void runSelectedPipeline(true)} type="button">Reprocess</button>
             <button disabled={!detail || pipelineActionBusy} onClick={() => void clearSelectedOutputs()} type="button">Clear</button>
           </div>
         </header>
+        {measurementConfigOpen && planeQaParams && (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" onClick={() => setMeasurementConfigOpen(false)}>
+            <div className="modal-panel measurement-config-modal" onClick={(event) => event.stopPropagation()}>
+              <div className="modal-header">
+                <h3>Known-Cube Calibration Config</h3>
+                <button type="button" onClick={() => setMeasurementConfigOpen(false)}>Close</button>
+              </div>
+              <div className="measurement-config-modal-body">
+                <div className="stage-parameter-panel-header">
+                  <strong>Measurement controls</strong>
+                  <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "Known-cube calibration config")}</small>
+                </div>
+                <div className="measurement-controls-row modal-controls">
+                  <label>Enable
+                    <input type="checkbox" checked={Boolean(planeQaParams.known_object_enabled ?? false)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  <label>Apply correction
+                    <input type="checkbox" checked={Boolean(planeQaParams.known_object_apply_correction ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_apply_correction: e.target.checked, known_object_enabled: e.target.checked ? true : c.known_object_enabled } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  <label>Target
+                    <select value={String(planeQaParams.known_object_target_selection ?? "largest_component")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_target_selection: e.target.value } : c); setPlaneQaDirty(true); }}>
+                      <option value="largest_component">largest component</option>
+                      <option value="manual_component_id">object id</option>
+                      <option value="label_match">label match</option>
+                    </select>
+                  </label>
+                  <label>Width X mm
+                    <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_width_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_width_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  <label>Depth Y mm
+                    <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_depth_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_depth_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                  <label>Height Z mm
+                    <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_height_mm ?? 25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  </label>
+                </div>
+                <div className="reference-surface-roi-actions">
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {pipelineActionMessage && <small className={resultStale ? "preview-stale" : "section-note"}>{pipelineActionMessage}</small>}
         {!compatible && selectedPipeline && (
           <small className="section-note">{incompatibleModalityMessage(selectedPipeline, detail?.modalities) ?? "Cannot execute: incompatible modalities."}</small>
@@ -1714,7 +1764,7 @@ export default function ProcessingLabPage() {
             <span className="eyebrow">Engineering workspace</span>
             <strong>{selectedStage ? prettyStageLabel(selectedStage.id, selectedStage.display_name) : "Workspace"}</strong>
           </div>
-          <div className="engineering-workbench-grid">
+          <div className={(canonicalSelectedStageId === "fit_object_geometry" || canonicalSelectedStageId === "compute_height_metrics") ? "engineering-workbench-grid measurement-workbench-grid" : "engineering-workbench-grid"}>
           <aside className="engineering-parameter-sidebar">
           {canonicalSelectedStageId === "segmentation" && (
             <StageParameterPanel
@@ -1832,7 +1882,7 @@ export default function ProcessingLabPage() {
                   <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.low_gradient_open_kernel ?? 3)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_open_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                 </label>
                 <label>Close
-                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.low_gradient_close_kernel ?? 9)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_close_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                  <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.low_gradient_close_kernel ?? 5)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_close_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                 </label>
                 <label>Min area
                   <input type="number" min={50} max={500000} step={50} value={Number(planeQaParams.low_gradient_min_component_area ?? 1500)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_min_component_area: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
@@ -1929,42 +1979,6 @@ export default function ProcessingLabPage() {
                 </label>
                 <label>Smoothing
                   <input type="number" min={1} max={31} step={2} value={Number(planeQaParams.smoothing_kernel ?? 3)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, smoothing_kernel: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
-                </label>
-                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
-                <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
-                <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
-                <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
-              </div>
-            </section>
-          )}
-          {(canonicalSelectedStageId === "fit_object_geometry" || canonicalSelectedStageId === "compute_height_metrics") && planeQaParams && (
-            <section className="segmentation-controls-strip reference-surface-controls-strip measurement-controls-strip">
-              <div className="stage-parameter-panel-header">
-                <strong>Measurement controls</strong>
-                <small>{pipelineActionBusy ? "Applying recipe and rerunning…" : (planeQaDirty ? "Unsaved changes" : "Known-cube calibration config")}</small>
-              </div>
-              <div className="measurement-controls-row">
-                <label>Enable
-                  <input type="checkbox" checked={Boolean(planeQaParams.known_object_enabled ?? false)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
-                </label>
-                <label>Apply correction
-                  <input type="checkbox" checked={Boolean(planeQaParams.known_object_apply_correction ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_apply_correction: e.target.checked, known_object_enabled: e.target.checked ? true : c.known_object_enabled } : c); setPlaneQaDirty(true); }} />
-                </label>
-                <label>Target
-                  <select value={String(planeQaParams.known_object_target_selection ?? "largest_component")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_object_target_selection: e.target.value } : c); setPlaneQaDirty(true); }}>
-                    <option value="largest_component">largest component</option>
-                    <option value="manual_component_id">object id</option>
-                    <option value="label_match">label match</option>
-                  </select>
-                </label>
-                <label>Width X mm
-                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_width_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_width_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
-                </label>
-                <label>Depth Y mm
-                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_depth_mm ?? 40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_depth_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
-                </label>
-                <label>Height Z mm
-                  <input type="number" min={0} max={1000} step={0.1} value={Number(planeQaParams.known_height_mm ?? 25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, known_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                 </label>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>

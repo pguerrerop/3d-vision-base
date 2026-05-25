@@ -14,6 +14,8 @@ import { normalizeBlobDetectionArtifacts } from "../../studio/blobDetectionModel
 import type { StudioDebugMode } from "../studioDebugMode";
 import type { HoverInspectionSample } from "../hoverInspectionModel";
 import { resolveHeightArtifact } from "../heightSemantics";
+import { objectDisplayId } from "../objectSelectionModel";
+import MetricDetailsPanel from "../MetricDetailsPanel";
 
 type RendererProps = {
   detail: TakeDetail | null;
@@ -599,8 +601,8 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       const kept = objects.filter((item) => item.filter_status !== "rejected");
       const avgDiameter = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.diameter_mm ?? obj.diameter_estimate_mm ?? 0), 0) / kept.length : 0;
       const avgCircularity = kept.length ? kept.reduce((acc, obj) => acc + Number(obj.sphericity_score ?? 0), 0) / kept.length : 0;
-      const selected = objects.find((item) => item.object_id === props.selectedObjectId) ?? null;
       const measurementArtifacts = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, stageArtifacts).resolvedArtifacts;
+      const thumbnailSource = measurementThumbnailSource(props.detail, [...measurementArtifacts, ...(props.detail.result?.artifacts ?? [])]);
       return (
         <section className="measurement-stage-layout">
           <section className="measurement-kpi-row" aria-label="Measurement stage summary">
@@ -612,32 +614,52 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
             <div className="measurement-kpi-card"><span title="Scale Y">Scale Y</span><strong>{scaleY == null ? "-" : Number(scaleY).toFixed(4)}</strong></div>
             <div className="measurement-kpi-card"><span title="Scale Z">Scale Z</span><strong>{scaleZ == null ? "-" : Number(scaleZ).toFixed(4)}</strong></div>
           </section>
-          <section className="measurement-main-split">
-            <aside className="measurement-object-nav">
-              <StudioObjectList objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelect={props.onSelectObject} onHover={props.onHoverObject} />
-            </aside>
+          <section className="measurement-main-split result-table-mode">
             <section className="measurement-selected-workspace">
-              <section className="measurement-selected-summary">
-                <strong>Selected object workspace</strong>
-                {selected ? (
-                  <div className="pipeline-status-grid">
-                    <div><span>Object</span><strong>{selected.object_id}</strong></div>
-                    <div><span>Class</span><strong>{selected.class_name ?? "-"}</strong></div>
-                    <div><span>Conf.</span><strong>{selected.confidence == null ? "-" : `${Math.round(selected.confidence * 100)}%`}</strong></div>
-                    <div><span>Diameter</span><strong>{selected.diameter_mm ?? selected.diameter_estimate_mm ?? "-"}</strong></div>
+              <section className="measurement-results-section">
+                <div className="measurement-section-heading">
+                  <div>
+                    <span>Object results</span>
+                    <strong>Height, volume, footprint, and classification metrics</strong>
                   </div>
-                ) : <small>Select an object from the left panel.</small>}
+                  <small>{objects.length} object{objects.length === 1 ? "" : "s"}</small>
+                </div>
+                <MeasurementResultsTable
+                  objects={objects}
+                  selectedObjectId={props.selectedObjectId}
+                  hoveredObjectId={props.hoveredObjectId}
+                  thumbnailSrc={thumbnailSource}
+                  onSelectObject={props.onSelectObject}
+                  onHoverObject={props.onHoverObject}
+                />
               </section>
               <section className="measurement-overlay-section">
+                <div className="measurement-section-heading compact">
+                  <div>
+                    <span>Artifact evidence</span>
+                    <strong>Height map, residuals, and overlays</strong>
+                  </div>
+                </div>
                 {explore(measurementArtifacts, props)}
               </section>
-              <section className="measurement-table-section">
+              <details className="measurement-table-section">
+                <summary>Raw object table</summary>
                 <ObjectTable objects={objects} selectedObjectId={props.selectedObjectId} hoveredObjectId={props.hoveredObjectId} onSelectObject={props.onSelectObject} onHoverObject={props.onHoverObject} />
-              </section>
+              </details>
             </section>
           </section>
         </section>
       );
+    }
+    if (semantic.category === "measurement" && props.view.id === "geometry_debug") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const debugArtifacts = stageArtifacts.filter((item) =>
+        item.artifact_id === "geometry_debug_summary"
+        || String(item.artifact_id ?? "").startsWith("geometry_debug_object_")
+        || String(((item.metadata ?? {}) as Record<string, unknown>).semantic_type ?? "") === "geometry_debug"
+      );
+      if (!debugArtifacts.length) return semanticEmpty(props.stageId, props.view.id);
+      return explore(debugArtifacts, props);
     }
     if (semantic.category === "measurement" && props.view.id === "provenance") {
       const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
@@ -680,6 +702,153 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         explanation: (obj as Record<string, unknown>).classification_explanation ?? null,
       }));
       return <pre className="json-block">{JSON.stringify({ summary: result, explanations }, null, 2)}</pre>;
+    }
+    if (semantic.category === "classification" && props.view.id === "rule_explanation") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const explanationArtifact = resolveClassificationExplanationArtifact(stageArtifacts)
+        ?? (
+          props.detail.result?.files?.classification_explanation
+            ? ({
+              artifact_id: "classification_explanation_file_fallback",
+              stage_id: "classification",
+              kind: "json",
+              title: "Classification rule explanation (files fallback)",
+              path: props.detail.result.files.classification_explanation,
+              preview_available: true,
+            } as StudioArtifact)
+            : null
+        );
+      if (!explanationArtifact) {
+        const visible = stageArtifacts
+          .filter((item) => item.stage_id === "classification" || item.stage_id === "overlay")
+          .map((item) => ({ artifact_id: item.artifact_id, kind: item.kind, path: item.path ?? null }));
+        return (
+          <div className="empty-state">
+            <strong>No classification explanation artifact found. Reprocess this take.</strong>
+            <small>Available classification artifacts: {visible.length ? JSON.stringify(visible) : "none"}</small>
+          </div>
+        );
+      }
+      const explanations = (() => {
+        const fromArtifact = explainRowsFromArtifact(explanationArtifact);
+        if (fromArtifact.length) return fromArtifact;
+        return explainRowsFromResult(props.detail);
+      })();
+      if (!explanations.length) {
+        const visible = stageArtifacts
+          .filter((item) => item.stage_id === "classification" || item.stage_id === "overlay")
+          .map((item) => ({ artifact_id: item.artifact_id, kind: item.kind, path: item.path ?? null }));
+        return (
+          <div className="empty-state">
+            <strong>No classification explanation artifact found. Reprocess this take.</strong>
+            <small>Available classification artifacts: {visible.length ? JSON.stringify(visible) : "none"}</small>
+          </div>
+        );
+      }
+      const chosen = explanations.find((item) => Number(item.object_id ?? -1) === props.selectedObjectId) ?? explanations[0];
+      const rules = (Array.isArray(chosen.rules) ? chosen.rules : [])
+        .filter((rule): rule is Record<string, unknown> => typeof rule === "object" && rule !== null)
+        .sort((a, b) => {
+          const score = (row: Record<string, unknown>) => {
+            const sev = String(row.severity ?? "info");
+            const pass = Boolean(row.passed);
+            if (!pass && sev === "critical") return 0;
+            if (!pass && sev === "warning") return 1;
+            if (pass) return 3;
+            return 2;
+          };
+          return score(a) - score(b);
+        });
+      return (
+        <div className="studio-table-pane">
+          {explanations.length > 1 ? (
+            <div className="overlay-controls">
+              <label>
+                Object
+                <select value={Number(chosen.object_id ?? 0)} onChange={(event) => props.onSelectObject(Number(event.target.value))}>
+                  {explanations.map((row) => (
+                    <option key={`rule_exp_object_${String(row.object_id ?? "")}`} value={Number(row.object_id ?? 0)}>
+                      object_{String(row.object_id ?? "-")}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          ) : null}
+          <div className="pipeline-status-grid">
+            <div><span>Final class</span><strong>{String(chosen.final_class_name ?? "-")}</strong></div>
+            <div><span>Class label</span><strong>{String(chosen.final_class_label ?? "-")}</strong></div>
+            <div><span>Superclass</span><strong>{String(chosen.superclass ?? "-")}</strong></div>
+            <div><span>Subclass</span><strong>{String(chosen.subclass ?? "-")}</strong></div>
+            <div><span>Confidence</span><strong>{chosen.confidence == null ? "-" : `${Math.round(Number(chosen.confidence) * 100)}%`}</strong></div>
+          </div>
+          <div className="artifact-reference">
+            <span>Decision path</span>
+            <small>{String(((chosen.decision_summary as Record<string, unknown> | undefined)?.final_decision_path) ?? "-")}</small>
+            <small>Debug: classification_explanation.json found: yes</small>
+          </div>
+          <table className="compact-candidate-table">
+            <thead>
+              <tr>
+                <th>Rule</th><th>Value</th><th>Expected/threshold</th><th>Pass/fail</th><th>Effect</th><th>Message</th><th>Metric trace</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rules.map((rule, idx) => {
+                const expected = (rule.expected_range ?? rule.threshold) as Record<string, unknown> | undefined;
+                const expectedLabel = expected ? Object.entries(expected).map(([k, v]) => `${k}:${String(v)}`).join(" ") : "-";
+                return (
+                  <tr key={`${String(rule.rule_id ?? "rule")}_${idx}`}>
+                    <td>{String(rule.label ?? rule.rule_id ?? "-")}</td>
+                    <td>{String(rule.value ?? "-")}</td>
+                    <td>{expectedLabel}</td>
+                    <td>{Boolean(rule.passed) ? "pass" : "fail"}</td>
+                    <td>{String(rule.contribution ?? "-")} ({String(rule.severity ?? "-")})</td>
+                    <td>{String(rule.message ?? "-")}</td>
+                    <td>{String(((rule.metric_trace_ref as Record<string, unknown> | undefined)?.trace_id) ?? "-")}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+    if (semantic.category === "classification" && props.view.id === "metric_details") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const metricArtifact = resolveMetricExplanationArtifact(stageArtifacts)
+        ?? (
+          props.detail.result?.files?.metric_explanation
+            ? ({
+              artifact_id: "metric_explanation_file_fallback",
+              stage_id: "classification",
+              kind: "json",
+              title: "Metric explanation (files fallback)",
+              path: props.detail.result.files.metric_explanation,
+              preview_available: true,
+            } as StudioArtifact)
+            : null
+        );
+      if (!metricArtifact) {
+        const visible = stageArtifacts.filter((item) => item.stage_id === "classification" || item.stage_id === "overlay").map((item) => ({ artifact_id: item.artifact_id, kind: item.kind, path: item.path ?? null }));
+        return (
+          <div className="empty-state">
+            <strong>No metric explanation artifact found. Reprocess this take.</strong>
+            <small>Available classification artifacts: {visible.length ? JSON.stringify(visible) : "none"}</small>
+          </div>
+        );
+      }
+      const objects = Array.isArray(((metricArtifact.metadata ?? {}) as Record<string, unknown>).objects)
+        ? ((((metricArtifact.metadata ?? {}) as Record<string, unknown>).objects as unknown[]).filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null))
+        : [];
+      if (!objects.length) return semanticEmpty(props.stageId, props.view.id);
+      return (
+        <MetricDetailsPanel
+          objects={objects}
+          selectedObjectId={props.selectedObjectId}
+          onSelectObject={props.onSelectObject}
+        />
+      );
     }
     const objects = [...(props.detail.result?.objects ?? []), ...(props.detail.result?.rejected_objects ?? [])];
     const stageArtifacts = artifactsForStage(props.detail, props.stageId);
@@ -851,6 +1020,200 @@ function ellipseEntries(artifacts: StudioArtifact[]): Array<Record<string, numbe
 function fmtNum(value: unknown, decimals: number): string {
   const n = Number(value);
   return Number.isFinite(n) ? n.toFixed(decimals) : "-";
+}
+
+function toFiniteMetric(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtMetric(value: unknown, decimals: number, suffix = ""): string {
+  const n = toFiniteMetric(value);
+  return n == null ? "-" : `${n.toFixed(decimals)}${suffix}`;
+}
+
+function explainRowsFromResult(detail: TakeDetail | null): Array<Record<string, unknown>> {
+  const objects = [...(detail?.result?.objects ?? []), ...(detail?.result?.rejected_objects ?? [])];
+  return objects
+    .map((item) => (item as Record<string, unknown>).classification_explanation)
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+}
+
+function resolveClassificationExplanationArtifact(artifacts: StudioArtifact[]): StudioArtifact | null {
+  const bySemantic = artifacts.find((item) => {
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+    const semanticType = String(meta.semantic_type ?? meta.artifact_type ?? meta.semantic_kind ?? "").toLowerCase();
+    return semanticType === "classification_explanation";
+  });
+  if (bySemantic) return bySemantic;
+  const byId = firstArtifactByAlias(artifacts, [
+    "classification_explanation",
+    "classification_explanation_json",
+    "classification_explanation_metadata",
+  ]);
+  if (byId) return byId;
+  return artifacts.find((item) => String(item.path ?? "").toLowerCase().endsWith("classification_explanation.json")) ?? null;
+}
+
+function explainRowsFromArtifact(artifact: StudioArtifact | null): Array<Record<string, unknown>> {
+  if (!artifact) return [];
+  const meta = (artifact.metadata ?? {}) as Record<string, unknown>;
+  const rows = meta.objects;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+}
+
+function resolveMetricExplanationArtifact(artifacts: StudioArtifact[]): StudioArtifact | null {
+  const bySemantic = artifacts.find((item) => {
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+    const semanticType = String(meta.semantic_type ?? meta.artifact_type ?? meta.semantic_kind ?? "").toLowerCase();
+    return semanticType === "metric_explanation";
+  });
+  if (bySemantic) return bySemantic;
+  const byId = firstArtifactByAlias(artifacts, ["metric_explanation", "metric_explanation_json", "object_geometry_explanation"]);
+  if (byId) return byId;
+  return artifacts.find((item) => String(item.path ?? "").toLowerCase().endsWith("metric_explanation.json")) ?? null;
+}
+
+function heightMetricStats(value: unknown): { min: number | null; mean: number | null; max: number | null; p95: number | null; median: number | null } {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    min: toFiniteMetric(record.min ?? record.min_height_mm),
+    mean: toFiniteMetric(record.mean ?? record.mean_height_mm),
+    max: toFiniteMetric(record.max ?? record.max_height_mm),
+    p95: toFiniteMetric(record.p95 ?? record.p95_height_mm),
+    median: toFiniteMetric(record.median ?? record.median_height_mm),
+  };
+}
+
+function measurementThumbnailSource(detail: TakeDetail, artifacts: StudioArtifact[]): string | null {
+  const files = detail.result?.files;
+  const preferredPath = files?.input_preview
+    ?? artifacts.find((artifact) => artifact.artifact_id === "heightmap_preview" && artifact.path)?.path
+    ?? artifacts.find((artifact) => artifact.artifact_id === "input_preview" && artifact.path)?.path
+    ?? artifacts.find((artifact) => artifact.artifact_id === "source_heightmap_preview" && artifact.path)?.path
+    ?? artifacts.find((artifact) => artifact.artifact_id === "raw_heightmap_preview" && artifact.path)?.path
+    ?? artifacts.find((artifact) => artifact.artifact_id === "normalized_heightmap" && artifact.path)?.path
+    ?? artifacts.find((artifact) => artifact.kind === "image" && artifact.path)?.path
+    ?? null;
+  return preferredPath ? fileUrl(detail.take_id, preferredPath) : null;
+}
+
+function bboxFromObject(object: Record<string, unknown>): [number, number, number, number] | null {
+  const direct = object.bbox_px;
+  const provenance = object.measurement_provenance && typeof object.measurement_provenance === "object"
+    ? (object.measurement_provenance as Record<string, unknown>).segmented_bbox_px
+    : null;
+  const candidate = Array.isArray(direct) ? direct : Array.isArray(provenance) ? provenance : null;
+  if (!candidate || candidate.length < 4) return null;
+  const values = candidate.slice(0, 4).map((item) => Number(item));
+  if (!values.every((item) => Number.isFinite(item))) return null;
+  const [x, y, w, h] = values;
+  if (w <= 0 || h <= 0) return null;
+  return [x, y, w, h];
+}
+
+function MeasurementResultsTable({
+  objects,
+  selectedObjectId,
+  hoveredObjectId,
+  thumbnailSrc,
+  onSelectObject,
+  onHoverObject,
+}: {
+  objects: NonNullable<TakeDetail["result"]>["objects"];
+  selectedObjectId: number | null;
+  hoveredObjectId: number | null;
+  thumbnailSrc: string | null;
+  onSelectObject?: (objectId: number) => void;
+  onHoverObject?: (objectId: number | null) => void;
+}) {
+  if (!objects.length) return <div className="empty-state">No objects reported.</div>;
+  return (
+    <div className="measurement-results-table-wrap">
+      <table className="measurement-results-table">
+        <thead>
+          <tr>
+            <th>Object</th>
+            <th>Crop</th>
+            <th>Class</th>
+            <th>Max H</th>
+            <th>P95 H</th>
+            <th>Mean H</th>
+            <th>Dim X</th>
+            <th>Dim Y</th>
+            <th>Dim Z</th>
+            <th>Volume</th>
+            <th>Footprint</th>
+            <th>Diameter</th>
+            <th>Confidence</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {objects.map((object) => {
+            const record = object as typeof object & Record<string, unknown>;
+            const height = heightMetricStats(record.height_above_belt_mm);
+            const dims = object.dimensions_mm ?? null;
+            const bbox = bboxFromObject(record);
+            const status = object.filter_status ?? "kept";
+            return (
+              <tr
+                key={`measurement_result_${object.object_id}`}
+                className={object.object_id === selectedObjectId ? "selected-object-row" : object.object_id === hoveredObjectId ? "hovered-object-row" : ""}
+                onClick={() => onSelectObject?.(object.object_id)}
+                onMouseEnter={() => onHoverObject?.(object.object_id)}
+                onMouseLeave={() => onHoverObject?.(null)}
+              >
+                <td><strong>{objectDisplayId(object.object_id)}</strong></td>
+                <td><ObjectCropThumbnail src={thumbnailSrc} bbox={bbox} label={objectDisplayId(object.object_id)} /></td>
+                <td>
+                  <strong>{object.class_name ?? "-"}</strong>
+                  <small>{object.subclass_label ?? "-"}</small>
+                </td>
+                <td>{fmtMetric(height.max, 1, " mm")}</td>
+                <td>{fmtMetric(height.p95, 1, " mm")}</td>
+                <td>{fmtMetric(height.mean, 1, " mm")}</td>
+                <td>{fmtMetric(Array.isArray(dims) ? dims[0] : null, 2, " mm")}</td>
+                <td>{fmtMetric(Array.isArray(dims) ? dims[1] : null, 2, " mm")}</td>
+                <td>{fmtMetric(Array.isArray(dims) ? dims[2] : null, 2, " mm")}</td>
+                <td>{fmtMetric(record.feature_volume_proxy_mm3, 0, " mm3")}</td>
+                <td>{fmtMetric(record.footprint_area_mm2, 0, " mm2")}</td>
+                <td>{fmtMetric(object.diameter_mm ?? object.diameter_estimate_mm, 2, " mm")}</td>
+                <td>{object.confidence == null ? "-" : `${Math.round(object.confidence * 100)}%`}</td>
+                <td>{status}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ObjectCropThumbnail({ src, bbox, label }: { src: string | null; bbox: [number, number, number, number] | null; label: string }) {
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  if (!src || !bbox) return <div className="object-crop-thumb empty">No crop</div>;
+  const [x, y, width, height] = bbox;
+  const thumbWidth = 84;
+  const thumbHeight = 64;
+  const scale = Math.min(thumbWidth / Math.max(1, width), thumbHeight / Math.max(1, height));
+  const imageStyle = naturalSize ? {
+    width: `${naturalSize.width * scale}px`,
+    height: `${naturalSize.height * scale}px`,
+    left: `${-x * scale}px`,
+    top: `${-y * scale}px`,
+  } : undefined;
+  return (
+    <div className="object-crop-thumb" title={`${label}: ${Math.round(x)},${Math.round(y)} ${Math.round(width)}x${Math.round(height)} px`}>
+      <img
+        alt={`${label} crop`}
+        src={src}
+        style={imageStyle}
+        onLoad={(event) => setNaturalSize({ width: event.currentTarget.naturalWidth || 1, height: event.currentTarget.naturalHeight || 1 })}
+      />
+    </div>
+  );
 }
 
 type OverlayMode = "contours" | "labels" | "bbox" | "filled" | "rejected_only";

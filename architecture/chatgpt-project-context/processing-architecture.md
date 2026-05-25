@@ -271,6 +271,178 @@ Studio classification behavior:
 - lightweight controls toggle IDs, labels, confidence, contours, and geometry overlays
 - legacy runs without classification overlay artifacts stay functional with graceful fallback views
 
+## 2.5D classification explanation artifact contract
+
+2.5D classification emits a canonical auditable artifact:
+
+- file: `classification_explanation.json`
+- artifact id: `classification_explanation`
+- kind: `json`
+- stage: `classification`
+- scope: `global`
+
+Payload contract:
+
+- top-level `objects[]` per classified object
+- each object explanation includes:
+  - `object_id`
+  - `final_class_name`
+  - `final_class_label`
+  - `superclass`
+  - `subclass`
+  - `confidence`
+  - `decision_summary`
+  - `metrics_used`
+  - `rules[]`
+- each `rules[]` entry includes:
+  - `rule_id`, `label`, `description`
+  - `metric_key`, `value`
+  - `expected_range` or `threshold`
+  - `comparator`
+  - `passed`
+  - `severity` (`info|warning|critical`)
+  - `contribution` (`positive|negative|neutral`)
+  - `message`
+- artifact metadata includes:
+  - `semantic_type: "classification_explanation"`
+  - `artifact_type: "classification_explanation"`
+  - `scope: "global"`
+
+Per-object references:
+
+- each object includes:
+  - `classification_explanation_ref.artifact_id = "classification_explanation"`
+  - `classification_explanation_ref.object_id = <object_id>`
+
+Diameter provenance is explicit:
+
+- `diameter_ellipse_mm`
+- `diameter_equivalent_area_mm`
+- `diameter_circumference_mm`
+- `diameter_selected_mm`
+- `diameter_selected_source`
+- `diameter_sanity_status`
+- `diameter_sanity_message`
+
+Sanity rules explicitly surface suspicious or impossible conditions:
+
+- diameter vs `dim_x/dim_y` inconsistencies
+- missing footprint area
+- invalid/unstable ellipse fit evidence
+- suspicious scale factors
+- extremely low roundness/sphericity
+
+Known-cube correction is authoritative for measurement/classification:
+
+- saved or measured scale factors are applied before classification consumes object metrics
+- correction context is persisted in measurement metadata:
+  - `correction_source`
+  - `scale_x`, `scale_y`, `scale_z`
+  - `correction_applied`
+  - `correction_context_id`
+- objects include:
+  - `metrics_coordinate_space` (`corrected_mm|raw_mm`)
+  - `correction_source`
+  - `correction_context_id`
+- rule explanations include raw/corrected metric values and correction scale context
+
+Canonical corrected geometry space:
+
+- `geometry_coordinate_space: corrected_metric_mm`
+- corrected per-object geometry representations:
+  - `contour_mm`
+  - `ellipse_fit_mm`
+  - `covariance_axes_mm`
+  - `point_cloud_mm` (center/height context)
+- shape descriptors (eccentricity, roundness/circularity/sphericity, equivalent/circumference diameters) are computed from corrected metric-space geometry.
+- `feature_sphericity_3d` is the canonical `min(dim_x, dim_y, dim_z) / max(dim_x, dim_y, dim_z)` over corrected XYZ extents (`dimensions_mm`), recomputed after any contour-based override so it never inherits a stretched / misaligned raw ellipse semi-axis.
+- `feature_local_curvature_proxy` is computed from per-axis gradient components (`feature_curvature_components_raw.mean_abs_g{x,y}_mm_per_mm`) at measurement time over the inner-eroded mask, then rescaled to corrected metric space via the per-axis factors `scale_z/scale_x` and `scale_z/scale_y`; without per-axis correction the proxy stays inflated whenever the raw heightmap is anisotropic.
+- raw/corrected values are preserved for engineering diagnostics (`raw_metrics`, `feature_curvature_components_raw`, `feature_curvature_components_corrected`).
+
+Geometry-debug workspace (engineering):
+
+- measurement stage exposes `Geometry debug` view with per-object geometry debug artifacts and summary.
+- inspector surfaces raw vs corrected eccentricity/roundness/diameter and correction scales.
+- geometry-debug artifacts are emitted by both the live known-cube calibration path and the persisted-known-cube reuse path, so the diagnostic UX is identical regardless of how the correction was sourced.
+
+Invariant validation rules:
+
+- near-equal `dim_x/dim_y` must not pair with extreme eccentricity (still raised as `invariant_violation:`)
+- selected diameter must remain coherent with `dim_x/dim_y/dim_z` (raised as `invariant_violation:`)
+- compact blob metrics must not collapse to near-zero roundness/sphericity (raised as `invariant_violation:`)
+- highly anisotropic correction scales are surfaced as an advisory `warning:anisotropic_scale_factors_may_destabilize_metrics` ONLY when the contour-based corrected geometry could not be derived; once a valid corrected contour exists, the metrics live in true mm space and the advisory is suppressed.
+
+Corrected-metric classification semantics:
+
+- `sanity.scale_factors` is informational (`severity=info`, `contribution=neutral`) when corrected metric geometry exists. Calibrated anisotropic scales (e.g. TriSpector raw-units sensors that need `scale_y=0.2`, `scale_z=0.0365`) no longer fail this rule.
+- `shape.deformation_score` is demoted to informational (`severity=info`, `contribution=neutral`) when the primary shape evidence already supports a ball (`feature_sphericity_3d >= 0.8` AND `sphericity_score >= 0.75` AND `feature_eccentricity < 0.45`). The curvature proxy is sensitive to anisotropic raw spacing and cannot single-handedly flip an otherwise-coherent ball.
+- `sanity.geometry_invariant_<n>` rules split by warning class: `invariant_violation:*` entries remain `severity=warning`, `contribution=negative`. `warning:*` entries are `severity=info`, `contribution=neutral`.
+
+## Studio Rule Explanation View (Engineering)
+
+Classification stage includes a dedicated `Rule explanation` tab:
+
+- compact object selector (multi-object runs)
+- final decision card (class/label/superclass/subclass/confidence)
+- rule table ordered as:
+  - critical failed rules first
+  - warning/sanity rules next
+  - passed supporting rules last
+- columns: Rule, Value, Expected/threshold, Pass/fail, Effect, Message
+- resolver order:
+  - artifact metadata semantic type
+  - artifact id alias (`classification_explanation`, `classification_explanation_json`, `classification_explanation_metadata`)
+  - filename fallback (`classification_explanation.json`)
+- empty state includes a debug artifact list (id/kind/path) for classification-stage artifacts.
+
+Inspector adds a compact `Why this class?` section with top decisive rules for selected object.
+
+Metric-level explainability contract:
+
+- artifact: `metric_explanation.json`
+- artifact id: `metric_explanation`
+- stage: `classification`
+- kind: `json`
+- scope: `global`
+- object payload includes `metric_trace[]` entries with:
+  - `trace_id` (object-scoped stable id, e.g. `obj_3_5`)
+  - `metric_key`
+  - `final_value`
+  - `raw_value`
+  - `corrected_value`
+  - `correction_applied`
+  - `correction_scales` (`{x, y, z}` from `scale_correction_applied`)
+  - `correction_factor_used` (per-metric scalar actually applied; e.g. `scale_z` for `max_height_mm`, `scale_x*scale_y` for `footprint_area_mm2`, `scale_x*scale_y*scale_z` for `feature_volume_proxy_mm3`; null for derived dimensionless metrics)
+  - `coordinate_space_before` (e.g. `raw_metric_mm`)
+  - `coordinate_space_after` (e.g. `corrected_metric_mm`)
+  - `geometry_metric_source` (`contour_corrected` when a corrected mm contour drives planar metrics, `bbox_corrected` when only bbox extents were rescaled, `raw_measurement` when no correction was applied)
+  - `source_artifact_id` (`geometry_debug_summary` or `measurement_object` or `known_object_scale_validation`)
+  - `source_stage`
+  - `formula_name`
+  - `formula_human_readable` (math-style expression with units)
+  - `formula_inputs` (`[{name, value}, ...]`)
+  - `intermediate_values` (free-form dictionary, e.g. axis ratios, scale products, gradient components, `geometry_metric_source`, `geometry_coordinate_space`, `diameter_selected_source`, `diameter_sanity_status`)
+  - `validity_status` (`valid|suspicious|invalid|not_applied`)
+  - `warnings` (e.g. `invariant_violation:*`, `warning:*`, diameter sanity messages)
+  - `used_by_classifier` (true when the same `metric_key` appears in `classification_explanation.rules[]`)
+
+Per-object `metric_trace[]` always includes (when the data exists on the object):
+
+- `feature_eccentricity`, `sphericity_score`, `feature_sphericity_3d`
+- `diameter_selected_mm`
+- `feature_local_curvature_proxy` (with per-axis gradient components `mean_abs_gx_mm_per_mm`, `mean_abs_gy_mm_per_mm` in `intermediate_values`, plus `scale_z/scale_x`, `scale_z/scale_y` and `computed_over` reflecting the inner-eroded mask used for the gradient sample)
+- `max_height_mm`, `footprint_area_mm2`, `feature_volume_proxy_mm3`
+- `scale_correction_applied` (synthetic calibration context entry capturing `correction_source`, `correction_context_id`, scales and the resulting `geometry_coordinate_space`)
+- `geometry_invariant_warnings` (synthetic entry, only when invariants triggered, split into `violations` and `advisories` in `intermediate_values`)
+
+Studio engineering view:
+
+- classification stage exposes a `Metric details` tab implemented by `MetricDetailsPanel`.
+- the tab renders a `Correction context` card at the top showing `correction_source`, `correction_context_id`, applied scales, `geometry_metric_source` and `geometry_coordinate_space`, plus an `Invariants` section that separates `invariant_violation:*` entries from `warning:*` advisories.
+- the metric table shows raw vs corrected value, per-metric `correction_factor_used`, coordinate-space transition, source artifact, formula name + math expression, and validity badge (`status-pill ok|warn|bad`).
+- each row is expandable to reveal `formula_inputs`, `intermediate_values`, and per-metric `warnings`.
+- rule explanation rows include `metric_trace_ref` so rule metric values can be traced back to the same `trace_id`.
+
 ## Ellipse fitting + geometry metrics stage
 
 The next derived stage after blob detection is `ellipse_fitting`, which consumes accepted blob candidates and contour geometry to produce generic fit-quality metrics.

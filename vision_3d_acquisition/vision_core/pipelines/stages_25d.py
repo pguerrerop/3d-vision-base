@@ -401,6 +401,10 @@ class DetectBeltPlaneStage:
     plane_fit_min_valid_pixels: int = 64
     plane_fit_min_inlier_ratio: float = 0.35
     plane_fit_residual_threshold_mm: float = 1.25
+    # Multiplier on the candidate surface's z-MAD used to expand the RANSAC
+    # inlier tolerance for noisy sensors / raw-unit heightmaps. The effective
+    # threshold is max(plane_fit_residual_threshold_mm, multiplier * z_mad).
+    plane_fit_residual_threshold_adaptive_multiplier: float = 3.0
     plane_fit_max_iterations: int = 250
     plane_background_residual_tolerance_mm: float = 2.5
     plane_background_residual_tolerance_mode: str = "adaptive"
@@ -418,7 +422,10 @@ class DetectBeltPlaneStage:
     invalid_neighbor_policy: str = "mark_high_gradient"
     low_gradient_morphology_enabled: bool = True
     low_gradient_open_kernel: int = 3
-    low_gradient_close_kernel: int = 9
+    # Close kernel larger than the smallest object-to-belt spacing can bridge
+    # the conveyor mask into adjacent low-gradient surfaces (cube/ball plateaus),
+    # inflating the selected component and corrupting the plane fit.
+    low_gradient_close_kernel: int = 5
     low_gradient_min_component_area: int = 1500
     low_gradient_fill_holes: bool = True
     reference_surface_selection_mode: str = "largest_constant_z"
@@ -488,6 +495,8 @@ class DetectBeltPlaneStage:
         active_height_gate_mask = valid_for_fit.copy()
         height_gate_debug: dict[str, Any] = {"enabled": bool(self.reference_surface_height_gate_enabled), "status": "not_evaluated"}
         gradient_debug: dict[str, Any] = {}
+        cand_z_mad = 0.0
+        effective_residual_threshold_mm = float(self.plane_fit_residual_threshold_mm)
 
         if valid_pixel_count < self.plane_fit_min_valid_pixels:
             status = "failed"
@@ -698,6 +707,21 @@ class DetectBeltPlaneStage:
                 idx = rng.choice(candidates.shape[0], size=self.plane_fit_downsample, replace=False)
                 candidates = candidates[idx]
             sampled_pixel_count = int(candidates.shape[0])
+            # Scale the RANSAC inlier tolerance to the actual noise of the
+            # selected candidate surface. Without this, sensors / calibrations
+            # whose belt noise std is larger than `plane_fit_residual_threshold_mm`
+            # (e.g. raw TriSpector counts) cannot reach the inlier-ratio gate
+            # and degenerate into a spurious tilted plane.
+            if candidates.shape[0] >= 3:
+                cand_z = candidates[:, 2]
+                cand_med = float(np.median(cand_z))
+                cand_z_mad = float(np.median(np.abs(cand_z - cand_med)))
+            else:
+                cand_z_mad = 0.0
+            effective_residual_threshold_mm = max(
+                float(self.plane_fit_residual_threshold_mm),
+                float(self.plane_fit_residual_threshold_adaptive_multiplier) * cand_z_mad,
+            )
             if sampled_pixel_count < max(3, self.plane_fit_min_valid_pixels // 2):
                 status = "failed"
                 failure_reason = "not_enough_sampled_points_after_filtering"
@@ -705,7 +729,7 @@ class DetectBeltPlaneStage:
                 coeffs, inliers = _fit_plane_ransac(
                     candidates,
                     iterations=self.plane_fit_max_iterations,
-                    threshold_mm=self.plane_fit_residual_threshold_mm,
+                    threshold_mm=effective_residual_threshold_mm,
                     seed=self.random_seed,
                 )
                 inlier_count = int(inliers.shape[0])
@@ -721,7 +745,7 @@ class DetectBeltPlaneStage:
                 adaptive_tol = float(self.plane_background_residual_tolerance_mm)
                 if self.plane_background_residual_tolerance_mode == "adaptive" and seed_residual_values.size:
                     adaptive_tol = max(
-                        float(self.plane_fit_residual_threshold_mm),
+                        effective_residual_threshold_mm,
                         float(np.std(seed_residual_values) * self.plane_background_residual_adaptive_multiplier),
                     )
                 tol = adaptive_tol if self.plane_background_residual_tolerance_mode == "adaptive" else float(self.plane_background_residual_tolerance_mm)
@@ -768,14 +792,21 @@ class DetectBeltPlaneStage:
         if np.count_nonzero(final_plane_inlier_mask):
             belt_mask = final_plane_inlier_mask
         else:
-            belt_mask = (np.abs(residual_map) <= self.plane_fit_residual_threshold_mm) & valid_for_fit
+            belt_mask = (np.abs(residual_map) <= effective_residual_threshold_mm) & valid_for_fit
         background_vals = residual_map[belt_mask]
         bg_mean = float(np.mean(background_vals)) if background_vals.size else 0.0
         bg_std = float(np.std(background_vals)) if background_vals.size else 0.0
         bg_p95_abs = float(np.percentile(np.abs(background_vals), 95)) if background_vals.size else 0.0
         foreground_vals = residual_map[(~belt_mask) & valid_for_fit]
         fg_mean = float(np.mean(np.abs(foreground_vals))) if foreground_vals.size else 0.0
-        if bg_p95_abs > 4.0:
+        # Noise-scaled gates: a sensor whose belt noise floor is 6mm shouldn't
+        # trip the "near zero" warning when residual p95 is naturally ~12mm.
+        bg_near_zero_limit_mm = max(4.0, 2.0 * effective_residual_threshold_mm)
+        max_plane_residual_p95_limit_mm = max(
+            float(self.reference_surface_max_plane_residual_p95_mm),
+            2.0 * effective_residual_threshold_mm,
+        )
+        if bg_p95_abs > bg_near_zero_limit_mm:
             warnings.append("background_not_near_zero_after_plane_fit")
         if fg_mean < 3.0:
             warnings.append("foreground_background_separation_too_small")
@@ -785,7 +816,7 @@ class DetectBeltPlaneStage:
             warnings.append("plane_fit_used_very_few_samples")
         if bg_p95_abs > 100.0:
             warnings.append("extreme_plane_fit_residuals_detected")
-        if float(np.percentile(residual_abs, 95)) > float(self.reference_surface_max_plane_residual_p95_mm):
+        if float(np.percentile(residual_abs, 95)) > max_plane_residual_p95_limit_mm:
             warnings.append("model_residual_p95_too_high")
         if np.count_nonzero(candidate_mask) and np.count_nonzero(belt_mask):
             overlap = float(np.count_nonzero(candidate_mask & belt_mask) / max(1, np.count_nonzero(candidate_mask)))
@@ -810,7 +841,11 @@ class DetectBeltPlaneStage:
             use_constant_z = False
             model_selection_reason = "forced_plane"
         elif self.reference_surface_model == "auto":
-            auto_fail = status != "success" or inlier_ratio < max(0.15, self.plane_fit_min_inlier_ratio * 0.6) or bg_p95_abs > float(self.reference_surface_max_plane_residual_p95_mm)
+            auto_fail = (
+                status != "success"
+                or inlier_ratio < max(0.15, self.plane_fit_min_inlier_ratio * 0.6)
+                or bg_p95_abs > max_plane_residual_p95_limit_mm
+            )
             if auto_fail:
                 use_constant_z = True
                 model_selection_reason = "auto_constant_z_fallback"
@@ -929,6 +964,8 @@ class DetectBeltPlaneStage:
             "sampled_pixel_count": sampled_pixel_count,
             "inlier_count": inlier_count,
             "inlier_ratio": inlier_ratio,
+            "effective_plane_fit_residual_threshold_mm": float(effective_residual_threshold_mm),
+            "candidate_z_mad_mm": float(cand_z_mad),
             "plane_coefficients": [float(x) for x in coeffs.tolist()],
             "residual_mean_mm": float(np.mean(residuals)) if residuals.size else 0.0,
             "residual_median_mm": float(np.median(residuals)) if residuals.size else 0.0,
@@ -977,6 +1014,7 @@ class DetectBeltPlaneStage:
                 "plane_fit_min_valid_pixels": self.plane_fit_min_valid_pixels,
                 "plane_fit_min_inlier_ratio": self.plane_fit_min_inlier_ratio,
                 "plane_fit_residual_threshold_mm": self.plane_fit_residual_threshold_mm,
+                "plane_fit_residual_threshold_adaptive_multiplier": self.plane_fit_residual_threshold_adaptive_multiplier,
                 "plane_fit_max_iterations": self.plane_fit_max_iterations,
                 "gradient_smoothing_kernel": self.gradient_smoothing_kernel,
                 "gradient_method": self.gradient_method,
@@ -2253,7 +2291,12 @@ class ComputeHeightMetricsStage:
             surface_residuals = normalized[inner_mask] - smoothed_surface[inner_mask]
             asym = float(abs(np.mean(pos_values[::2]) - np.mean(pos_values[1::2]))) if pos_values.size > 4 else 0.0
             flatness = float(1.0 - np.std(pos_values) / max(np.mean(pos_values), 1e-6))
-            curvature = float(np.mean(np.abs(gx[mask])) + np.mean(np.abs(gy[mask])))
+            # Curvature is the mean absolute slope of the height surface. Restrict to
+            # inner_mask so the artificial 0->height step at the segmentation boundary
+            # does not dominate the average.
+            curvature_gx_inner = float(np.mean(np.abs(gx[inner_mask]))) if int(np.count_nonzero(inner_mask)) > 0 else 0.0
+            curvature_gy_inner = float(np.mean(np.abs(gy[inner_mask]))) if int(np.count_nonzero(inner_mask)) > 0 else 0.0
+            curvature = float(curvature_gx_inner + curvature_gy_inner)
             roughness = float(1.4826 * np.median(np.abs(surface_residuals - np.median(surface_residuals)))) if surface_residuals.size else 0.0
             volume_proxy = float(np.sum(pos_values) * pixel_area)
             centroid = _mask_centroid(mask)
@@ -2308,9 +2351,29 @@ class ComputeHeightMetricsStage:
                 "feature_volume_proxy_mm3": round(volume_proxy, 4),
                 "feature_flatness": round(flatness, 4),
                 "feature_eccentricity": round(float(comp.get("eccentricity") or 0.0), 4),
-                "feature_sphericity_3d": round(_axis_balance_3d(footprint_x, footprint_y, max_height), 4),
+                # 3D axis balance is defined over the canonical XYZ extents
+                # (bbox in raw mm here; later replaced by corrected dim_x/y/z so it
+                # stays a true min/max ratio over physical dimensions).
+                "feature_sphericity_3d": round(
+                    _axis_balance_3d(
+                        float(comp["bbox"][2] * frame.x_resolution_mm),
+                        float(comp["bbox"][3] * frame.y_resolution_mm),
+                        float(max_height),
+                    ),
+                    4,
+                ),
                 "feature_edge_roughness": round(roughness, 4),
                 "feature_local_curvature_proxy": round(curvature, 4),
+                # Per-axis gradient components stored so the curvature proxy can be
+                # rescaled into corrected metric space later (scale_z/scale_x for x,
+                # scale_z/scale_y for y). Captured in raw heightmap mm-per-pixel units.
+                "feature_curvature_components_raw": {
+                    "mean_abs_gx_mm_per_mm": round(curvature_gx_inner, 6),
+                    "mean_abs_gy_mm_per_mm": round(curvature_gy_inner, 6),
+                    "x_resolution_mm": float(frame.x_resolution_mm),
+                    "y_resolution_mm": float(frame.y_resolution_mm),
+                    "computed_over": "inner_mask" if int(np.count_nonzero(inner_mask)) > 0 else "mask",
+                },
                 "feature_height_asymmetry": round(asym, 4),
                 "feature_footprint_roundness": round(float(comp.get("roundness") or 0.0), 4),
                 "footprint_area_mm2": round(float(comp.get("footprint_area_mm2") or 0.0), 4),
@@ -2334,6 +2397,11 @@ class ComputeHeightMetricsStage:
                     "morphology_removals": 0,
                     "contour_point_count": int(len(comp.get("contour"))) if comp.get("contour") is not None else 0,
                     "height_point_count": int(values.size),
+                },
+                "geometry_coordinate_space": "raw_metric_mm",
+                "geometry_metric_context": {
+                    "x_resolution_mm": float(frame.x_resolution_mm),
+                    "y_resolution_mm": float(frame.y_resolution_mm),
                 },
                 "sphere_fit_diagnostics": {
                     "estimated_center_mm": [round((frame.origin_x_mm + centroid[0] * frame.x_resolution_mm), 4), round((frame.origin_y_mm + centroid[1] * frame.y_resolution_mm), 4), round(float(np.mean(values)), 4)],
@@ -2380,11 +2448,13 @@ class ValidateKnownObjectScale25DStage:
         runtime_cfg = context.get_artifact("stage_params.known_object_25d", {})
         cfg = runtime_cfg if isinstance(runtime_cfg, dict) and runtime_cfg else (metadata.get("known_object_25d") if isinstance(metadata, dict) else None)
         if not isinstance(cfg, dict):
+            self._annotate_measurement_artifacts(context, {"correction_source": "none", "correction_applied": False})
             self._record_result(context, {"enabled": False, "status": "skipped"})
             return
 
         objects = context.get_artifact("objects", [])
         if not isinstance(objects, list) or not objects:
+            self._annotate_measurement_artifacts(context, {"correction_source": "none", "correction_applied": False})
             self._record_result(context, {"enabled": bool(cfg.get("enabled", False)), "status": "failed", "reason": "no_objects"})
             return
 
@@ -2393,6 +2463,7 @@ class ValidateKnownObjectScale25DStage:
         saved_scale_z = cfg.get("persisted_scale_correction_z")
         has_saved_scale = saved_scale_x is not None and saved_scale_y is not None and saved_scale_z is not None
         apply_saved_correction = bool(cfg.get("apply_persisted_correction", has_saved_scale))
+        correction_context_id = f"known_cube:{float(saved_scale_x) if saved_scale_x is not None else 'na'}:{float(saved_scale_y) if saved_scale_y is not None else 'na'}:{float(saved_scale_z) if saved_scale_z is not None else 'na'}"
         calibration_enabled = bool(cfg.get("enabled", False))
         if has_saved_scale and apply_saved_correction and not calibration_enabled:
             _apply_known_object_scale_correction(
@@ -2400,10 +2471,38 @@ class ValidateKnownObjectScale25DStage:
                 scale_x=float(saved_scale_x),
                 scale_y=float(saved_scale_y),
                 scale_z=float(saved_scale_z),
+                correction_source="persisted_known_cube",
+                correction_context_id=correction_context_id,
             )
             context.set_artifact("objects", objects)
+            context.set_artifact(
+                "measurement_correction_context",
+                {
+                    "correction_source": "persisted_known_cube",
+                    "scale_x": float(saved_scale_x),
+                    "scale_y": float(saved_scale_y),
+                    "scale_z": float(saved_scale_z),
+                    "correction_applied": True,
+                    "correction_context_id": correction_context_id,
+                },
+            )
+            # Persisted-only path also exposes the raw vs corrected geometry so
+            # the Geometry-debug workspace is populated identically regardless
+            # of whether the cube was just measured or restored from disk.
+            self._emit_geometry_debug_artifacts(context, objects)
 
         if not calibration_enabled:
+            self._annotate_measurement_artifacts(
+                context,
+                {
+                    "correction_source": "persisted_known_cube" if has_saved_scale and apply_saved_correction else "none",
+                    "scale_x": float(saved_scale_x) if saved_scale_x is not None else None,
+                    "scale_y": float(saved_scale_y) if saved_scale_y is not None else None,
+                    "scale_z": float(saved_scale_z) if saved_scale_z is not None else None,
+                    "correction_applied": bool(has_saved_scale and apply_saved_correction),
+                    "correction_context_id": correction_context_id if has_saved_scale and apply_saved_correction else None,
+                },
+            )
             self._record_result(
                 context,
                 {
@@ -2449,7 +2548,14 @@ class ValidateKnownObjectScale25DStage:
         scale_z = (known_h / measured_h) if measured_h > 1e-9 else 1.0
         apply_correction = bool(cfg.get("apply_correction", True))
         if apply_correction:
-            _apply_known_object_scale_correction(objects, scale_x=scale_x, scale_y=scale_y, scale_z=scale_z)
+            _apply_known_object_scale_correction(
+                objects,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                scale_z=scale_z,
+                correction_source="known_cube_measured",
+                correction_context_id=f"known_cube:{scale_x:.8f}:{scale_y:.8f}:{scale_z:.8f}",
+            )
             context.set_artifact("objects", objects)
             corrected_target = next((item for item in objects if int(item.get("object_id") or -1) == int(target.get("object_id") or -2)), target)
             corrected_dims = corrected_target.get("dimensions_mm") if isinstance(corrected_target.get("dimensions_mm"), (list, tuple)) else [None, None, None]
@@ -2486,8 +2592,47 @@ class ValidateKnownObjectScale25DStage:
             "persisted_scale_correction_y": float(saved_scale_y) if saved_scale_y is not None else None,
             "persisted_scale_correction_z": float(saved_scale_z) if saved_scale_z is not None else None,
             "tolerance_percent": tol_pct,
+            "correction_source": "known_cube_measured" if apply_correction else "none",
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "scale_z": scale_z,
+            "correction_applied": bool(apply_correction),
+            "correction_context_id": f"known_cube:{scale_x:.8f}:{scale_y:.8f}:{scale_z:.8f}",
         }
+        context.set_artifact(
+            "measurement_correction_context",
+            {
+                "correction_source": result["correction_source"],
+                "scale_x": result["scale_x"],
+                "scale_y": result["scale_y"],
+                "scale_z": result["scale_z"],
+                "correction_applied": bool(result["correction_applied"]),
+                "correction_context_id": result["correction_context_id"],
+            },
+        )
+        self._annotate_measurement_artifacts(context, context.get_artifact("measurement_correction_context", {}))
+        self._emit_geometry_debug_artifacts(context, objects)
         self._record_result(context, result)
+
+    def _annotate_measurement_artifacts(self, context: PipelineContext, correction: dict[str, Any]) -> None:
+        for artifact in context.processing_artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            if str(artifact.get("stage_id") or "") != "measurement":
+                continue
+            meta = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+            meta = dict(meta)
+            meta.update(
+                {
+                    "correction_source": correction.get("correction_source"),
+                    "scale_x": correction.get("scale_x"),
+                    "scale_y": correction.get("scale_y"),
+                    "scale_z": correction.get("scale_z"),
+                    "correction_applied": bool(correction.get("correction_applied", False)),
+                    "correction_context_id": correction.get("correction_context_id"),
+                }
+            )
+            artifact["metadata"] = meta
 
     def _record_result(self, context: PipelineContext, result: dict[str, Any]) -> None:
         output_dir: Path = context.require_artifact("output_dir")
@@ -2507,8 +2652,79 @@ class ValidateKnownObjectScale25DStage:
             metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **result}),
         )
 
+    def _emit_geometry_debug_artifacts(self, context: PipelineContext, objects: list[dict[str, Any]]) -> None:
+        output_dir: Path = context.require_artifact("output_dir")
+        rows: list[dict[str, Any]] = []
+        for row in objects:
+            oid = int(row.get("object_id") or 0)
+            payload = {
+                "object_id": oid,
+                "geometry_coordinate_space": row.get("geometry_coordinate_space"),
+                "metrics_coordinate_space": row.get("metrics_coordinate_space"),
+                "correction_source": row.get("correction_source"),
+                "scale_correction_applied": row.get("scale_correction_applied"),
+                "geometry_debug": row.get("geometry_debug"),
+                "geometry_invariant_warnings": row.get("geometry_invariant_warnings") or [],
+                "raw_eccentricity": ((row.get("raw_metrics") or {}).get("feature_eccentricity") if isinstance(row.get("raw_metrics"), dict) else None),
+                "corrected_eccentricity": row.get("feature_eccentricity"),
+                "raw_roundness": ((row.get("raw_metrics") or {}).get("sphericity_score") if isinstance(row.get("raw_metrics"), dict) else None),
+                "corrected_roundness": row.get("sphericity_score"),
+                "raw_diameter_mm": ((row.get("raw_metrics") or {}).get("diameter_mm") if isinstance(row.get("raw_metrics"), dict) else None),
+                "corrected_diameter_mm": row.get("diameter_mm"),
+            }
+            rows.append(payload)
+            file_name = f"geometry_debug_object_{oid}.json"
+            (output_dir / file_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            context.add_processing_artifact(
+                artifact_id=f"geometry_debug_object_{oid}",
+                stage_id="measurement",
+                object_id=oid,
+                kind="json",
+                title=f"Object #{oid} geometry debug",
+                path=file_name,
+                mime_type="application/json",
+                preview_available=True,
+                metadata=_numeric_source_meta(
+                    {
+                        "source": "native_pipeline",
+                        "producer": self.name,
+                        "artifact_type": "geometry_debug",
+                        "semantic_type": "geometry_debug",
+                    }
+                ),
+            )
+        summary_path = "geometry_debug_summary.json"
+        (output_dir / summary_path).write_text(json.dumps({"objects": rows}, indent=2), encoding="utf-8")
+        context.add_processing_artifact(
+            artifact_id="geometry_debug_summary",
+            stage_id="measurement",
+            kind="json",
+            title="Geometry debug summary",
+            path=summary_path,
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "artifact_type": "geometry_debug",
+                    "semantic_type": "geometry_debug",
+                }
+            ),
+        )
 
-def _apply_known_object_scale_correction(objects: list[dict[str, Any]], *, scale_x: float, scale_y: float, scale_z: float) -> None:
+
+def _apply_known_object_scale_correction(
+    objects: list[dict[str, Any]],
+    *,
+    scale_x: float,
+    scale_y: float,
+    scale_z: float,
+    correction_source: str = "known_object_scale_validation",
+    correction_context_id: str | None = None,
+) -> bool:
+    changed = False
+
     def _scale_tuple(value: Any, scales: tuple[float, ...]) -> tuple[float, ...] | Any:
         if not isinstance(value, (list, tuple)):
             return value
@@ -2523,9 +2739,38 @@ def _apply_known_object_scale_correction(objects: list[dict[str, Any]], *, scale
             row[key] = round(float(row[key]) * factor, 4)
 
     for row in objects:
+        existing = row.get("scale_correction_applied")
+        if isinstance(existing, dict):
+            ex = _safe_float(existing.get("x"))
+            ey = _safe_float(existing.get("y"))
+            ez = _safe_float(existing.get("z"))
+            if ex is not None and ey is not None and ez is not None:
+                if abs(ex - scale_x) < 1e-9 and abs(ey - scale_y) < 1e-9 and abs(ez - scale_z) < 1e-9:
+                    row["metrics_coordinate_space"] = "corrected_mm"
+                    row["correction_source"] = correction_source
+                    row["correction_context_id"] = correction_context_id or row.get("correction_context_id")
+                    continue
+        raw_snapshot = row.get("raw_metrics")
+        if not isinstance(raw_snapshot, dict):
+            row["raw_metrics"] = {
+                "dimensions_mm": list(row.get("dimensions_mm") or []) if isinstance(row.get("dimensions_mm"), (list, tuple)) else None,
+                "major_axis_mm": row.get("major_axis_mm"),
+                "minor_axis_mm": row.get("minor_axis_mm"),
+                "diameter_mm": row.get("diameter_mm"),
+                "sphericity_score": row.get("sphericity_score"),
+                "feature_sphericity_3d": row.get("feature_sphericity_3d"),
+                "feature_eccentricity": row.get("feature_eccentricity"),
+                "feature_volume_proxy_mm3": row.get("feature_volume_proxy_mm3"),
+                "feature_edge_roughness": row.get("feature_edge_roughness"),
+                "feature_local_curvature_proxy": row.get("feature_local_curvature_proxy"),
+                "feature_curvature_components_raw": dict(row.get("feature_curvature_components_raw") or {}) if isinstance(row.get("feature_curvature_components_raw"), dict) else None,
+                "footprint_area_mm2": row.get("footprint_area_mm2"),
+                "height_above_belt_mm": dict(row.get("height_above_belt_mm") or {}) if isinstance(row.get("height_above_belt_mm"), dict) else None,
+            }
         # NOTE: Keep positional fields (center_mm, bbox_*_mm) in heightmap coordinates so that
         # overlay rendering (which converts mm -> pixel using the original x/y resolution) still
         # draws markers on the actual object. Only physical size fields get scaled.
+        changed = True
         row["dimensions_mm"] = _scale_tuple(row.get("dimensions_mm"), (scale_x, scale_y, scale_z))
         _scale_number(row, "major_axis_mm", scale_x)
         _scale_number(row, "minor_axis_mm", scale_y)
@@ -2552,7 +2797,121 @@ def _apply_known_object_scale_correction(objects: list[dict[str, Any]], *, scale
         _scale_number(row, "feature_volume_proxy_mm3", scale_x * scale_y * scale_z)
         _scale_number(row, "feature_edge_roughness", scale_z)
         _scale_number(row, "footprint_area_mm2", scale_x * scale_y)
+        # Recompute the curvature proxy in corrected metric space. Curvature is
+        # mean(|dH/dx|) + mean(|dH/dy|). After correction, dH gets * scale_z while
+        # dx gets * scale_x and dy gets * scale_y, so the per-axis correction factors
+        # are scale_z/scale_x and scale_z/scale_y, not just scale_z. Without this the
+        # proxy stays inflated whenever scale_x and scale_y differ from each other.
+        curvature_components = row.get("feature_curvature_components_raw")
+        if (
+            isinstance(curvature_components, dict)
+            and curvature_components.get("mean_abs_gx_mm_per_mm") is not None
+            and curvature_components.get("mean_abs_gy_mm_per_mm") is not None
+            and scale_x > 1e-9
+            and scale_y > 1e-9
+        ):
+            gx_raw = float(curvature_components.get("mean_abs_gx_mm_per_mm") or 0.0)
+            gy_raw = float(curvature_components.get("mean_abs_gy_mm_per_mm") or 0.0)
+            corrected_curvature = gx_raw * (scale_z / scale_x) + gy_raw * (scale_z / scale_y)
+            row["feature_local_curvature_proxy"] = round(corrected_curvature, 4)
+            row["feature_curvature_components_corrected"] = {
+                "mean_abs_gx_mm_per_mm": round(gx_raw * (scale_z / scale_x), 6),
+                "mean_abs_gy_mm_per_mm": round(gy_raw * (scale_z / scale_y), 6),
+                "scale_z_over_scale_x": round(scale_z / scale_x, 6),
+                "scale_z_over_scale_y": round(scale_z / scale_y, 6),
+            }
+        else:
+            # Fallback for objects without per-axis curvature components (e.g.
+            # measurement stage from an older pipeline run). Use the isotropic
+            # min(scale_z/scale_x, scale_z/scale_y) as a conservative bound so
+            # the proxy doesn't stay inflated at raw-units magnitudes.
+            if scale_x > 1e-9 and scale_y > 1e-9:
+                effective_factor = min(scale_z / scale_x, scale_z / scale_y, scale_z)
+                _scale_number(row, "feature_local_curvature_proxy", effective_factor)
+        metric_ctx = row.get("geometry_metric_context") if isinstance(row.get("geometry_metric_context"), dict) else {}
+        x_res = _safe_float(metric_ctx.get("x_resolution_mm")) or 1.0
+        y_res = _safe_float(metric_ctx.get("y_resolution_mm")) or 1.0
+        raw_contour = row.get("contour_px")
+        raw_geom = _contour_metrics_in_metric_space(
+            raw_contour if isinstance(raw_contour, list) else None,
+            x_resolution_mm=x_res,
+            y_resolution_mm=y_res,
+            scale_x=1.0,
+            scale_y=1.0,
+        )
+        corrected_geom = _contour_metrics_in_metric_space(
+            raw_contour if isinstance(raw_contour, list) else None,
+            x_resolution_mm=x_res,
+            y_resolution_mm=y_res,
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
+        contour_correction_applied = bool(corrected_geom.get("valid"))
+        if contour_correction_applied:
+            row["major_axis_mm"] = corrected_geom.get("major_axis_mm")
+            row["minor_axis_mm"] = corrected_geom.get("minor_axis_mm")
+            row["feature_eccentricity"] = corrected_geom.get("eccentricity")
+            row["sphericity_score"] = corrected_geom.get("roundness")
+            row["feature_footprint_roundness"] = corrected_geom.get("roundness")
+            row["feature_circularity"] = corrected_geom.get("circularity")
+            row["footprint_area_mm2"] = corrected_geom.get("area_mm2")
+            row["perimeter_mm"] = corrected_geom.get("perimeter_mm")
+            row["diameter_mm"] = corrected_geom.get("major_axis_mm")
+            row["geometry_debug"] = {
+                "raw": raw_geom,
+                "corrected": corrected_geom,
+                "point_cloud_mm": row.get("center_mm"),
+                "geometry_coordinate_space": "corrected_metric_mm",
+                "scale_x": scale_x,
+                "scale_y": scale_y,
+                "scale_z": scale_z,
+            }
+        # Recompute feature_sphericity_3d in corrected metric space using the
+        # canonical XYZ extents (dimensions_mm). Doing it here, AFTER any
+        # contour-based override, prevents stretched / misaligned ellipse axes
+        # from collapsing the axis-balance ratio to a near-zero value when the
+        # raw heightmap is anisotropic (scale_x != scale_y != scale_z).
+        dims_for_sph3d = row.get("dimensions_mm") if isinstance(row.get("dimensions_mm"), (list, tuple)) else None
+        if dims_for_sph3d is not None and len(dims_for_sph3d) >= 3:
+            row["feature_sphericity_3d"] = round(
+                _axis_balance_3d(
+                    float(dims_for_sph3d[0]),
+                    float(dims_for_sph3d[1]),
+                    float(dims_for_sph3d[2]),
+                ),
+                4,
+            )
+        invariants: list[str] = []
+        dx = _safe_float((row.get("dimensions_mm") or [None, None, None])[0] if isinstance(row.get("dimensions_mm"), (list, tuple)) else None)
+        dy = _safe_float((row.get("dimensions_mm") or [None, None, None])[1] if isinstance(row.get("dimensions_mm"), (list, tuple)) else None)
+        ecc = _safe_float(row.get("feature_eccentricity"))
+        if dx is not None and dy is not None and ecc is not None and abs(dx - dy) <= max(2.5, 0.05 * max(dx, dy)) and ecc > 0.85:
+            invariants.append("invariant_violation:near_equal_dims_with_extreme_eccentricity")
+        sel_d = _safe_float(row.get("diameter_mm"))
+        if dx is not None and dy is not None and sel_d is not None and sel_d > (2.2 * max(dx, dy)):
+            invariants.append("invariant_violation:diameter_far_exceeds_dims")
+        roundness = _safe_float(row.get("sphericity_score"))
+        if dx is not None and dy is not None and roundness is not None and max(dx, dy) > 20 and roundness < 0.05:
+            invariants.append("invariant_violation:compact_blob_with_near_zero_roundness")
+        # Only flag anisotropic scales as a metric-stability concern when the
+        # contour-based corrected geometry could not be derived. With a valid
+        # corrected contour the planar metrics ARE in true mm space, so the
+        # raw->corrected anisotropy is information, not a defect.
+        if (
+            not contour_correction_applied
+            and (max(scale_x, scale_y, scale_z) / max(min(scale_x, scale_y, scale_z), 1e-9)) > 4.0
+        ):
+            invariants.append("warning:anisotropic_scale_factors_may_destabilize_metrics")
+        if invariants:
+            row["geometry_invariant_warnings"] = invariants
+        else:
+            row.pop("geometry_invariant_warnings", None)
+        row["geometry_coordinate_space"] = "corrected_metric_mm"
         row["scale_correction_applied"] = {"x": scale_x, "y": scale_y, "z": scale_z}
+        row["metrics_coordinate_space"] = "corrected_mm"
+        row["correction_source"] = correction_source
+        row["correction_context_id"] = correction_context_id
+    return changed
 
 
 def _axis_balance_3d(x_mm: float, y_mm: float, z_mm: float) -> float:
@@ -2587,7 +2946,12 @@ class ClassifyMiningBall25DStage:
         objects = context.get_artifact("objects", [])
         ball_count = 0
         non_ball = 0
+        explanations: list[dict[str, Any]] = []
         for item in objects:
+            if "metrics_coordinate_space" not in item:
+                item["metrics_coordinate_space"] = "raw_mm"
+            if "correction_source" not in item:
+                item["correction_source"] = "none"
             label, display_label, class_name, confidence = _classify_25d(item)
             superclass = map_label_to_superclass(label)
             label, display_label, class_name, confidence, superclass = apply_sphericity_3d_fallback_to_object(
@@ -2610,6 +2974,14 @@ class ClassifyMiningBall25DStage:
                 "superclass": superclass,
                 "confidence": confidence,
             }
+            diameter_metrics = _compose_diameter_metrics(item)
+            item["diameter_ellipse_mm"] = diameter_metrics.get("diameter_ellipse_mm")
+            item["diameter_equivalent_area_mm"] = diameter_metrics.get("diameter_equivalent_area_mm")
+            item["diameter_circumference_mm"] = diameter_metrics.get("diameter_circumference_mm")
+            item["diameter_selected_mm"] = diameter_metrics.get("diameter_selected_mm")
+            item["diameter_selected_source"] = diameter_metrics.get("diameter_selected_source")
+            item["diameter_sanity_status"] = diameter_metrics.get("diameter_sanity_status")
+            item["diameter_sanity_message"] = diameter_metrics.get("diameter_sanity_message")
             reasons: list[str] = []
             if float(item.get("sphericity_score") or 0.0) < 0.75:
                 reasons.append("low_sphericity")
@@ -2630,6 +3002,13 @@ class ClassifyMiningBall25DStage:
                 },
                 "rejected_ball_reasons": reasons,
             }
+            explanation = _classification_explanation_for_object(item)
+            item["classification_explanation"] = explanation
+            item["classification_explanation_ref"] = {
+                "artifact_id": "classification_explanation",
+                "object_id": int(item.get("object_id", 0) or 0),
+            }
+            explanations.append(explanation)
             if class_name == "ball":
                 ball_count += 1
             elif class_name == "non_ball":
@@ -2649,6 +3028,7 @@ class ClassifyMiningBall25DStage:
                         "superclass": superclass,
                         "numeric_source_artifact": numeric_source_artifact_id,
                         "semantic_field": "height_above_belt",
+                        "classification_explanation_artifact_id": "classification_explanation",
                     }
                 ),
             )
@@ -2698,6 +3078,71 @@ class ClassifyMiningBall25DStage:
                     "superclass": canonical.get("superclass"),
                     "numeric_source_artifact": numeric_source_artifact_id,
                     "semantic_field": "height_above_belt",
+                }
+            ),
+        )
+        output_dir: Path = context.require_artifact("output_dir")
+        explanation_payload = {
+            "stage": "classification",
+            "artifact_id": "classification_explanation",
+            "scope": "global",
+            "objects": explanations,
+        }
+        metric_payload = {
+            "stage": "classification",
+            "artifact_id": "metric_explanation",
+            "scope": "global",
+            "objects": [
+                {
+                    "object_id": row.get("object_id"),
+                    "metric_trace": row.get("metric_trace") if isinstance(row, dict) else [],
+                }
+                for row in explanations
+            ],
+        }
+        (output_dir / "classification_explanation.json").write_text(json.dumps(explanation_payload, indent=2), encoding="utf-8")
+        (output_dir / "metric_explanation.json").write_text(json.dumps(metric_payload, indent=2), encoding="utf-8")
+        files = dict(context.get_artifact("files", {}))
+        files["classification_explanation"] = "classification_explanation.json"
+        files["metric_explanation"] = "metric_explanation.json"
+        context.set_artifact("files", files)
+        context.add_processing_artifact(
+            artifact_id="classification_explanation",
+            stage_id="classification",
+            kind="json",
+            title="Classification rule explanation",
+            path="classification_explanation.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "scope": "global",
+                    "semantic_type": "classification_explanation",
+                    "artifact_type": "classification_explanation",
+                    "object_count": len(explanations),
+                    "objects": explanations,
+                }
+            ),
+        )
+        context.add_processing_artifact(
+            artifact_id="metric_explanation",
+            stage_id="classification",
+            kind="json",
+            title="Metric explanation",
+            path="metric_explanation.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "scope": "global",
+                    "semantic_type": "metric_explanation",
+                    "artifact_type": "metric_explanation",
+                    "object_count": len(explanations),
+                    "objects": metric_payload["objects"],
                 }
             ),
         )
@@ -3160,8 +3605,12 @@ def _select_low_gradient_component(
         area_ratio = float(area / total)
         if area_ratio < float(min_area_ratio):
             continue
-        zvals = z[mask]
-        gvals = gradient[mask]
+        # Restrict statistics to valid pixels: morphology (e.g. CLOSE) can dilate
+        # the component into invalid pixels whose z (often a 0 sentinel) would
+        # otherwise dominate std/mean/percentile readings.
+        stat_mask = mask & valid_mask
+        zvals = z[stat_mask]
+        gvals = gradient[stat_mask]
         if zvals.size == 0:
             continue
         z_std = float(np.std(zvals))
@@ -3259,6 +3708,79 @@ def _mask_centroid(mask: np.ndarray) -> tuple[float, float]:
     return (float(np.mean(xs)), float(np.mean(ys)))
 
 
+def _contour_metrics_in_metric_space(
+    contour_px: list[list[float]] | None,
+    *,
+    x_resolution_mm: float,
+    y_resolution_mm: float,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> dict[str, Any]:
+    if not isinstance(contour_px, list) or len(contour_px) < 5:
+        return {
+            "valid": False,
+            "perimeter_mm": None,
+            "area_mm2": None,
+            "major_axis_mm": None,
+            "minor_axis_mm": None,
+            "eccentricity": None,
+            "roundness": None,
+            "circularity": None,
+            "ellipse_fit_mm": None,
+            "covariance_axes_mm": None,
+            "contour_mm": None,
+        }
+    pts = np.asarray(contour_px, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return {"valid": False}
+    mm = np.column_stack(
+        (
+            pts[:, 0] * float(x_resolution_mm) * float(scale_x),
+            pts[:, 1] * float(y_resolution_mm) * float(scale_y),
+        )
+    ).astype(np.float32)
+    mm_cv = mm.reshape((-1, 1, 2))
+    perimeter_mm = float(cv2.arcLength(mm_cv, True))
+    area_mm2 = float(abs(cv2.contourArea(mm_cv)))
+    ellipse = cv2.fitEllipse(mm_cv)
+    (_cx, _cy), (ax1, ax2), _angle = ellipse
+    major = max(float(ax1), float(ax2))
+    minor = min(float(ax1), float(ax2))
+    eccentricity = float(np.sqrt(max(0.0, 1.0 - (minor * minor) / max(major * major, 1e-9))))
+    roundness = float(minor / max(major, 1e-9))
+    circularity = float((4.0 * np.pi * area_mm2) / max(perimeter_mm * perimeter_mm, 1e-9))
+    cov = np.cov(mm.T)
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(evals)[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+    cov_major = float(2.0 * np.sqrt(max(evals[0], 0.0)))
+    cov_minor = float(2.0 * np.sqrt(max(evals[1], 0.0)))
+    return {
+        "valid": True,
+        "perimeter_mm": round(perimeter_mm, 4),
+        "area_mm2": round(area_mm2, 4),
+        "major_axis_mm": round(major, 4),
+        "minor_axis_mm": round(minor, 4),
+        "eccentricity": round(eccentricity, 4),
+        "roundness": round(roundness, 4),
+        "circularity": round(circularity, 4),
+        "ellipse_fit_mm": {
+            "major_axis_mm": round(major, 4),
+            "minor_axis_mm": round(minor, 4),
+            "eccentricity": round(eccentricity, 4),
+            "roundness": round(roundness, 4),
+            "circularity": round(circularity, 4),
+        },
+        "covariance_axes_mm": {
+            "major_axis_mm": round(cov_major, 4),
+            "minor_axis_mm": round(cov_minor, 4),
+            "eigenvectors": evecs.astype(float).tolist(),
+        },
+        "contour_mm": mm.astype(float).tolist(),
+    }
+
+
 def _roi_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
     roi = metadata.get("roi_25d")
     return roi if isinstance(roi, dict) else None
@@ -3319,6 +3841,923 @@ def _classify_25d(item: dict[str, Any]) -> tuple[str, str, str, float]:
     if max_h < 6.0 or p95_h < 4.0 or vol < 4000.0:
         return "planchuela", "Chatarra - Planchuelas", "non_ball", 0.72
     return "bola_con_chip", "Scrap de Bola - Bola con chip", "non_ball", 0.66
+
+
+def _metric(item: dict[str, Any], key: str) -> float | None:
+    if key == "max_height_mm":
+        return _safe_float(((item.get("height_above_belt_mm") or {}).get("max_height_mm")) if isinstance(item.get("height_above_belt_mm"), dict) else None)
+    if key == "p95_height_mm":
+        return _safe_float(((item.get("height_above_belt_mm") or {}).get("p95_height_mm")) if isinstance(item.get("height_above_belt_mm"), dict) else None)
+    if key == "mean_height_mm":
+        return _safe_float(((item.get("height_above_belt_mm") or {}).get("mean_height_mm")) if isinstance(item.get("height_above_belt_mm"), dict) else None)
+    return _safe_float(item.get(key))
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return out
+
+
+def _rule(
+    *,
+    rule_id: str,
+    label: str,
+    description: str,
+    metric_key: str,
+    value: float | None,
+    comparator: str,
+    expected: dict[str, float] | None,
+    passed: bool,
+    severity: str,
+    contribution: str,
+    message: str,
+    raw_value: float | None = None,
+    corrected_value: float | None = None,
+    correction_scale: float | None = None,
+    metric_source: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "rule_id": rule_id,
+        "label": label,
+        "description": description,
+        "metric_key": metric_key,
+        "value": value,
+        "comparator": comparator,
+        "passed": bool(passed),
+        "severity": severity,
+        "contribution": contribution,
+        "message": message,
+    }
+    if expected:
+        payload["expected_range"] = expected
+        payload["threshold"] = expected
+    payload["raw_value"] = raw_value
+    payload["corrected_value"] = corrected_value if corrected_value is not None else value
+    payload["correction_scale"] = correction_scale
+    payload["metric_source"] = metric_source or "object_metrics"
+    return payload
+
+
+def _raw_metric(item: dict[str, Any], key: str) -> float | None:
+    raw = item.get("raw_metrics")
+    if not isinstance(raw, dict):
+        return None
+    if key in ("max_height_mm", "mean_height_mm", "p95_height_mm"):
+        heights = raw.get("height_above_belt_mm")
+        if isinstance(heights, dict):
+            return _safe_float(heights.get(key))
+        return None
+    return _safe_float(raw.get(key))
+
+
+def _compose_diameter_metrics(item: dict[str, Any]) -> dict[str, Any]:
+    footprint_area = _safe_float(item.get("footprint_area_mm2"))
+    circumference = _safe_float(item.get("perimeter_mm"))
+    major = _safe_float(item.get("major_axis_mm"))
+    minor = _safe_float(item.get("minor_axis_mm"))
+    dims = item.get("dimensions_mm") if isinstance(item.get("dimensions_mm"), (list, tuple)) else None
+    dim_x = _safe_float(dims[0] if isinstance(dims, (list, tuple)) and len(dims) >= 1 else major)
+    dim_y = _safe_float(dims[1] if isinstance(dims, (list, tuple)) and len(dims) >= 2 else minor)
+    dim_z = _safe_float(dims[2] if isinstance(dims, (list, tuple)) and len(dims) >= 3 else ((item.get("height_above_belt_mm") or {}).get("max_height_mm") if isinstance(item.get("height_above_belt_mm"), dict) else None))
+    diameter_ellipse = max(v for v in (major, minor) if v is not None) if (major is not None or minor is not None) else None
+    diameter_equivalent_area = (2.0 * float(np.sqrt(max(0.0, footprint_area) / np.pi))) if footprint_area is not None and footprint_area > 0 else None
+    diameter_circumference = (circumference / np.pi) if circumference is not None and circumference > 0 else None
+    diameter_selected = _safe_float(item.get("diameter_mm"))
+    selected_source = "legacy_diameter_mm"
+    if diameter_selected is not None:
+        if diameter_ellipse is not None and abs(diameter_selected - diameter_ellipse) < 1e-3:
+            selected_source = "ellipse"
+        elif diameter_equivalent_area is not None and abs(diameter_selected - diameter_equivalent_area) < 1e-3:
+            selected_source = "equivalent_area"
+        elif diameter_circumference is not None and abs(diameter_selected - diameter_circumference) < 1e-3:
+            selected_source = "circumference"
+    max_dim_xy = max(v for v in (dim_x, dim_y) if v is not None) if (dim_x is not None or dim_y is not None) else None
+    ratio = (diameter_selected / max_dim_xy) if diameter_selected is not None and max_dim_xy is not None and max_dim_xy > 1e-9 else None
+    sanity_status = "ok"
+    sanity_message = "Diameter is consistent with XY dimensions."
+    if ratio is not None and ratio > 1.8:
+        sanity_status = "suspicious"
+        sanity_message = f"Selected diameter ({diameter_selected:.2f}mm) is inconsistent with max(dim_x,dim_y) ({max_dim_xy:.2f}mm); ratio={ratio:.2f}."
+    if ratio is not None and ratio > 2.5:
+        sanity_status = "invalid"
+        sanity_message = f"Selected diameter appears impossible for object footprint; ratio={ratio:.2f}."
+    if sanity_status in ("suspicious", "invalid"):
+        if diameter_ellipse is not None:
+            diameter_selected = diameter_ellipse
+            selected_source = "ellipse_fallback_from_sanity"
+        elif max_dim_xy is not None:
+            diameter_selected = max_dim_xy
+            selected_source = "dim_xy_fallback_from_sanity"
+    return {
+        "dim_x_mm": dim_x,
+        "dim_y_mm": dim_y,
+        "dim_z_mm": dim_z,
+        "diameter_ellipse_mm": diameter_ellipse,
+        "diameter_equivalent_area_mm": diameter_equivalent_area,
+        "diameter_circumference_mm": diameter_circumference,
+        "diameter_selected_mm": diameter_selected,
+        "diameter_selected_source": selected_source,
+        "diameter_sanity_status": sanity_status,
+        "diameter_sanity_message": sanity_message,
+    }
+
+
+def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, Any]:
+    final_class_name = str(item.get("class_name") or "unknown")
+    final_class_label = str(item.get("label") or item.get("display_label") or "unknown")
+    superclass = str(item.get("superclass") or "UNKNOWN")
+    subclass = item.get("subclass_label")
+    confidence = _safe_float(item.get("confidence"))
+    diameter = _compose_diameter_metrics(item)
+    dim_x = diameter["dim_x_mm"]
+    dim_y = diameter["dim_y_mm"]
+    dim_z = diameter["dim_z_mm"]
+    max_dim_xy = max(v for v in (dim_x, dim_y) if v is not None) if (dim_x is not None or dim_y is not None) else None
+    selected_d = diameter["diameter_selected_mm"]
+    ratio = (selected_d / max_dim_xy) if selected_d is not None and max_dim_xy is not None and max_dim_xy > 1e-9 else None
+    # Preserve the original (pre-fallback) diameter so the explanation rule can
+    # still surface a "Suspicious diameter mismatch" even after _compose_diameter_metrics
+    # has swapped in a sane fallback for downstream classification.
+    raw_diameter_for_sanity = _safe_float(item.get("diameter_mm"))
+    raw_ratio = (
+        raw_diameter_for_sanity / max_dim_xy
+        if raw_diameter_for_sanity is not None and max_dim_xy is not None and max_dim_xy > 1e-9
+        else None
+    )
+    diameter_sanity_status = str(diameter.get("diameter_sanity_status") or "ok")
+    diameter_sanity_message = str(diameter.get("diameter_sanity_message") or "")
+
+    rules: list[dict[str, Any]] = []
+    max_h = _metric(item, "max_height_mm")
+    p95_h = _metric(item, "p95_height_mm")
+    ecc = _metric(item, "feature_eccentricity")
+    sph3d = _metric(item, "feature_sphericity_3d")
+    flat = _metric(item, "feature_flatness")
+    rough = _metric(item, "feature_edge_roughness")
+    vol = _metric(item, "feature_volume_proxy_mm3")
+    roundness = _metric(item, "sphericity_score")
+    deformation = _metric(item, "feature_local_curvature_proxy")
+    invariant_warnings = item.get("geometry_invariant_warnings") if isinstance(item.get("geometry_invariant_warnings"), list) else []
+    footprint_area = _metric(item, "footprint_area_mm2")
+    trunc = _safe_float(((item.get("sphere_fit_diagnostics") or {}).get("estimated_truncation_ratio")) if isinstance(item.get("sphere_fit_diagnostics"), dict) else None)
+    fit_rmse = _metric(item, "fit_rmse_mm")
+    scale = (item.get("scale_correction_applied") or {}) if isinstance(item.get("scale_correction_applied"), dict) else {}
+    scale_x = _safe_float(scale.get("x"))
+    scale_y = _safe_float(scale.get("y"))
+    scale_z = _safe_float(scale.get("z"))
+
+    rules.extend(
+        [
+            _rule(
+                rule_id="shape.sphericity_3d",
+                label="3D sphericity",
+                description="3D axis balance should be high for spherical balls.",
+                metric_key="feature_sphericity_3d",
+                value=sph3d,
+                comparator=">=",
+                expected={"min": 0.8},
+                passed=(sph3d is not None and sph3d >= 0.8),
+                severity="critical",
+                contribution="positive" if (sph3d is not None and sph3d >= 0.8) else "negative",
+                message="Sphericity supports ball classification." if (sph3d is not None and sph3d >= 0.8) else "Low 3D sphericity pushes toward non-ball.",
+            ),
+            _rule(
+                rule_id="shape.eccentricity",
+                label="Eccentricity",
+                description="Projected eccentricity should stay low for near-round objects.",
+                metric_key="feature_eccentricity",
+                value=ecc,
+                comparator="<",
+                expected={"max": 0.45},
+                passed=(ecc is not None and ecc < 0.45),
+                severity="critical",
+                contribution="positive" if (ecc is not None and ecc < 0.45) else "negative",
+                message="Low eccentricity supports round object." if (ecc is not None and ecc < 0.45) else "High eccentricity indicates deformation/non-ball.",
+            ),
+            _rule(
+                rule_id="shape.roundness",
+                label="Roundness score",
+                description="Roundness from footprint/axes should not collapse for true balls.",
+                metric_key="sphericity_score",
+                value=roundness,
+                comparator=">=",
+                expected={"min": 0.75},
+                passed=(roundness is not None and roundness >= 0.75),
+                severity="critical",
+                contribution="positive" if (roundness is not None and roundness >= 0.75) else "negative",
+                message="Roundness supports ball." if (roundness is not None and roundness >= 0.75) else "Very low roundness is decisive non-ball evidence.",
+            ),
+            _rule(
+                rule_id="height.max",
+                label="Max height band",
+                description="Ball-like objects should appear within expected height range.",
+                metric_key="max_height_mm",
+                value=max_h,
+                comparator="between",
+                expected={"min": 8.0, "max": 95.0},
+                passed=(max_h is not None and 8.0 <= max_h <= 95.0),
+                severity="info",
+                contribution="positive" if (max_h is not None and 8.0 <= max_h <= 95.0) else "neutral",
+                message="Height in valid band." if (max_h is not None and 8.0 <= max_h <= 95.0) else "Height outside preferred ball range.",
+            ),
+            _rule(
+                rule_id="shape.flatness",
+                label="Flatness",
+                description="Flatness underflow indicates truncated or non-spherical shape.",
+                metric_key="feature_flatness",
+                value=flat,
+                comparator=">",
+                expected={"min": 0.15},
+                passed=(flat is not None and flat > 0.15),
+                severity="warning",
+                contribution="positive" if (flat is not None and flat > 0.15) else "negative",
+                message="Flatness supports full body shape." if (flat is not None and flat > 0.15) else "Low flatness suggests chip/truncation.",
+            ),
+            _rule(
+                rule_id="shape.roughness",
+                label="Edge roughness",
+                description="Excessive roughness is a defect/scrap indicator.",
+                metric_key="feature_edge_roughness",
+                value=rough,
+                comparator="<",
+                expected={"max": 8.0},
+                passed=(rough is not None and rough < 8.0),
+                severity="warning",
+                contribution="positive" if (rough is not None and rough < 8.0) else "negative",
+                message="Roughness within expected band." if (rough is not None and rough < 8.0) else "High roughness supports non-ball/deformed class.",
+            ),
+            _rule(
+                rule_id="volume.minimum",
+                label="Volume floor",
+                description="Very low volume is consistent with flat scraps.",
+                metric_key="feature_volume_proxy_mm3",
+                value=vol,
+                comparator=">=",
+                expected={"min": 4000.0},
+                passed=(vol is not None and vol >= 4000.0),
+                severity="warning",
+                contribution="positive" if (vol is not None and vol >= 4000.0) else "negative",
+                message="Volume supports ball-like mass." if (vol is not None and vol >= 4000.0) else "Low volume is non-ball evidence.",
+            ),
+            _rule(
+                rule_id="height.p95_floor",
+                label="Height P95 floor",
+                description="Low p95 height indicates flattened profile.",
+                metric_key="p95_height_mm",
+                value=p95_h,
+                comparator=">=",
+                expected={"min": 4.0},
+                passed=(p95_h is not None and p95_h >= 4.0),
+                severity="warning",
+                contribution="positive" if (p95_h is not None and p95_h >= 4.0) else "negative",
+                message="Height distribution supports object body." if (p95_h is not None and p95_h >= 4.0) else "Low p95 height indicates planchuela-like profile.",
+            ),
+        ]
+    )
+
+    rules.extend(
+        [
+            _rule(
+                rule_id="sanity.footprint_area_present",
+                label="Footprint area present",
+                description="Footprint area must exist for diameter cross-checks.",
+                metric_key="footprint_area_mm2",
+                value=footprint_area,
+                comparator=">",
+                expected={"min": 0.0},
+                passed=(footprint_area is not None and footprint_area > 0.0),
+                severity="warning",
+                contribution="neutral" if (footprint_area is not None and footprint_area > 0.0) else "negative",
+                message="Footprint area available." if (footprint_area is not None and footprint_area > 0.0) else "Missing footprint area disables reliable equivalent-diameter checks.",
+            ),
+            _rule(
+                rule_id="sanity.ellipse_fit_valid",
+                label="Ellipse fit validity",
+                description="Invalid ellipse fit reduces trust in ellipse-derived diameter.",
+                metric_key="fit_rmse_mm",
+                value=fit_rmse,
+                comparator="<=",
+                expected={"max": 5.0},
+                passed=(fit_rmse is None or fit_rmse <= 5.0),
+                severity="warning",
+                contribution="neutral" if (fit_rmse is None or fit_rmse <= 5.0) else "negative",
+                message="Ellipse fit quality acceptable." if (fit_rmse is None or fit_rmse <= 5.0) else "High fit RMSE indicates unstable ellipse metrics.",
+            ),
+            _rule(
+                rule_id="sanity.scale_factors",
+                label="Scale factors",
+                description="Reports the calibration scale envelope; aggressive scales are informational once a calibrated correction is applied.",
+                metric_key="scale_correction_applied",
+                value=max(v for v in (scale_x, scale_y, scale_z) if v is not None) if (scale_x is not None or scale_y is not None or scale_z is not None) else None,
+                comparator="between",
+                expected={"min": 0.5, "max": 2.0},
+                # Once a contour-based corrected metric geometry has been produced
+                # (geometry_coordinate_space == corrected_metric_mm), the post-
+                # correction metrics live in true mm space regardless of how
+                # aggressive the per-axis raw->corrected scales are. Don't fail
+                # this rule purely because the calibration chain is anisotropic.
+                passed=(
+                    (scale_x is None and scale_y is None and scale_z is None)
+                    or str(item.get("geometry_coordinate_space") or "") == "corrected_metric_mm"
+                    or all(0.5 <= v <= 2.0 for v in (scale_x, scale_y, scale_z) if v is not None)
+                ),
+                severity="info",
+                contribution="neutral",
+                message=(
+                    "Scale factors within expected envelope."
+                    if (
+                        (scale_x is None and scale_y is None and scale_z is None)
+                        or all(0.5 <= v <= 2.0 for v in (scale_x, scale_y, scale_z) if v is not None)
+                    )
+                    else "Calibrated scale factors are aggressive; metrics are computed in corrected mm space."
+                    if str(item.get("geometry_coordinate_space") or "") == "corrected_metric_mm"
+                    else "Suspicious scale correction factors detected; inspect calibration chain."
+                ),
+            ),
+            _rule(
+                rule_id="sanity.diameter_vs_dims",
+                label="Diameter consistency",
+                description="Selected diameter should be consistent with measured XY footprint dimensions.",
+                metric_key="diameter_selected_mm",
+                value=selected_d,
+                comparator="ratio_to_max_dim_xy",
+                expected={"max": 1.8},
+                # Surface the suspicion even when _compose_diameter_metrics has
+                # already replaced the bad selected diameter with a sane
+                # ellipse_fallback_from_sanity: the raw ratio still tells us
+                # the calibration / measurement chain produced an inconsistent
+                # diameter and that information must reach the explanation UI.
+                passed=(
+                    diameter_sanity_status == "ok"
+                    and (ratio is None or ratio <= 1.8)
+                    and (raw_ratio is None or raw_ratio <= 1.8)
+                ),
+                severity=(
+                    "critical"
+                    if (
+                        (ratio is not None and ratio > 2.5)
+                        or (raw_ratio is not None and raw_ratio > 2.5)
+                        or diameter_sanity_status == "invalid"
+                    )
+                    else "warning"
+                ),
+                contribution=(
+                    "negative"
+                    if (
+                        diameter_sanity_status != "ok"
+                        or (ratio is not None and ratio > 1.8)
+                        or (raw_ratio is not None and raw_ratio > 1.8)
+                    )
+                    else "neutral"
+                ),
+                message=(
+                    f"Suspicious diameter mismatch: raw diameter={raw_diameter_for_sanity:.2f}mm vs max(dim_x,dim_y)={max_dim_xy:.2f}mm (ratio={raw_ratio:.2f}). {diameter_sanity_message}".strip()
+                    if (
+                        raw_ratio is not None and raw_ratio > 1.8
+                        and raw_diameter_for_sanity is not None
+                        and max_dim_xy is not None
+                    )
+                    else (
+                        f"Suspicious diameter mismatch: selected={selected_d:.2f}mm vs max(dim_x,dim_y)={max_dim_xy:.2f}mm (ratio={ratio:.2f})."
+                        if ratio is not None and ratio > 1.8 and selected_d is not None and max_dim_xy is not None
+                        else "Diameter and footprint dimensions are broadly consistent."
+                    )
+                ),
+            ),
+            _rule(
+                rule_id="sanity.extremely_low_shape_metrics",
+                label="Extremely low shape metrics",
+                description="Near-zero roundness/sphericity strongly indicates non-ball or broken metrics.",
+                metric_key="shape_low_guard",
+                value=min(v for v in (sph3d, roundness) if v is not None) if (sph3d is not None or roundness is not None) else None,
+                comparator=">=",
+                expected={"min": 0.05},
+                passed=(
+                    (sph3d is None and roundness is None)
+                    or ((sph3d if sph3d is not None else 1.0) >= 0.05 and (roundness if roundness is not None else 1.0) >= 0.05)
+                ),
+                severity="critical",
+                contribution="negative"
+                if ((sph3d is not None and sph3d < 0.05) or (roundness is not None and roundness < 0.05))
+                else "neutral",
+                message="Shape metrics above extreme-failure floor."
+                if not ((sph3d is not None and sph3d < 0.05) or (roundness is not None and roundness < 0.05))
+                else "Roundness/sphericity are extremely low and are decisive non-ball evidence.",
+            ),
+        ]
+    )
+
+    if trunc is not None:
+        rules.append(
+            _rule(
+                rule_id="shape.truncation_ratio",
+                label="Truncation ratio",
+                description="Estimated missing lower hemisphere from sphere-fit diagnostics.",
+                metric_key="estimated_truncation_ratio",
+                value=trunc,
+                comparator="<=",
+                expected={"max": 0.2},
+                passed=trunc <= 0.2,
+                severity="warning",
+                contribution="negative" if trunc > 0.2 else "neutral",
+                message="Truncation within expected range." if trunc <= 0.2 else "High truncation suggests chip/cut object.",
+            )
+        )
+    if deformation is not None:
+        # Curvature proxy is sensitive to anisotropic raw spacing and to mask
+        # boundary artifacts. When the primary shape evidence already strongly
+        # supports a ball (high 3D sphericity, high roundness, low eccentricity),
+        # demote deformation to informational so it cannot single-handedly flip
+        # the classification of an obviously round object.
+        ball_shape_consensus = (
+            sph3d is not None and sph3d >= 0.8
+            and roundness is not None and roundness >= 0.75
+            and ecc is not None and ecc < 0.45
+        )
+        rules.append(
+            _rule(
+                rule_id="shape.deformation_score",
+                label="Deformation score",
+                description="Curvature proxy used as deformation evidence (in corrected metric space).",
+                metric_key="feature_local_curvature_proxy",
+                value=deformation,
+                comparator="<=",
+                expected={"max": 12.0},
+                passed=(deformation <= 12.0) or ball_shape_consensus,
+                severity="info" if ball_shape_consensus else "warning",
+                contribution=(
+                    "neutral" if (deformation <= 12.0 or ball_shape_consensus) else "negative"
+                ),
+                message=(
+                    "Deformation score is within expected limits."
+                    if deformation <= 12.0
+                    else "Deformation score is elevated but overall shape metrics are ball-consistent; treated as informational."
+                    if ball_shape_consensus
+                    else "High deformation score supports non-ball/deformed class."
+                ),
+            )
+        )
+    for idx, warning in enumerate(invariant_warnings):
+        warning_text = str(warning)
+        # Entries prefixed with "warning:" are advisory (e.g. anisotropic raw
+        # scaling). Entries prefixed with "invariant_violation:" represent
+        # internal inconsistency (e.g. near-equal dims with extreme eccentricity).
+        is_violation = warning_text.startswith("invariant_violation:")
+        rules.append(
+            _rule(
+                rule_id=f"sanity.geometry_invariant_{idx+1}",
+                label="Geometry invariant warning" if is_violation else "Geometry invariant info",
+                description="Invariant check over corrected metric geometry.",
+                metric_key="geometry_invariant_warnings",
+                value=None,
+                comparator="warning",
+                expected=None,
+                passed=not is_violation,
+                severity="warning" if is_violation else "info",
+                contribution="negative" if is_violation else "neutral",
+                message=warning_text,
+            )
+        )
+
+    scale_ctx = (item.get("scale_correction_applied") or {}) if isinstance(item.get("scale_correction_applied"), dict) else {}
+    sx = _safe_float(scale_ctx.get("x"))
+    sy = _safe_float(scale_ctx.get("y"))
+    sz = _safe_float(scale_ctx.get("z"))
+    for rule in rules:
+        key = str(rule.get("metric_key") or "")
+        raw_value: float | None = None
+        corrected_value: float | None = _safe_float(rule.get("value"))
+        correction_scale: float | None = None
+        if key in ("feature_sphericity_3d", "sphericity_score", "feature_eccentricity", "feature_flatness"):
+            raw_value = _raw_metric(item, key)
+            correction_scale = 1.0
+        elif key in ("max_height_mm", "mean_height_mm", "p95_height_mm", "feature_edge_roughness"):
+            raw_value = _raw_metric(item, key)
+            correction_scale = sz
+        elif key in ("feature_volume_proxy_mm3",):
+            raw_value = _raw_metric(item, key)
+            correction_scale = (sx * sy * sz) if sx is not None and sy is not None and sz is not None else None
+        elif key in ("footprint_area_mm2",):
+            raw_value = _raw_metric(item, key)
+            correction_scale = (sx * sy) if sx is not None and sy is not None else None
+        elif key in ("diameter_selected_mm",):
+            raw_value = _raw_metric(item, "diameter_mm")
+            correction_scale = sx
+        elif key in ("feature_local_curvature_proxy", "fit_rmse_mm", "estimated_truncation_ratio"):
+            raw_value = _raw_metric(item, key)
+            correction_scale = 1.0
+        rule["raw_value"] = raw_value
+        rule["corrected_value"] = corrected_value
+        rule["correction_scale"] = correction_scale
+        rule["metric_source"] = "corrected_metrics" if str(item.get("metrics_coordinate_space") or "") == "corrected_mm" else "raw_metrics"
+
+    decisive = [
+        rule for rule in rules
+        if (
+            (rule["contribution"] == "negative" and not rule["passed"])
+            or (rule["contribution"] == "positive" and rule["passed"])
+        )
+    ]
+    if not decisive:
+        fallback = next((r for r in rules if r["rule_id"] == "shape.sphericity_3d"), rules[0])
+        fallback["contribution"] = "negative" if final_class_name != "ball" else "positive"
+        decisive = [fallback]
+
+    decision_summary = {
+        "decisive_rule_ids": [str(rule["rule_id"]) for rule in decisive[:3]],
+        "critical_failures": [str(rule["rule_id"]) for rule in rules if rule["severity"] == "critical" and not bool(rule["passed"])],
+        "suspicious_metrics": [str(rule["rule_id"]) for rule in rules if rule["rule_id"].startswith("sanity.") and not bool(rule["passed"])],
+        "final_decision_path": f"{' / '.join([str(rule['rule_id']) for rule in decisive[:3]])} => {final_class_name}",
+    }
+
+    metrics_used = {
+        "max_height_mm": max_h,
+        "mean_height_mm": _metric(item, "mean_height_mm"),
+        "p95_height_mm": p95_h,
+        "feature_eccentricity": ecc,
+        "feature_sphericity_3d": sph3d,
+        "sphericity_score": roundness,
+        "feature_flatness": flat,
+        "feature_edge_roughness": rough,
+        "feature_volume_proxy_mm3": vol,
+        "feature_local_curvature_proxy": deformation,
+        "geometry_invariant_warnings": invariant_warnings,
+        "fit_rmse_mm": fit_rmse,
+        "estimated_truncation_ratio": trunc,
+        **diameter,
+    }
+
+    metric_trace = _build_metric_trace_for_object(item, rules)
+    trace_by_key = {str(row.get("metric_key") or ""): row for row in metric_trace}
+    for rule in rules:
+        key = str(rule.get("metric_key") or "")
+        trace = trace_by_key.get(key)
+        if trace is not None:
+            rule["metric_trace_ref"] = {
+                "metric_key": key,
+                "trace_id": trace.get("trace_id"),
+            }
+    return {
+        "object_id": int(item.get("object_id") or 0),
+        "final_class_name": final_class_name,
+        "final_class_label": final_class_label,
+        "superclass": superclass,
+        "subclass": subclass,
+        "confidence": confidence,
+        "metrics_coordinate_space": str(item.get("metrics_coordinate_space") or "raw_mm"),
+        "correction_source": item.get("correction_source"),
+        "correction_context_id": item.get("correction_context_id"),
+        "correction_scales": item.get("scale_correction_applied"),
+        "decision_summary": decision_summary,
+        "metrics_used": metrics_used,
+        "metric_trace": metric_trace,
+        "rules": rules,
+    }
+
+
+def _build_metric_trace_for_object(item: dict[str, Any], rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    scale = item.get("scale_correction_applied") if isinstance(item.get("scale_correction_applied"), dict) else {}
+    sx = _safe_float(scale.get("x"))
+    sy = _safe_float(scale.get("y"))
+    sz = _safe_float(scale.get("z"))
+    corrected_space = str(item.get("metrics_coordinate_space") or "raw_mm")
+    raw = item.get("raw_metrics") if isinstance(item.get("raw_metrics"), dict) else {}
+    geom = item.get("geometry_debug") if isinstance(item.get("geometry_debug"), dict) else {}
+    used_keys = {str(rule.get("metric_key") or "") for rule in rules}
+    dims = item.get("dimensions_mm") if isinstance(item.get("dimensions_mm"), (list, tuple)) else None
+    dim_x = float(dims[0]) if dims is not None and len(dims) >= 1 and dims[0] is not None else None
+    dim_y = float(dims[1]) if dims is not None and len(dims) >= 2 and dims[1] is not None else None
+    dim_z = float(dims[2]) if dims is not None and len(dims) >= 3 and dims[2] is not None else None
+    invariants = item.get("geometry_invariant_warnings") if isinstance(item.get("geometry_invariant_warnings"), list) else []
+    raw_heights = (raw.get("height_above_belt_mm") if isinstance(raw, dict) else None) or {}
+    corrected_heights = item.get("height_above_belt_mm") if isinstance(item.get("height_above_belt_mm"), dict) else {}
+    curv_raw = item.get("feature_curvature_components_raw") if isinstance(item.get("feature_curvature_components_raw"), dict) else {}
+    curv_corrected = item.get("feature_curvature_components_corrected") if isinstance(item.get("feature_curvature_components_corrected"), dict) else {}
+    # If a known-cube correction was applied AND a contour-based corrected
+    # geometry was produced, planar metrics are sourced from
+    # `contour_corrected`. Otherwise we fall back to bbox-scaled extents or
+    # raw measurement output.
+    if geom and bool(((geom.get("corrected") or {}) if isinstance(geom.get("corrected"), dict) else {}).get("valid")):
+        geometry_metric_source = "contour_corrected"
+    elif scale:
+        geometry_metric_source = "bbox_corrected"
+    else:
+        geometry_metric_source = "raw_measurement"
+
+    def _input(name: str, value: Any) -> dict[str, Any]:
+        return {"name": name, "value": value}
+
+    # Per-row specs:
+    #   (metric_key, final_value, formula_name, formula_human_readable,
+    #    formula_inputs, intermediate_values, warnings,
+    #    correction_factor_used, source_artifact_id)
+    metric_specs: list[tuple[str, Any, str, str, list[dict[str, Any]], dict[str, Any], list[Any], float | None, str]] = [
+        (
+            "feature_eccentricity",
+            item.get("feature_eccentricity"),
+            "ellipse_eccentricity_from_corrected_contour",
+            "sqrt(1 - (minor_axis_mm^2 / major_axis_mm^2))  // axes in corrected metric mm",
+            [
+                _input("major_axis_mm", item.get("major_axis_mm")),
+                _input("minor_axis_mm", item.get("minor_axis_mm")),
+            ],
+            {
+                "major_axis_mm": item.get("major_axis_mm"),
+                "minor_axis_mm": item.get("minor_axis_mm"),
+                "circularity": item.get("feature_circularity"),
+                "perimeter_mm": item.get("perimeter_mm"),
+                "area_mm2": item.get("footprint_area_mm2"),
+                "geometry_metric_source": geometry_metric_source,
+            },
+            list(invariants),
+            None,
+            "geometry_debug_summary" if geom else "measurement_object",
+        ),
+        (
+            "sphericity_score",
+            item.get("sphericity_score"),
+            "roundness_ratio_from_corrected_axes",
+            "minor_axis_mm / major_axis_mm  // axes in corrected metric mm",
+            [
+                _input("major_axis_mm", item.get("major_axis_mm")),
+                _input("minor_axis_mm", item.get("minor_axis_mm")),
+            ],
+            {
+                "major_axis_mm": item.get("major_axis_mm"),
+                "minor_axis_mm": item.get("minor_axis_mm"),
+                "feature_footprint_roundness": item.get("feature_footprint_roundness"),
+                "geometry_metric_source": geometry_metric_source,
+            },
+            [],
+            None,
+            "geometry_debug_summary" if geom else "measurement_object",
+        ),
+        (
+            "feature_sphericity_3d",
+            item.get("feature_sphericity_3d"),
+            "axis_balance_3d_from_corrected_dimensions",
+            "min(dim_x_mm, dim_y_mm, dim_z_mm) / max(dim_x_mm, dim_y_mm, dim_z_mm)  // corrected XYZ extents",
+            [
+                _input("dim_x_mm", dim_x),
+                _input("dim_y_mm", dim_y),
+                _input("dim_z_mm", dim_z),
+            ],
+            {
+                "min_axis_mm": min(v for v in (dim_x, dim_y, dim_z) if v is not None) if any(v is not None for v in (dim_x, dim_y, dim_z)) else None,
+                "max_axis_mm": max(v for v in (dim_x, dim_y, dim_z) if v is not None) if any(v is not None for v in (dim_x, dim_y, dim_z)) else None,
+                "axis_ratio": item.get("feature_sphericity_3d"),
+                "geometry_metric_source": geometry_metric_source,
+            },
+            [],
+            None,
+            "measurement_object",
+        ),
+        (
+            "diameter_selected_mm",
+            item.get("diameter_selected_mm") or item.get("diameter_mm"),
+            "diameter_selection_with_sanity",
+            "select(best of ellipse/equivalent_area/circumference) with sanity fallback when diameter is incoherent with dim_x/dim_y",
+            [
+                _input("diameter_ellipse_mm", item.get("diameter_ellipse_mm")),
+                _input("diameter_equivalent_area_mm", item.get("diameter_equivalent_area_mm")),
+                _input("diameter_circumference_mm", item.get("diameter_circumference_mm")),
+                _input("dim_x_mm", dim_x),
+                _input("dim_y_mm", dim_y),
+            ],
+            {
+                "diameter_selected_source": item.get("diameter_selected_source"),
+                "diameter_sanity_status": item.get("diameter_sanity_status"),
+                "diameter_selected_mm": item.get("diameter_selected_mm"),
+            },
+            [item.get("diameter_sanity_message")] if item.get("diameter_sanity_message") else [],
+            sx,
+            "measurement_object",
+        ),
+        (
+            "feature_local_curvature_proxy",
+            item.get("feature_local_curvature_proxy"),
+            "anisotropic_curvature_proxy_in_corrected_mm" if curv_raw else "isotropic_curvature_proxy_scale_z",
+            (
+                "mean_abs_gx_raw * (scale_z / scale_x) + mean_abs_gy_raw * (scale_z / scale_y)  // per-axis correction; gradients sampled on inner-eroded mask"
+                if curv_raw
+                else "feature_local_curvature_proxy_raw * scale_z  // fallback when per-axis gradient components were not stored"
+            ),
+            [
+                _input("mean_abs_gx_mm_per_mm_raw", curv_raw.get("mean_abs_gx_mm_per_mm") if isinstance(curv_raw, dict) else None),
+                _input("mean_abs_gy_mm_per_mm_raw", curv_raw.get("mean_abs_gy_mm_per_mm") if isinstance(curv_raw, dict) else None),
+                _input("scale_x", sx),
+                _input("scale_y", sy),
+                _input("scale_z", sz),
+            ],
+            {
+                "mean_abs_gx_mm_per_mm_corrected": curv_corrected.get("mean_abs_gx_mm_per_mm") if isinstance(curv_corrected, dict) else None,
+                "mean_abs_gy_mm_per_mm_corrected": curv_corrected.get("mean_abs_gy_mm_per_mm") if isinstance(curv_corrected, dict) else None,
+                "scale_z_over_scale_x": curv_corrected.get("scale_z_over_scale_x") if isinstance(curv_corrected, dict) else None,
+                "scale_z_over_scale_y": curv_corrected.get("scale_z_over_scale_y") if isinstance(curv_corrected, dict) else None,
+                "computed_over": curv_raw.get("computed_over") if isinstance(curv_raw, dict) else None,
+            },
+            [],
+            None,
+            "measurement_object",
+        ),
+        (
+            "max_height_mm",
+            corrected_heights.get("max_height_mm") if isinstance(corrected_heights, dict) else None,
+            "max_height_mm_corrected",
+            "max(height_above_belt_mm) * scale_z  // applied during known-cube correction",
+            [
+                _input("max_height_mm_raw", raw_heights.get("max_height_mm")),
+                _input("scale_z", sz),
+            ],
+            {
+                "p95_height_mm": corrected_heights.get("p95_height_mm") if isinstance(corrected_heights, dict) else None,
+                "mean_height_mm": corrected_heights.get("mean_height_mm") if isinstance(corrected_heights, dict) else None,
+            },
+            [],
+            sz,
+            "measurement_object",
+        ),
+        (
+            "footprint_area_mm2",
+            item.get("footprint_area_mm2"),
+            "footprint_area_mm2_corrected",
+            "footprint_area_raw * scale_x * scale_y  // or recomputed from corrected contour when available",
+            [
+                _input("footprint_area_raw", raw.get("footprint_area_mm2") if isinstance(raw, dict) else None),
+                _input("scale_x", sx),
+                _input("scale_y", sy),
+            ],
+            {
+                "scale_xy_product": (sx * sy) if sx is not None and sy is not None else None,
+                "geometry_metric_source": geometry_metric_source,
+            },
+            [],
+            (sx * sy) if sx is not None and sy is not None else None,
+            "geometry_debug_summary" if geom else "measurement_object",
+        ),
+        (
+            "feature_volume_proxy_mm3",
+            item.get("feature_volume_proxy_mm3"),
+            "volume_proxy_mm3_corrected",
+            "volume_proxy_raw * scale_x * scale_y * scale_z",
+            [
+                _input("volume_proxy_raw", raw.get("feature_volume_proxy_mm3") if isinstance(raw, dict) else None),
+                _input("scale_x", sx),
+                _input("scale_y", sy),
+                _input("scale_z", sz),
+            ],
+            {
+                "scale_xyz_product": (sx * sy * sz) if sx is not None and sy is not None and sz is not None else None,
+            },
+            [],
+            (sx * sy * sz) if sx is not None and sy is not None and sz is not None else None,
+            "measurement_object",
+        ),
+    ]
+
+    trace_rows: list[dict[str, Any]] = []
+    for idx, (
+        metric_key,
+        final_value,
+        formula_name,
+        formula_hr,
+        formula_inputs,
+        intermediate,
+        warnings,
+        correction_factor_used,
+        source_artifact_id,
+    ) in enumerate(metric_specs, start=1):
+        rv = raw.get(metric_key) if isinstance(raw, dict) else None
+        if rv is None and metric_key == "diameter_selected_mm" and isinstance(raw, dict):
+            rv = raw.get("diameter_mm")
+        if rv is None and metric_key == "max_height_mm" and isinstance(raw_heights, dict):
+            rv = raw_heights.get("max_height_mm")
+        cspace_before = "raw_metric_mm" if isinstance(raw, dict) and raw else corrected_space
+        cspace_after = corrected_space
+        validity = "valid"
+        warning_texts = [str(w) for w in warnings if w]
+        if metric_key == "diameter_selected_mm":
+            status = str(item.get("diameter_sanity_status") or "ok")
+            if status == "suspicious":
+                validity = "suspicious"
+            elif status == "invalid":
+                validity = "invalid"
+        if metric_key in ("feature_eccentricity", "sphericity_score") and warning_texts:
+            # Only invariant_violation:* entries downgrade validity; warning:*
+            # advisories are informational and the corrected metric is still trusted.
+            if any(str(text).startswith("invariant_violation:") for text in warning_texts):
+                validity = "suspicious"
+        trace_rows.append(
+            {
+                "trace_id": f"obj_{int(item.get('object_id') or 0)}_{idx}",
+                "metric_key": metric_key,
+                "final_value": final_value,
+                "raw_value": rv,
+                "corrected_value": final_value,
+                "correction_applied": bool(scale),
+                "correction_scales": {"x": sx, "y": sy, "z": sz},
+                "correction_factor_used": correction_factor_used,
+                "coordinate_space_before": cspace_before,
+                "coordinate_space_after": cspace_after,
+                "source_artifact_id": source_artifact_id,
+                "source_stage": "measurement",
+                "formula_name": formula_name,
+                "formula_human_readable": formula_hr,
+                "formula_inputs": formula_inputs,
+                "intermediate_values": intermediate,
+                "validity_status": validity,
+                "warnings": warning_texts,
+                "used_by_classifier": metric_key in used_keys,
+                "geometry_metric_source": geometry_metric_source,
+            }
+        )
+
+    # Synthetic calibration / invariants context entries. These do not feed
+    # into the classifier directly but are surfaced in the Metric details tab
+    # so engineers can read the correction chain without leaving the table.
+    trace_rows.append(
+        {
+            "trace_id": f"obj_{int(item.get('object_id') or 0)}_ctx_calibration",
+            "metric_key": "scale_correction_applied",
+            "final_value": None,
+            "raw_value": None,
+            "corrected_value": None,
+            "correction_applied": bool(scale),
+            "correction_scales": {"x": sx, "y": sy, "z": sz},
+            "correction_factor_used": None,
+            "coordinate_space_before": "raw_metric_mm",
+            "coordinate_space_after": corrected_space,
+            "source_artifact_id": "known_object_scale_validation",
+            "source_stage": "measurement",
+            "formula_name": "known_cube_scale_correction",
+            "formula_human_readable": (
+                "known_width / measured_width, known_depth / measured_depth, known_height / measured_height"
+            ),
+            "formula_inputs": [
+                _input("correction_source", item.get("correction_source")),
+                _input("correction_context_id", item.get("correction_context_id")),
+            ],
+            "intermediate_values": {
+                "scale_x": sx,
+                "scale_y": sy,
+                "scale_z": sz,
+                "geometry_metric_source": geometry_metric_source,
+                "geometry_coordinate_space": item.get("geometry_coordinate_space"),
+            },
+            "validity_status": "valid" if bool(scale) else "not_applied",
+            "warnings": [],
+            "used_by_classifier": False,
+            "geometry_metric_source": geometry_metric_source,
+        }
+    )
+    if invariants:
+        trace_rows.append(
+            {
+                "trace_id": f"obj_{int(item.get('object_id') or 0)}_ctx_invariants",
+                "metric_key": "geometry_invariant_warnings",
+                "final_value": None,
+                "raw_value": None,
+                "corrected_value": None,
+                "correction_applied": bool(scale),
+                "correction_scales": {"x": sx, "y": sy, "z": sz},
+                "correction_factor_used": None,
+                "coordinate_space_before": "raw_metric_mm",
+                "coordinate_space_after": corrected_space,
+                "source_artifact_id": "geometry_debug_summary" if geom else "measurement_object",
+                "source_stage": "measurement",
+                "formula_name": "geometry_invariant_checks",
+                "formula_human_readable": (
+                    "near_equal_dims_with_extreme_eccentricity | diameter_far_exceeds_dims | "
+                    "compact_blob_with_near_zero_roundness | anisotropic_scale_factors_may_destabilize_metrics"
+                ),
+                "formula_inputs": [
+                    _input("dim_x_mm", dim_x),
+                    _input("dim_y_mm", dim_y),
+                    _input("dim_z_mm", dim_z),
+                    _input("feature_eccentricity", item.get("feature_eccentricity")),
+                    _input("sphericity_score", item.get("sphericity_score")),
+                    _input("diameter_mm", item.get("diameter_mm")),
+                    _input("scale_x", sx),
+                    _input("scale_y", sy),
+                    _input("scale_z", sz),
+                ],
+                "intermediate_values": {
+                    "violations": [str(w) for w in invariants if str(w).startswith("invariant_violation:")],
+                    "advisories": [str(w) for w in invariants if str(w).startswith("warning:")],
+                },
+                "validity_status": "suspicious" if any(str(w).startswith("invariant_violation:") for w in invariants) else "valid",
+                "warnings": [str(w) for w in invariants],
+                "used_by_classifier": False,
+                "geometry_metric_source": geometry_metric_source,
+            }
+        )
+
+    return trace_rows
 
 
 def _class_group(superclass: str) -> str:

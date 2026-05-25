@@ -12,6 +12,7 @@ export function canonicalStageId(stageId: string, stageLabel?: string | null): s
   if (raw.includes("extractconnectedcomponents")) return "connected_components";
   if (raw.includes("fitobjectgeometry") || raw.includes("footprint geometry") || raw === "geometry") return "fit_object_geometry";
   if (raw.includes("computeheightmetrics") || raw.includes("height + volume") || raw === "measurement") return "compute_height_metrics";
+  if (raw.includes("classify_25d")) return "classify_25d";
   if (raw.includes("classifyminingball25d")) return "classify_25d";
   if (raw.includes("generate25doverlays")) return "overlays_25d";
   if (
@@ -105,14 +106,17 @@ const VIEWS_BY_CATEGORY: Record<StageSemanticCategory, StageViewDefinition[]> = 
     { id: "measurements", label: "Objects", rendererType: "table", priority: 1 },
     { id: "fit_metrics", label: "Fit metrics", rendererType: "metrics", priority: 2, emptyState: { title: "Ellipse fitting has not been executed for this take." } },
     { id: "diameter_histogram", label: "Diameter histogram", rendererType: "histogram", priority: 3 },
+    { id: "geometry_debug", label: "Geometry debug", rendererType: "table", priority: 4, emptyState: { title: "No geometry debug artifacts available yet." } },
     { id: "json", label: "JSON", rendererType: "json", priority: 99 },
   ],
   classification: [
     { id: "overlay", label: "Overlay", rendererType: "overlay", priority: 1, emptyState: { title: "No classification overlay available yet." } },
     { id: "classification", label: "Classification", rendererType: "table", priority: 2, emptyState: { title: "No classification summary available yet." } },
-    { id: "summary", label: "Summary", rendererType: "metrics", priority: 3 },
-    { id: "rejected", label: "Rejected objects", rendererType: "table", priority: 4 },
-    { id: "export", label: "Export", rendererType: "table", priority: 5 },
+    { id: "rule_explanation", label: "Rule explanation", rendererType: "table", priority: 3, emptyState: { title: "No classification explanation artifact found. Reprocess this take." } },
+    { id: "metric_details", label: "Metric details", rendererType: "table", priority: 4, emptyState: { title: "No metric explanation artifact found. Reprocess this take." } },
+    { id: "summary", label: "Summary", rendererType: "metrics", priority: 5 },
+    { id: "rejected", label: "Rejected objects", rendererType: "table", priority: 6 },
+    { id: "export", label: "Export", rendererType: "table", priority: 7 },
     { id: "json", label: "Result JSON", rendererType: "json", priority: 99 },
   ],
   fusion: [
@@ -198,6 +202,7 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
         { id: "residuals", label: "Residuals", rendererType: "image", priority: 2, emptyState: { title: "No geometry residual view available yet." } },
         { id: "profiles", label: "Profiles", rendererType: "image", priority: 3, emptyState: { title: "Select image artifact to inspect object profiles." } },
         { id: "provenance", label: "Provenance", rendererType: "table", priority: 4, emptyState: { title: "No object provenance available yet." } },
+        { id: "geometry_debug", label: "Geometry debug", rendererType: "table", priority: 5, emptyState: { title: "No geometry debug artifacts available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };
@@ -209,7 +214,9 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       defaultViewId: "classification_25d",
       views: [
         { id: "classification_25d", label: "Classification", rendererType: "table", priority: 1, emptyState: { title: "No 25D classifications available yet." } },
-        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 2, emptyState: { title: "No classification diagnostics available yet." } },
+        { id: "rule_explanation", label: "Rule explanation", rendererType: "table", priority: 2, emptyState: { title: "No classification rule explanation available yet." } },
+        { id: "metric_details", label: "Metric details", rendererType: "table", priority: 3, emptyState: { title: "No metric explanation artifact found. Reprocess this take." } },
+        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 4, emptyState: { title: "No classification diagnostics available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };

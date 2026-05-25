@@ -80,12 +80,12 @@ export function toHeightLegendSemantic(metadata: Record<string, unknown> | null 
   if (!semanticField) return null;
   return {
     semanticField,
-    semanticLabel: asText(metadata.semantic_label ?? metadata.display_semantic_label),
-    units: asText(metadata.units ?? metadata.display_units),
+    semanticLabel: asText(metadata.semantic_label ?? metadata.display_semantic_label) ?? undefined,
+    units: asText(metadata.units ?? metadata.display_units) ?? undefined,
     minValue: asNumber(metadata.value_min ?? metadata.min_mm ?? metadata.raw_min ?? metadata.display_vmin),
     maxValue: asNumber(metadata.value_max ?? metadata.max_mm ?? metadata.raw_max ?? metadata.display_vmax),
-    colorMap: asText(metadata.color_map ?? metadata.colormap),
-    positiveDirection: asText(metadata.positive_direction),
+    colorMap: asText(metadata.color_map ?? metadata.colormap) ?? undefined,
+    positiveDirection: asText(metadata.positive_direction) ?? undefined,
     authoritative: asBoolean(metadata.is_measurement_authoritative),
     displayOnly: asBoolean(metadata.display_only),
     percentileLabels: {

@@ -161,7 +161,10 @@ def test_scale_correction_recomputes_eccentricity_from_corrected_axes() -> None:
     assert row["sphericity_score"] == 0.625
     assert abs(float(row["feature_eccentricity"]) - 0.7806) < 0.0001
     assert row["height_above_belt_mm"]["max_height_mm"] == 40.0
-    assert row["feature_sphericity_3d"] == 0.5
+    # feature_sphericity_3d is now defined over canonical XYZ extents
+    # (dimensions_mm = (50, 100, 40)) -> min/max = 40/100 = 0.4. This makes the
+    # ratio independent of how the raw ellipse axes happen to be assigned.
+    assert row["feature_sphericity_3d"] == 0.4
 
 
 def test_25d_good_ball_requires_min_3d_sphericity() -> None:

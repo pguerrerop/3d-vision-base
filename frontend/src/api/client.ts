@@ -491,6 +491,11 @@ export interface ProcessingResult {
   files: {
     point_cloud: string | null;
     point_cloud_npz?: string | null;
+    heightmap?: string | null;
+    heightmap_npz?: string | null;
+    normalized_heightmap?: string | null;
+    classification_explanation?: string | null;
+    metric_explanation?: string | null;
     input_preview: string | null;
     overlay: string | null;
     debug_height: string | null;
