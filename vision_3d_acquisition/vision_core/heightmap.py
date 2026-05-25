@@ -111,26 +111,71 @@ def write_heightmap_preview_png(
 
 
 def _append_colorbar(image: np.ndarray, *, min_v: float, max_v: float, label: str, colormap: int) -> np.ndarray:
+    # Layout (top → bottom inside the appended strip):
+    #   - 8 px gap
+    #   - 12 px colour gradient bar
+    #   - 6 px gap
+    #   - min/max value text row (left/right of bar)
+    #   - 4 px gap
+    #   - centred label text row
+    # This 2-row layout avoids the label overlapping the min/max numbers,
+    # which happens with the older single-row layout when the label is wide
+    # and/or the colorbar is narrow.
     h, w = image.shape[:2]
-    bar_h = 46
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    value_scale = 0.42
+    label_scale = 0.46
+    bar_thickness = 12
+    gap_top = 8
+    gap_between = 6
+    gap_between_rows = 4
+    gap_bottom = 8
+    (_, val_h), _ = cv2.getTextSize("0.00", font, value_scale, 1)
+    (_, lbl_h), _ = cv2.getTextSize(label or " ", font, label_scale, 1)
+    bar_h = (
+        gap_top
+        + bar_thickness
+        + gap_between
+        + val_h
+        + gap_between_rows
+        + lbl_h
+        + gap_bottom
+    )
     canvas = np.zeros((h + bar_h, w, 3), dtype=np.uint8)
     canvas[:h, :, :] = image
     canvas[h:, :, :] = (18, 18, 18)
     margin = max(24, min(80, w // 12))
     bar_w = max(1, w - (2 * margin))
     gradient = np.linspace(0, 255, bar_w, dtype=np.uint8).reshape(1, bar_w)
-    gradient = np.repeat(gradient, 12, axis=0)
+    gradient = np.repeat(gradient, bar_thickness, axis=0)
     bar = cv2.applyColorMap(gradient, colormap)
-    y0 = h + 8
+    y0 = h + gap_top
     canvas[y0 : y0 + bar.shape[0], margin : margin + bar_w, :] = bar
     cv2.rectangle(canvas, (margin, y0), (margin + bar_w - 1, y0 + bar.shape[0] - 1), (210, 210, 210), 1)
-    text_y = h + 36
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(canvas, f"{min_v:.2f}", (margin, text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+    text_baseline_values = y0 + bar.shape[0] + gap_between + val_h
+    cv2.putText(canvas, f"{min_v:.2f}", (margin, text_baseline_values), font, value_scale, (235, 235, 235), 1, cv2.LINE_AA)
     max_text = f"{max_v:.2f}"
-    (tw, _), _ = cv2.getTextSize(max_text, font, 0.42, 1)
-    cv2.putText(canvas, max_text, (max(0, margin + bar_w - tw), text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
-    label_text = label
-    (lw, _), _ = cv2.getTextSize(label_text, font, 0.42, 1)
-    cv2.putText(canvas, label_text, (max(0, (w - lw) // 2), text_y), font, 0.42, (235, 235, 235), 1, cv2.LINE_AA)
+    (tw, _), _ = cv2.getTextSize(max_text, font, value_scale, 1)
+    cv2.putText(canvas, max_text, (max(0, margin + bar_w - tw), text_baseline_values), font, value_scale, (235, 235, 235), 1, cv2.LINE_AA)
+    if label:
+        label_text = label
+        (lw, _), _ = cv2.getTextSize(label_text, font, label_scale, 1)
+        # If the label is still too wide for the strip, trim with an ellipsis
+        # so it never overflows the canvas (still readable in Studio).
+        if lw > w - 2 * margin and len(label_text) > 6:
+            while lw > w - 2 * margin and len(label_text) > 6:
+                label_text = label_text[:-1]
+                (lw, _), _ = cv2.getTextSize(label_text + "…", font, label_scale, 1)
+            label_text = label_text + "…"
+        label_baseline = text_baseline_values + gap_between_rows + lbl_h
+        cv2.putText(
+            canvas,
+            label_text,
+            (max(0, (w - lw) // 2), label_baseline),
+            font,
+            label_scale,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
     return canvas

@@ -132,7 +132,8 @@ def test_reference_surface_vertical_band_roi_uses_full_height(tmp_path: Path) ->
     frame = load_heightmap_npz(take_dir / "heightmap.npz")
     roi_stage_params = {
         "detect_belt_plane": {
-            "plane_fit_roi": {"enabled": True, "type": "vertical_band", "x": 80, "width": 90},
+            "reference_surface_region_mode": "full_height_x_band",
+            "plane_fit_roi": {"enabled": True, "type": "full_height_x_band", "x": 80, "width": 90},
         },
     }
     run_ball_inspection_25d_flow(data_dir, take_id=take_id, stage_params=roi_stage_params)
@@ -141,7 +142,7 @@ def test_reference_surface_vertical_band_roi_uses_full_height(tmp_path: Path) ->
     by_id = {item.get("artifact_id"): item for item in artifacts if isinstance(item, dict)}
     plane_fit_debug = (by_id.get("plane_fit_debug", {}).get("metadata") or {}) if isinstance(by_id.get("plane_fit_debug"), dict) else {}
     assert plane_fit_debug.get("roi_enabled") is True
-    assert plane_fit_debug.get("roi_type") == "vertical_band"
+    assert plane_fit_debug.get("roi_type") == "full_height_x_band"
     assert plane_fit_debug.get("roi_x") == 80
     assert plane_fit_debug.get("roi_y") == 0
     assert plane_fit_debug.get("roi_width") == 90

@@ -861,10 +861,10 @@ export default function StudioArtifactExplorer({
               onOverlayDebug={onOverlayDebug}
               artifacts={artifacts}
               emptyMessage="Artifact file is unavailable."
-              roi={(localRoiType === "rectangle" || localRoiType === "vertical_band") ? (draftRoi ?? (roiEnabled && roiType === localRoiType ? roi : null)) : null}
+              roi={(localRoiType === "rectangle" || localRoiType === "full_height_x_band") ? (draftRoi ?? (roiEnabled && roiType === localRoiType ? roi : null)) : null}
               roiPolygon={localRoiType === "polygon" ? (draftPolygon ?? (roiEnabled && roiType === "polygon" ? roiPolygon : null)) : null}
               roiType={localRoiType}
-              roiLabel={localRoiType === "vertical_band" ? "Vertical band ROI" : "ROI"}
+              roiLabel={localRoiType === "full_height_x_band" ? "Vertical band ROI" : "ROI"}
               drawRoiMode={drawRoiMode}
               onRoiDrawComplete={(next) => setDraftRoi(next)}
               onPolygonRoiComplete={(points) => setDraftPolygon(points)}
@@ -1134,7 +1134,7 @@ export default function StudioArtifactExplorer({
             <button className={roiEnabled ? "active" : ""} type="button">{`ROI: ${roiEnabled ? "enabled" : "disabled"}`}</button>
             <button className={localRoiType === "rectangle" ? "active" : ""} onClick={() => setLocalRoiType("rectangle")} type="button">Rectangle</button>
             <button className={localRoiType === "polygon" ? "active" : ""} onClick={() => setLocalRoiType("polygon")} type="button">Polygon</button>
-            <button className={localRoiType === "vertical_band" ? "active" : ""} onClick={() => setLocalRoiType("vertical_band")} type="button">Vertical band ROI</button>
+            <button className={localRoiType === "full_height_x_band" ? "active" : ""} onClick={() => setLocalRoiType("full_height_x_band")} type="button">Vertical band ROI</button>
             <button className={drawRoiMode ? "active" : ""} onClick={() => setDrawRoiMode((value) => !value)} type="button">Draw ROI</button>
             <button onClick={() => { setDraftRoi(null); setDraftPolygon(null); onCancelRoiEdit?.(); }} type="button">Cancel</button>
             <button onClick={() => { setDraftRoi(null); setDraftPolygon(null); onClearRoi?.(); }} type="button">Use full frame</button>
@@ -1142,7 +1142,7 @@ export default function StudioArtifactExplorer({
               disabled={localRoiType === "polygon" ? !(draftPolygon && draftPolygon.length >= 3) : !draftRoi}
               onClick={() => {
                 if (localRoiType === "rectangle" && draftRoi) onApplyRoi?.(draftRoi, false);
-                if (localRoiType === "vertical_band" && draftRoi) onApplyRoi?.(draftRoi, false);
+                if (localRoiType === "full_height_x_band" && draftRoi) onApplyRoi?.(draftRoi, false);
                 if (localRoiType === "polygon" && draftPolygon && draftPolygon.length >= 3) onApplyPolygonRoi?.(draftPolygon, false);
               }}
               type="button"
@@ -1153,7 +1153,7 @@ export default function StudioArtifactExplorer({
               disabled={localRoiType === "polygon" ? !(draftPolygon && draftPolygon.length >= 3) : !draftRoi}
               onClick={() => {
                 if (localRoiType === "rectangle" && draftRoi) onApplyRoi?.(draftRoi, true);
-                if (localRoiType === "vertical_band" && draftRoi) onApplyRoi?.(draftRoi, true);
+                if (localRoiType === "full_height_x_band" && draftRoi) onApplyRoi?.(draftRoi, true);
                 if (localRoiType === "polygon" && draftPolygon && draftPolygon.length >= 3) onApplyPolygonRoi?.(draftPolygon, true);
               }}
               type="button"
@@ -1162,7 +1162,7 @@ export default function StudioArtifactExplorer({
             </button>
           </div>
         )}
-        {allowRoiEditing && localRoiType === "vertical_band" && (
+        {allowRoiEditing && localRoiType === "full_height_x_band" && (
           <div className="artifact-reference">
             <small>Constrains processing to an X-range while preserving the full scan height.</small>
           </div>

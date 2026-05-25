@@ -152,6 +152,47 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       if (props.view.id === "background_candidates" || props.view.id === "background_seeds") return artifact.artifact_id === "background_seed_mask" || artifact.artifact_id === "background_candidate_mask" || /background_(seed|candidate)_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "expanded_plane") return artifact.artifact_id === "expanded_plane_mask" || /expanded_plane_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "depth_plot") return artifact.artifact_id === "background_depth_plot" || /background_depth_plot/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "plateau_plot") {
+        return artifact.artifact_id === "background_plateau_plot"
+          || /background_plateau_plot/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "filtered_depth_plot") {
+        return artifact.artifact_id === "flat_candidate_depth_plot"
+          || /flat_candidate_depth_plot/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_base") {
+        return artifact.artifact_id === "belt_base_mask"
+          || /belt_base_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_stripes") {
+        return artifact.artifact_id === "belt_stripes_mask"
+          || /belt_stripes_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_stripes_tophat") {
+        return artifact.artifact_id === "belt_stripes_tophat_mask"
+          || /belt_stripes_tophat_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_stripes_shape") {
+        return artifact.artifact_id === "belt_stripes_shape_mask"
+          || /belt_stripes_shape_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_above_belt") {
+        return artifact.artifact_id === "belt_above_belt_mask"
+          || /belt_above_belt_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_wide_object") {
+        return artifact.artifact_id === "belt_wide_object_mask"
+          || /belt_wide_object_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_altitude_plot") {
+        return artifact.artifact_id === "belt_altitude_histogram_image"
+          || artifact.artifact_id === "belt_altitude_local_min"
+          || /belt_altitude_histogram|belt_altitude_local_min/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "belt_baseline") {
+        return artifact.artifact_id === "belt_baseline_local_min"
+          || /belt_baseline_local_min/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "plane_inliers") return artifact.artifact_id === "final_plane_inlier_mask" || artifact.artifact_id === "plane_inlier_mask" || /final_plane_inlier_mask|plane_inlier_mask/i.test(String(artifact.path ?? ""));
       if (props.view.id === "residual_heatmap" || props.view.id === "belt_plane") {
         return artifact.artifact_id === "raw_heightmap_preview"
@@ -186,7 +227,12 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         );
       }
     }
-    if (props.view.id === "depth_plot") {
+    if (
+      props.view.id === "depth_plot"
+      || props.view.id === "plateau_plot"
+      || props.view.id === "filtered_depth_plot"
+      || props.view.id === "belt_altitude_plot"
+    ) {
       return explore(artifacts, props, { disableRoi: true });
     }
     return explore(artifacts, props);
@@ -977,9 +1023,11 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
           : { stage: props.stageId, semantic, artifacts: context.runArtifacts, result: props.detail.result };
     if (semantic.category === "plane_qa" && props.view.id === "surface_candidates") {
       const surfaceCandidates = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_candidates");
+      const plateaus = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_plateaus");
+      const flatHistogram = context.runArtifacts.find((item) => item.artifact_id === "flat_candidate_histogram");
       const gradientDebug = context.runArtifacts.find((item) => item.artifact_id === "gradient_debug");
       const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");
-      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null, selected_surface_debug: selectedSurface?.metadata ?? null }, null, 2)}</pre>;
+      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, plateaus: plateaus?.metadata ?? null, flat_candidate_histogram: flatHistogram?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null, selected_surface_debug: selectedSurface?.metadata ?? null }, null, 2)}</pre>;
     }
     if (semantic.category === "plane_qa" && props.view.id === "reference_surface") {
       const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");

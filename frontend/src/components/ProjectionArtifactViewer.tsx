@@ -4,7 +4,7 @@ import { overlayDebugInfo, transformOverlayGeometry, type OverlayDebugInfo, type
 import { clampPolygon, mapClientToImagePoint, mapClientToImagePointStrict, pointsToRoi, type RoiPolygon, type RoiRect } from "./roiMapping";
 import type { HoverInspectionSample } from "./hoverInspectionModel";
 
-export type RoiType = "rectangle" | "polygon" | "vertical_band";
+export type RoiType = "rectangle" | "polygon" | "full_height_x_band";
 
 type Props = {
   title: string;
@@ -143,7 +143,7 @@ function OverlayRenderer({
               setPolyDraft((current) => [...current, [Math.round(point.x), Math.round(point.y)]]);
               return;
             }
-            if (roiType === "vertical_band") {
+            if (roiType === "full_height_x_band") {
               const active = bandDraft ?? roi;
               const edgeTol = 8;
               if (active) {
@@ -212,7 +212,7 @@ function OverlayRenderer({
               setHoverPoint(point);
               return;
             }
-            if (roiType === "vertical_band" && bandDragMode && bandDragAnchor && onRoiDrawComplete) {
+            if (roiType === "full_height_x_band" && bandDragMode && bandDragAnchor && onRoiDrawComplete) {
               const dx = Math.round(point.x - bandDragAnchor.x);
               const source = bandDragAnchor.rect;
               let next: RoiRect = source;
@@ -241,13 +241,13 @@ function OverlayRenderer({
           onPointerUp={() => {
             if (!drawRoiMode) return;
             if (roiType === "polygon") return;
-            if (roiType === "vertical_band" && bandDragMode) {
+            if (roiType === "full_height_x_band" && bandDragMode) {
               setBandDragMode(null);
               setBandDragAnchor(null);
               return;
             }
             if (!drawRoiMode || !dragStart || !dragNow || !onRoiDrawComplete) return;
-            const next = roiType === "vertical_band"
+            const next = roiType === "full_height_x_band"
               ? { ...pointsToRoi(dragStart, dragNow, size.width, size.height), y: 0, height: size.height }
               : pointsToRoi(dragStart, dragNow, size.width, size.height);
             onRoiDrawComplete(next);
@@ -262,13 +262,13 @@ function OverlayRenderer({
             }
             if (!drawRoiMode) return;
             if (roiType === "polygon") return;
-            if (roiType === "vertical_band" && bandDragMode) {
+            if (roiType === "full_height_x_band" && bandDragMode) {
               setBandDragMode(null);
               setBandDragAnchor(null);
               return;
             }
             if (!drawRoiMode || !dragStart || !dragNow || !onRoiDrawComplete) return;
-            const next = roiType === "vertical_band"
+            const next = roiType === "full_height_x_band"
               ? { ...pointsToRoi(dragStart, dragNow, size.width, size.height), y: 0, height: size.height }
               : pointsToRoi(dragStart, dragNow, size.width, size.height);
             onRoiDrawComplete(next);
@@ -415,10 +415,10 @@ function OverlayRenderer({
                   );
                 }
                 const rect = dragStart && dragNow
-                  ? (roiType === "vertical_band"
+                  ? (roiType === "full_height_x_band"
                     ? { ...pointsToRoi(dragStart, dragNow, size.width, size.height), y: 0, height: size.height }
                     : pointsToRoi(dragStart, dragNow, size.width, size.height))
-                  : (roiType === "vertical_band" ? (bandDraft ?? roi) : roi);
+                  : (roiType === "full_height_x_band" ? (bandDraft ?? roi) : roi);
                 if (!rect) return null;
                 return (
                   <g>

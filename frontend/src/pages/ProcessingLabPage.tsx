@@ -357,8 +357,16 @@ export default function ProcessingLabPage() {
       reference_surface_selection_mode: String(detect.reference_surface_selection_mode ?? "largest_constant_z"),
       reference_surface_model: String(detect.reference_surface_model ?? "auto"),
       reference_surface_max_plane_residual_p95_mm: Number(detect.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+      reference_surface_region_mode: String(
+        detect.reference_surface_region_mode
+        ?? (
+          Boolean((detect.plane_fit_roi as Record<string, unknown> | undefined)?.enabled ?? false)
+            ? String((detect.plane_fit_roi as Record<string, unknown> | undefined)?.type ?? "rectangle")
+            : "none"
+        ),
+      ).replace("vertical_band", "full_height_x_band"),
       plane_fit_roi_enabled: Boolean((detect.plane_fit_roi as Record<string, unknown> | undefined)?.enabled ?? false),
-      plane_fit_roi_type: String((detect.plane_fit_roi as Record<string, unknown> | undefined)?.type ?? "rectangle"),
+      plane_fit_roi_type: String((detect.plane_fit_roi as Record<string, unknown> | undefined)?.type ?? "rectangle").replace("vertical_band", "full_height_x_band"),
       plane_fit_roi_x: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.x ?? 0),
       plane_fit_roi_y: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.y ?? 0),
       plane_fit_roi_width: Number((detect.plane_fit_roi as Record<string, unknown> | undefined)?.width ?? 0),
@@ -411,18 +419,19 @@ export default function ProcessingLabPage() {
   const morphologyStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "morphology");
   const ellipseStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "ellipse_fitting");
   const blobStep = selectedPipelineInstance?.configured_steps.find((step) => step.step_id === "blob_detection");
-  const roiEnabled = Boolean(planeQaParams?.plane_fit_roi_enabled ?? false);
+  const regionModeRaw = String(planeQaParams?.reference_surface_region_mode ?? "none").replace("vertical_band", "full_height_x_band");
+  const roiEnabled = regionModeRaw !== "none";
   const roiType = (() => {
-    const raw = String(planeQaParams?.plane_fit_roi_type ?? "rectangle");
-    if (raw === "polygon" || raw === "vertical_band") return raw;
+    const raw = regionModeRaw === "none" ? String(planeQaParams?.plane_fit_roi_type ?? "rectangle") : regionModeRaw;
+    if (raw === "polygon" || raw === "full_height_x_band") return raw;
     return "rectangle";
   })() as RoiType;
   const activeRoi = roiEnabled && roiType !== "polygon"
     ? {
       x: Number(planeQaParams?.plane_fit_roi_x ?? 0),
-      y: roiType === "vertical_band" ? 0 : Number(planeQaParams?.plane_fit_roi_y ?? 0),
+      y: roiType === "full_height_x_band" ? 0 : Number(planeQaParams?.plane_fit_roi_y ?? 0),
       width: Number(planeQaParams?.plane_fit_roi_width ?? 0),
-      height: roiType === "vertical_band" ? Number(planeQaParams?.plane_fit_roi_height ?? 0) : Number(planeQaParams?.plane_fit_roi_height ?? 0),
+      height: Number(planeQaParams?.plane_fit_roi_height ?? 0),
     }
     : null;
   const activeRoiPolygon = roiEnabled && roiType === "polygon"
@@ -807,18 +816,26 @@ export default function ProcessingLabPage() {
         reference_surface_selection_mode: String(planeQaParams.reference_surface_selection_mode ?? "largest_constant_z"),
         reference_surface_model: String(planeQaParams.reference_surface_model ?? "auto"),
         reference_surface_max_plane_residual_p95_mm: Number(planeQaParams.reference_surface_max_plane_residual_p95_mm ?? 3.0),
-        plane_fit_roi: Boolean(planeQaParams.plane_fit_roi_enabled ?? false)
-          ? (
-            String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "polygon"
+        plane_fit_roi: String(planeQaParams.reference_surface_region_mode ?? "none") === "none"
+          ? {
+            enabled: false,
+            type: "rectangle",
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+          }
+          : (
+            String(planeQaParams.reference_surface_region_mode ?? "none") === "polygon"
               ? {
                 enabled: true,
                 type: "polygon",
                 points: ((planeQaParams.plane_fit_roi_points as Array<[number, number]> | undefined) ?? []).map(([x, y]) => [Math.round(Number(x)), Math.round(Number(y))]),
               }
-              : String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band"
+              : String(planeQaParams.reference_surface_region_mode ?? "none") === "full_height_x_band"
                 ? {
                   enabled: true,
-                  type: "vertical_band",
+                  type: "full_height_x_band",
                   x: Number(planeQaParams.plane_fit_roi_x ?? 0),
                   width: Number(planeQaParams.plane_fit_roi_width ?? 0),
                 }
@@ -830,8 +847,7 @@ export default function ProcessingLabPage() {
                 width: Number(planeQaParams.plane_fit_roi_width ?? 0),
                 height: Number(planeQaParams.plane_fit_roi_height ?? 0),
               }
-          )
-          : null,
+          ),
       },
       remove_belt_segment_objects: {
         min_height_mm: Number(planeQaParams.object_min_height_mm ?? 8.0),
@@ -1151,13 +1167,13 @@ export default function ProcessingLabPage() {
   }
 
   async function applyRoi(roi: RoiRect, rerun = false) {
-    const nextType = (String(planeQaParams?.plane_fit_roi_type ?? "rectangle") === "vertical_band" ? "vertical_band" : "rectangle") as RoiType;
+    const nextType = (String(planeQaParams?.reference_surface_region_mode ?? "rectangle") === "full_height_x_band" ? "full_height_x_band" : "rectangle") as RoiType;
     setPlaneQaParams((current) => current ? {
       ...current,
-      plane_fit_roi_enabled: true,
+      reference_surface_region_mode: nextType,
       plane_fit_roi_type: nextType,
       plane_fit_roi_x: roi.x,
-      plane_fit_roi_y: nextType === "vertical_band" ? 0 : roi.y,
+      plane_fit_roi_y: nextType === "full_height_x_band" ? 0 : roi.y,
       plane_fit_roi_width: roi.width,
       plane_fit_roi_height: roi.height,
       plane_fit_roi_points: [],
@@ -1174,7 +1190,7 @@ export default function ProcessingLabPage() {
             type: nextType,
             x: roi.x,
             width: roi.width,
-            ...(nextType === "vertical_band"
+            ...(nextType === "full_height_x_band"
               ? {}
               : { y: roi.y, height: roi.height }),
           },
@@ -1193,7 +1209,7 @@ export default function ProcessingLabPage() {
     const normalized = points.map(([x, y]) => [Math.round(Number(x)), Math.round(Number(y))] as [number, number]);
     setPlaneQaParams((current) => current ? {
       ...current,
-      plane_fit_roi_enabled: true,
+      reference_surface_region_mode: "polygon",
       plane_fit_roi_type: "polygon",
       plane_fit_roi_points: normalized,
     } : current);
@@ -1220,7 +1236,7 @@ export default function ProcessingLabPage() {
   }
 
   async function clearRoi() {
-    setPlaneQaParams((current) => current ? { ...current, plane_fit_roi_enabled: false, plane_fit_roi_type: "rectangle", plane_fit_roi_points: [] } : current);
+    setPlaneQaParams((current) => current ? { ...current, reference_surface_region_mode: "none", plane_fit_roi_points: [] } : current);
     setPlaneQaDirty(true);
     setRoiEditModeActive(false);
     setRoiEditStatus("rerun_required");
@@ -1815,25 +1831,19 @@ export default function ProcessingLabPage() {
               </div>
               <div className="reference-surface-roi-block">
                 <strong>Reference surface region</strong>
-                <label>Enable ROI
-                  <input
-                    type="checkbox"
-                    checked={Boolean(planeQaParams.plane_fit_roi_enabled ?? false)}
-                    onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_enabled: e.target.checked } : c); setPlaneQaDirty(true); }}
-                  />
-                </label>
                 <div className="reference-surface-roi-grid">
-                  <label>Type
-                    <select value={String(planeQaParams.plane_fit_roi_type ?? "rectangle")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_type: e.target.value } : c); setPlaneQaDirty(true); }}>
+                  <label>Mode
+                    <select value={String(planeQaParams.reference_surface_region_mode ?? "none")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_region_mode: e.target.value, plane_fit_roi_type: e.target.value === "full_height_x_band" ? "full_height_x_band" : e.target.value === "none" ? "rectangle" : e.target.value } : c); setPlaneQaDirty(true); }}>
+                      <option value="none">No ROI / full frame</option>
+                      <option value="full_height_x_band">full_height_x_band</option>
                       <option value="rectangle">rectangle</option>
                       <option value="polygon">polygon</option>
-                      <option value="vertical_band">Vertical band ROI</option>
                     </select>
                   </label>
                   <label>X
                     <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_x ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_x: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                   </label>
-                  {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                  {String(planeQaParams.reference_surface_region_mode ?? "none") !== "full_height_x_band" && (
                     <label>Y
                       <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_y ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_y: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                     </label>
@@ -1841,7 +1851,7 @@ export default function ProcessingLabPage() {
                   <label>W
                     <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_width ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_width: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                   </label>
-                  {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                  {String(planeQaParams.reference_surface_region_mode ?? "none") !== "full_height_x_band" && (
                     <label>H
                       <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_height ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_height: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                     </label>
@@ -1858,7 +1868,7 @@ export default function ProcessingLabPage() {
                 <small>
                   ROI constrains only reference-surface estimation. Normalization and segmentation still run on the full valid frame.
                 </small>
-                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band" && (
+                {String(planeQaParams.reference_surface_region_mode ?? "none") === "full_height_x_band" && (
                   <small>Constrains processing to an X-range while preserving the full scan height.</small>
                 )}
                 <small>
@@ -1869,6 +1879,7 @@ export default function ProcessingLabPage() {
                 <label>Strategy
                   <select value={String(planeQaParams.background_detection_strategy ?? "low_gradient_surface")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, background_detection_strategy: e.target.value } : c); setPlaneQaDirty(true); }}>
                     <option value="low_gradient_surface">low_gradient_surface</option>
+                    <option value="low_gradient_depth_plateaus">low_gradient_depth_plateaus</option>
                     <option value="depth_percentile_plane">depth_percentile_plane</option>
                   </select>
                 </label>
@@ -1915,16 +1926,17 @@ export default function ProcessingLabPage() {
               </div>
               <div className="reference-surface-roi-grid">
                 <label>Type
-                    <select value={String(planeQaParams.plane_fit_roi_type ?? "rectangle")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_type: e.target.value } : c); setPlaneQaDirty(true); }} >
+                    <select value={String(planeQaParams.reference_surface_region_mode ?? "none")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_region_mode: e.target.value, plane_fit_roi_type: e.target.value === "full_height_x_band" ? "full_height_x_band" : e.target.value === "none" ? "rectangle" : e.target.value } : c); setPlaneQaDirty(true); }} >
+                    <option value="none">No ROI / full frame</option>
+                    <option value="full_height_x_band">full_height_x_band</option>
                     <option value="rectangle">rectangle</option>
                     <option value="polygon">polygon</option>
-                    <option value="vertical_band">Vertical band ROI</option>
                   </select>
                 </label>
                 <label>X
                   <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_x ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_x: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                 </label>
-                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                {String(planeQaParams.reference_surface_region_mode ?? "none") !== "full_height_x_band" && (
                   <label>Y
                     <input type="number" min={0} step={1} value={Number(planeQaParams.plane_fit_roi_y ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_y: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                   </label>
@@ -1932,7 +1944,7 @@ export default function ProcessingLabPage() {
                 <label>W
                   <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_width ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_width: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                 </label>
-                {String(planeQaParams.plane_fit_roi_type ?? "rectangle") !== "vertical_band" && (
+                {String(planeQaParams.reference_surface_region_mode ?? "none") !== "full_height_x_band" && (
                   <label>H
                     <input type="number" min={1} step={1} value={Number(planeQaParams.plane_fit_roi_height ?? 0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plane_fit_roi_height: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
                   </label>
@@ -1943,7 +1955,7 @@ export default function ProcessingLabPage() {
                 <button type="button" disabled={pipelineActionBusy} onClick={() => void clearRoi()}>Use full frame</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
               </div>
-              {String(planeQaParams.plane_fit_roi_type ?? "rectangle") === "vertical_band" && (
+              {String(planeQaParams.reference_surface_region_mode ?? "none") === "full_height_x_band" && (
                 <small>Vertical band ROI constrains processing to an X-range while preserving the full scan height.</small>
               )}
               <small>ROI affects only reference-surface estimation (not full-frame normalization/segmentation).</small>

@@ -101,7 +101,98 @@ def test_plane_normalization_and_cube_scale_validation(tmp_path: Path) -> None:
     assert plane_debug["status"] in {"success", "failed"}
     assert norm_debug["background_height_p95_abs_after_normalization_mm"] < 2.5
     assert abs(float(scale["measured_height_mm"]) - 25.0) < 6.0
-    assert abs(float(obj["dimensions_mm"][2]) - float(obj["height_above_belt_mm"]["max_height_mm"])) < 1e-6
+    # dim_z is sourced from P99 of height_above_belt to stay robust to noise peaks.
+    # On a clean cube p99 == max so dim_z still matches both fields after correction.
+    assert abs(float(obj["dimensions_mm"][2]) - float(obj["height_above_belt_mm"]["p99_height_mm"])) < 1e-6
+    # The cube validation reports the source field used for dim_z and exposes both
+    # max and p99 (pre-correction) so the studio UI can explain the measurement.
+    assert scale.get("measured_height_source") == "p99_height_mm"
+    assert abs(float(scale["measured_height_mm"]) - float(scale["measured_height_p99_mm"])) < 1e-6
+
+
+def _tilted_plane_with_noisy_cube(width: int = 160, height: int = 120) -> HeightmapFrame:
+    """Tilted belt with a 25mm cube whose top has a few sharp noise peaks.
+
+    The peaks reach +12mm above the cube top so a max-based dim_z would report
+    ~37mm, while a P99-based dim_z stays close to the true 25mm. Used to verify
+    both the per-object measurement and the known-cube calibration use P99.
+    """
+
+    xx, yy = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    plane = 100.0 + 0.03 * xx + 0.02 * yy
+    cube_mask = (xx > 50) & (xx < 90) & (yy > 40) & (yy < 80)
+    z = plane.copy()
+    z[cube_mask] += 25.0
+    rng = np.random.default_rng(7)
+    cube_yx = np.argwhere(cube_mask)
+    peak_indices = rng.choice(cube_yx.shape[0], size=4, replace=False)
+    for idx in peak_indices:
+        py, px = int(cube_yx[idx, 0]), int(cube_yx[idx, 1])
+        z[py, px] += 12.0
+    valid = np.ones_like(z, dtype=bool)
+    z[10:20, 10:20] = 0.0
+    valid[10:20, 10:20] = False
+    return HeightmapFrame(
+        z_mm=z.astype(np.float32),
+        valid_mask=valid,
+        reflectance=None,
+        x_resolution_mm=1.0,
+        y_resolution_mm=1.0,
+        origin_x_mm=0.0,
+        origin_y_mm=0.0,
+        coordinate_system="sensor_xy_z_mm",
+    )
+
+
+def test_dim_z_uses_p99_when_cube_has_noise_peaks(tmp_path: Path) -> None:
+    """dim_z must stay near the true cube height even when noise peaks are present.
+
+    Both the per-object dimensions_mm and the known-cube calibration source dim_z
+    from the P99 of height_above_belt, so a handful of sharp peaks on the cube
+    surface should NOT inflate the measured height.
+    """
+
+    settings = _settings(tmp_path / "data")
+    frame = _tilted_plane_with_noisy_cube()
+    _write_take(
+        settings,
+        "take_noisy_cube",
+        frame,
+        known_object={
+            "enabled": True,
+            "object_label": "cubo",
+            "known_width_mm": 57.0,
+            "known_depth_mm": 57.0,
+            "known_height_mm": 57.0,
+            "tolerance_percent": 100.0,
+            "target_selection": "largest_component",
+        },
+    )
+    result = run_ball_inspection_25d_flow(settings.data_dir, take_id="take_noisy_cube")
+    scale = json.loads((result.output_dir / "known_object_scale_validation.json").read_text(encoding="utf-8"))
+    obj = result.result_payload["objects"][0]
+
+    # The cube-validation JSON exposes both the raw absolute max and the raw P99
+    # so we can prove the noise peaks exist AND that the calibration ignored them.
+    raw_p99 = float(scale["measured_height_p99_mm"])
+    raw_max = float(scale["measured_height_max_mm"])
+    assert raw_max - raw_p99 >= 5.0, (
+        f"expected noise peak headroom but got max={raw_max} p99={raw_p99}"
+    )
+
+    # dim_z (per-object) and the cube-calibration measurement both follow P99,
+    # not the absolute max.
+    assert scale.get("measured_height_source") == "p99_height_mm"
+    assert abs(float(scale["measured_height_mm"]) - raw_p99) < 1e-6
+
+    # On the corrected per-object payload, dim_z still matches the (corrected) p99
+    # field, while the absolute max stays meaningfully larger because the peaks
+    # were preserved as diagnostics through the scale_z multiplication.
+    heights = obj["height_above_belt_mm"]
+    p99_corrected = float(heights["p99_height_mm"])
+    max_corrected = float(heights["max_height_mm"])
+    assert abs(float(obj["dimensions_mm"][2]) - p99_corrected) < 1e-6
+    assert max_corrected - p99_corrected >= 5.0
 
 
 def test_cube_recalibration_ignores_persisted_identity_scale(tmp_path: Path) -> None:

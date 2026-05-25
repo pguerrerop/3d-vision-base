@@ -348,6 +348,7 @@ Canonical corrected geometry space:
   - `point_cloud_mm` (center/height context)
 - shape descriptors (eccentricity, roundness/circularity/sphericity, equivalent/circumference diameters) are computed from corrected metric-space geometry.
 - `feature_sphericity_3d` is the canonical `min(dim_x, dim_y, dim_z) / max(dim_x, dim_y, dim_z)` over corrected XYZ extents (`dimensions_mm`), recomputed after any contour-based override so it never inherits a stretched / misaligned raw ellipse semi-axis.
+- `dim_z` (i.e. `dimensions_mm[2]`) is sourced from the **P99** of `height_above_belt`, NOT the absolute max. This applies to every object in the pipeline and to the known-cube calibration measurement, so a few sharp noise peaks on the cube surface (or on regular objects) do not inflate the canonical Z extent. The absolute peak is preserved separately under `height_above_belt_mm.max_height_mm` (and under `known_object_scale_validation.measured_height_max_mm` for the cube) for diagnostics. The cube validation result also exposes `measured_height_source = "p99_height_mm"` so the studio UI can explain where dim_z came from.
 - `feature_local_curvature_proxy` is computed from per-axis gradient components (`feature_curvature_components_raw.mean_abs_g{x,y}_mm_per_mm`) at measurement time over the inner-eroded mask, then rescaled to corrected metric space via the per-axis factors `scale_z/scale_x` and `scale_z/scale_y`.
 - raw/corrected values are preserved for engineering diagnostics.
 
