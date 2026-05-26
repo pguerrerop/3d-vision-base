@@ -32,6 +32,42 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _processed_labels_from_result(result: dict[str, Any]) -> tuple[str | None, str | None]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
+    objects = result.get("objects") if isinstance(result.get("objects"), list) else []
+    first_object = objects[0] if objects and isinstance(objects[0], dict) else {}
+    class_label = next(
+        (
+            str(value).strip()
+            for value in (
+                classification.get("final_class_label"),
+                classification.get("class_label"),
+                classification.get("label"),
+                summary.get("class_label"),
+                summary.get("label"),
+                first_object.get("class_label"),
+                first_object.get("label"),
+            )
+            if value is not None and str(value).strip()
+        ),
+        None,
+    )
+    superclass = next(
+        (
+            str(value).strip()
+            for value in (
+                classification.get("superclass"),
+                summary.get("superclass"),
+                first_object.get("superclass"),
+            )
+            if value is not None and str(value).strip()
+        ),
+        None,
+    )
+    return class_label, superclass
+
+
 def read_runtime_state(settings: ApiSettings) -> RuntimeState:
     payload = read_runtime_status(settings.state_dir)
     return RuntimeState.model_validate(payload)
@@ -64,6 +100,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     result_status = result.get("status")
     status = "failed" if result_status == "failed" else "processed" if has_done else "incoming"
     summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    processed_class_label, processed_superclass = _processed_labels_from_result(result) if result else (None, None)
     poc_summary = result.get("poc_summary") if isinstance(result.get("poc_summary"), dict) else None
     if result and poc_summary is None:
         try:
@@ -141,6 +178,8 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         tags=[str(item) for item in (take_management.get("tags") or []) if str(item)],
         semantic_labels=[str(item) for item in (take_management.get("semantic_labels") or []) if str(item)],
         superclass_labels=[str(item) for item in (take_management.get("superclass_labels") or []) if str(item)],
+        processed_class_label=processed_class_label,
+        processed_superclass=processed_superclass,
         normalized_class=(str(take_management.get("normalized_class")) if take_management.get("normalized_class") is not None else None),
         normalization_version=(str(take_management.get("normalization_version")) if take_management.get("normalization_version") is not None else None),
         validation_status=str(take_management.get("validation_status") or "unreviewed"),

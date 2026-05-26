@@ -183,6 +183,8 @@ export default function ProcessingLabPage() {
   const [roiEditStatus, setRoiEditStatus] = useState<RoiEditStatus>("idle");
   const [resultStale, setResultStale] = useState(false);
   const [debugMode, setDebugMode] = useState<StudioDebugMode>("operator");
+  const [selectedTakeIds, setSelectedTakeIds] = useState<Set<string>>(new Set());
+  const lastTakeClickIndexRef = useRef<number | null>(null);
   const selectedTakeIdRef = useRef(selectedTakeId);
 
   useEffect(() => {
@@ -357,6 +359,58 @@ export default function ProcessingLabPage() {
       reference_surface_selection_mode: String(detect.reference_surface_selection_mode ?? "largest_constant_z"),
       reference_surface_model: String(detect.reference_surface_model ?? "auto"),
       reference_surface_max_plane_residual_p95_mm: Number(detect.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+      // --- Plateau detection (low_gradient_depth_plateaus strategy) ---
+      low_gradient_plateau_use_hessian_filter: Boolean(detect.low_gradient_plateau_use_hessian_filter ?? true),
+      low_gradient_plateau_hessian_percentile: Number(detect.low_gradient_plateau_hessian_percentile ?? 70),
+      low_gradient_plateau_hist_bins: Number(detect.low_gradient_plateau_hist_bins ?? 96),
+      low_gradient_plateau_min_fraction: Number(detect.low_gradient_plateau_min_fraction ?? 0.05),
+      low_gradient_plateau_min_pixels: Number(detect.low_gradient_plateau_min_pixels ?? 500),
+      low_gradient_plateau_smoothing_sigma_bins: Number(detect.low_gradient_plateau_smoothing_sigma_bins ?? 2.5),
+      low_gradient_plateau_peak_drop_ratio: Number(detect.low_gradient_plateau_peak_drop_ratio ?? 0.40),
+      low_gradient_plateau_select_min_area_fraction: Number(detect.low_gradient_plateau_select_min_area_fraction ?? 0.20),
+      low_gradient_plateau_selection_mode: String(detect.low_gradient_plateau_selection_mode ?? "lowest_dominant"),
+      low_gradient_plateau_robust_band_mad_k: Number(detect.low_gradient_plateau_robust_band_mad_k ?? 3.0),
+      low_gradient_plateau_detection_min_count_floor: Number(detect.low_gradient_plateau_detection_min_count_floor ?? 25),
+      low_gradient_plateau_detection_min_count_fraction: Number(detect.low_gradient_plateau_detection_min_count_fraction ?? 0.25),
+      // --- Belt stripe filter ---
+      belt_stripe_filter_enabled: Boolean(detect.belt_stripe_filter_enabled ?? true),
+      belt_stripe_filter_scope: String(detect.belt_stripe_filter_scope ?? "global"),
+      belt_stripe_filter_baseline_mode: String(detect.belt_stripe_filter_baseline_mode ?? "opening"),
+      belt_stripe_filter_window_mm: Number(detect.belt_stripe_filter_window_mm ?? 30.0),
+      belt_stripe_filter_direction: String(detect.belt_stripe_filter_direction ?? "auto"),
+      belt_stripe_filter_threshold_mode: String(detect.belt_stripe_filter_threshold_mode ?? "otsu"),
+      belt_stripe_filter_min_altitude_mm: Number(detect.belt_stripe_filter_min_altitude_mm ?? 10.0),
+      belt_stripe_filter_k_mad: Number(detect.belt_stripe_filter_k_mad ?? 3.0),
+      belt_stripe_filter_fixed_threshold_mm: Number(detect.belt_stripe_filter_fixed_threshold_mm ?? 10.0),
+      belt_stripe_filter_min_stripe_fraction: Number(detect.belt_stripe_filter_min_stripe_fraction ?? 0.02),
+      belt_stripe_filter_z_floor_enabled: Boolean(detect.belt_stripe_filter_z_floor_enabled ?? true),
+      belt_stripe_filter_z_floor_use_upper_bound: Boolean(detect.belt_stripe_filter_z_floor_use_upper_bound ?? true),
+      belt_stripe_filter_z_floor_margin_mm: Number(detect.belt_stripe_filter_z_floor_margin_mm ?? 20.0),
+      belt_stripe_filter_max_stripe_height_mm: Number(detect.belt_stripe_filter_max_stripe_height_mm ?? 500.0),
+      belt_stripe_filter_above_belt_close_mm: Number(detect.belt_stripe_filter_above_belt_close_mm ?? 30.0),
+      belt_stripe_filter_object_kernel_mm: Number(detect.belt_stripe_filter_object_kernel_mm ?? 100.0),
+      belt_stripe_filter_object_kernel_shape: String(detect.belt_stripe_filter_object_kernel_shape ?? "ellipse"),
+      belt_stripe_filter_altitude_hist_bins: Number(detect.belt_stripe_filter_altitude_hist_bins ?? 64),
+      belt_stripe_filter_auto_bimodality_margin: Number(detect.belt_stripe_filter_auto_bimodality_margin ?? 1.10),
+      belt_stripe_filter_z_floor_upper_percentile: Number(detect.belt_stripe_filter_z_floor_upper_percentile ?? 99.0),
+      belt_stripe_filter_z_floor_fallback_lower_percentile: Number(detect.belt_stripe_filter_z_floor_fallback_lower_percentile ?? 10.0),
+      belt_stripe_filter_z_floor_fallback_upper_percentile: Number(detect.belt_stripe_filter_z_floor_fallback_upper_percentile ?? 25.0),
+      belt_stripe_filter_warn_removed_fraction: Number(detect.belt_stripe_filter_warn_removed_fraction ?? 0.40),
+      // --- Low-gradient surface (legacy strategy) ---
+      low_gradient_surface_support_z_mad_multiplier: Number(detect.low_gradient_surface_support_z_mad_multiplier ?? 2.5),
+      low_gradient_surface_support_z_floor_mm: Number(detect.low_gradient_surface_support_z_floor_mm ?? 1.0),
+      low_gradient_surface_support_z_mad_floor_mm: Number(detect.low_gradient_surface_support_z_mad_floor_mm ?? 0.25),
+      low_gradient_surface_ridge_percentile: Number(detect.low_gradient_surface_ridge_percentile ?? 90.0),
+      // --- Height gate ---
+      reference_surface_height_gate_enabled: Boolean(detect.reference_surface_height_gate_enabled ?? true),
+      reference_surface_height_gate_margin_mm: Number(detect.reference_surface_height_gate_margin_mm ?? 8.0),
+      reference_surface_height_gate_min_coverage_ratio: Number(detect.reference_surface_height_gate_min_coverage_ratio ?? 0.10),
+      reference_surface_height_gate_max_coverage_ratio: Number(detect.reference_surface_height_gate_max_coverage_ratio ?? 0.95),
+      reference_surface_height_gate_gap_floor_mm: Number(detect.reference_surface_height_gate_gap_floor_mm ?? 1.0),
+      reference_surface_height_gate_gap_ratio: Number(detect.reference_surface_height_gate_gap_ratio ?? 8.0),
+      // --- Plot rendering ---
+      plot_depth_plot_max_render_samples: Number(detect.plot_depth_plot_max_render_samples ?? 60000),
+      plot_y_robust_percentile: Number(detect.plot_y_robust_percentile ?? 98.0),
       reference_surface_region_mode: String(
         detect.reference_surface_region_mode
         ?? (
@@ -689,6 +743,23 @@ export default function ProcessingLabPage() {
     if (takeFilter === "warnings" && !(take.warning_count ?? 0)) return false;
     return true;
   });
+  const allVisibleTakeIds = useMemo(() => filteredTakes.map((take) => take.take_id), [filteredTakes]);
+  const selectedVisibleCount = useMemo(
+    () => allVisibleTakeIds.filter((takeId) => selectedTakeIds.has(takeId)).length,
+    [allVisibleTakeIds, selectedTakeIds]
+  );
+  const allVisibleSelected = allVisibleTakeIds.length > 0 && selectedVisibleCount === allVisibleTakeIds.length;
+  const bulkSelectionCount = selectedTakeIds.size;
+  useEffect(() => {
+    const visible = new Set(allVisibleTakeIds);
+    setSelectedTakeIds((current) => {
+      const next = new Set<string>();
+      current.forEach((takeId) => {
+        if (visible.has(takeId)) next.add(takeId);
+      });
+      return next.size === current.size ? current : next;
+    });
+  }, [allVisibleTakeIds]);
   const familyStatus = useMemo(
     () => (detail?.processing_by_family ?? []).find((item) => item.family === activePipelineFamily) ?? null,
     [detail?.processing_by_family, activePipelineFamily]
@@ -816,6 +887,53 @@ export default function ProcessingLabPage() {
         reference_surface_selection_mode: String(planeQaParams.reference_surface_selection_mode ?? "largest_constant_z"),
         reference_surface_model: String(planeQaParams.reference_surface_model ?? "auto"),
         reference_surface_max_plane_residual_p95_mm: Number(planeQaParams.reference_surface_max_plane_residual_p95_mm ?? 3.0),
+        low_gradient_plateau_use_hessian_filter: Boolean(planeQaParams.low_gradient_plateau_use_hessian_filter ?? true),
+        low_gradient_plateau_hessian_percentile: Number(planeQaParams.low_gradient_plateau_hessian_percentile ?? 70),
+        low_gradient_plateau_hist_bins: Number(planeQaParams.low_gradient_plateau_hist_bins ?? 96),
+        low_gradient_plateau_min_fraction: Number(planeQaParams.low_gradient_plateau_min_fraction ?? 0.05),
+        low_gradient_plateau_min_pixels: Number(planeQaParams.low_gradient_plateau_min_pixels ?? 500),
+        low_gradient_plateau_smoothing_sigma_bins: Number(planeQaParams.low_gradient_plateau_smoothing_sigma_bins ?? 2.5),
+        low_gradient_plateau_peak_drop_ratio: Number(planeQaParams.low_gradient_plateau_peak_drop_ratio ?? 0.40),
+        low_gradient_plateau_select_min_area_fraction: Number(planeQaParams.low_gradient_plateau_select_min_area_fraction ?? 0.20),
+        low_gradient_plateau_selection_mode: String(planeQaParams.low_gradient_plateau_selection_mode ?? "lowest_dominant"),
+        low_gradient_plateau_robust_band_mad_k: Number(planeQaParams.low_gradient_plateau_robust_band_mad_k ?? 3.0),
+        low_gradient_plateau_detection_min_count_floor: Number(planeQaParams.low_gradient_plateau_detection_min_count_floor ?? 25),
+        low_gradient_plateau_detection_min_count_fraction: Number(planeQaParams.low_gradient_plateau_detection_min_count_fraction ?? 0.25),
+        belt_stripe_filter_enabled: Boolean(planeQaParams.belt_stripe_filter_enabled ?? true),
+        belt_stripe_filter_scope: String(planeQaParams.belt_stripe_filter_scope ?? "global"),
+        belt_stripe_filter_baseline_mode: String(planeQaParams.belt_stripe_filter_baseline_mode ?? "opening"),
+        belt_stripe_filter_window_mm: Number(planeQaParams.belt_stripe_filter_window_mm ?? 30.0),
+        belt_stripe_filter_direction: String(planeQaParams.belt_stripe_filter_direction ?? "auto"),
+        belt_stripe_filter_threshold_mode: String(planeQaParams.belt_stripe_filter_threshold_mode ?? "otsu"),
+        belt_stripe_filter_min_altitude_mm: Number(planeQaParams.belt_stripe_filter_min_altitude_mm ?? 10.0),
+        belt_stripe_filter_k_mad: Number(planeQaParams.belt_stripe_filter_k_mad ?? 3.0),
+        belt_stripe_filter_fixed_threshold_mm: Number(planeQaParams.belt_stripe_filter_fixed_threshold_mm ?? 10.0),
+        belt_stripe_filter_min_stripe_fraction: Number(planeQaParams.belt_stripe_filter_min_stripe_fraction ?? 0.02),
+        belt_stripe_filter_z_floor_enabled: Boolean(planeQaParams.belt_stripe_filter_z_floor_enabled ?? true),
+        belt_stripe_filter_z_floor_use_upper_bound: Boolean(planeQaParams.belt_stripe_filter_z_floor_use_upper_bound ?? true),
+        belt_stripe_filter_z_floor_margin_mm: Number(planeQaParams.belt_stripe_filter_z_floor_margin_mm ?? 20.0),
+        belt_stripe_filter_max_stripe_height_mm: Number(planeQaParams.belt_stripe_filter_max_stripe_height_mm ?? 500.0),
+        belt_stripe_filter_above_belt_close_mm: Number(planeQaParams.belt_stripe_filter_above_belt_close_mm ?? 30.0),
+        belt_stripe_filter_object_kernel_mm: Number(planeQaParams.belt_stripe_filter_object_kernel_mm ?? 100.0),
+        belt_stripe_filter_object_kernel_shape: String(planeQaParams.belt_stripe_filter_object_kernel_shape ?? "ellipse"),
+        belt_stripe_filter_altitude_hist_bins: Number(planeQaParams.belt_stripe_filter_altitude_hist_bins ?? 64),
+        belt_stripe_filter_auto_bimodality_margin: Number(planeQaParams.belt_stripe_filter_auto_bimodality_margin ?? 1.10),
+        belt_stripe_filter_z_floor_upper_percentile: Number(planeQaParams.belt_stripe_filter_z_floor_upper_percentile ?? 99.0),
+        belt_stripe_filter_z_floor_fallback_lower_percentile: Number(planeQaParams.belt_stripe_filter_z_floor_fallback_lower_percentile ?? 10.0),
+        belt_stripe_filter_z_floor_fallback_upper_percentile: Number(planeQaParams.belt_stripe_filter_z_floor_fallback_upper_percentile ?? 25.0),
+        belt_stripe_filter_warn_removed_fraction: Number(planeQaParams.belt_stripe_filter_warn_removed_fraction ?? 0.40),
+        low_gradient_surface_support_z_mad_multiplier: Number(planeQaParams.low_gradient_surface_support_z_mad_multiplier ?? 2.5),
+        low_gradient_surface_support_z_floor_mm: Number(planeQaParams.low_gradient_surface_support_z_floor_mm ?? 1.0),
+        low_gradient_surface_support_z_mad_floor_mm: Number(planeQaParams.low_gradient_surface_support_z_mad_floor_mm ?? 0.25),
+        low_gradient_surface_ridge_percentile: Number(planeQaParams.low_gradient_surface_ridge_percentile ?? 90.0),
+        reference_surface_height_gate_enabled: Boolean(planeQaParams.reference_surface_height_gate_enabled ?? true),
+        reference_surface_height_gate_margin_mm: Number(planeQaParams.reference_surface_height_gate_margin_mm ?? 8.0),
+        reference_surface_height_gate_min_coverage_ratio: Number(planeQaParams.reference_surface_height_gate_min_coverage_ratio ?? 0.10),
+        reference_surface_height_gate_max_coverage_ratio: Number(planeQaParams.reference_surface_height_gate_max_coverage_ratio ?? 0.95),
+        reference_surface_height_gate_gap_floor_mm: Number(planeQaParams.reference_surface_height_gate_gap_floor_mm ?? 1.0),
+        reference_surface_height_gate_gap_ratio: Number(planeQaParams.reference_surface_height_gate_gap_ratio ?? 8.0),
+        plot_depth_plot_max_render_samples: Number(planeQaParams.plot_depth_plot_max_render_samples ?? 60000),
+        plot_y_robust_percentile: Number(planeQaParams.plot_y_robust_percentile ?? 98.0),
         plane_fit_roi: String(planeQaParams.reference_surface_region_mode ?? "none") === "none"
           ? {
             enabled: false,
@@ -908,6 +1026,19 @@ export default function ProcessingLabPage() {
       setPipelineActionBusy(false);
       setResultStale(false);
     }
+  }
+
+  async function processTakeWithSelectedPipeline(
+    takeId: string,
+    reprocess = false,
+    stageParamsOverride?: Record<string, unknown> | null
+  ) {
+    if (!selectedPipeline) return null;
+    return await api.processTake(takeId, {
+      pipeline_id: selectedPipeline.id,
+      reprocess,
+      stage_params: stageParamsOverride ?? build25dStageParams(),
+    }) as { pipeline_instance_id?: string; run_id?: string; result_path?: string };
   }
 
   function applyPlaneQaParams(rerun = false) {
@@ -1044,6 +1175,73 @@ export default function ProcessingLabPage() {
   async function rerunLatestPipeline() {
     if (!detail || !selectedPipeline) return;
     await runSelectedPipeline(false);
+  }
+
+  function handleTakeSelection(
+    takeId: string,
+    index: number,
+    additive: boolean,
+    range: boolean,
+  ) {
+    setSelectedTakeIds((current) => {
+      const next = additive ? new Set(current) : new Set<string>();
+      if (range && lastTakeClickIndexRef.current != null) {
+        const lo = Math.min(lastTakeClickIndexRef.current, index);
+        const hi = Math.max(lastTakeClickIndexRef.current, index);
+        for (let i = lo; i <= hi; i += 1) {
+          next.add(filteredTakes[i].take_id);
+        }
+      } else if (next.has(takeId)) {
+        next.delete(takeId);
+      } else {
+        next.add(takeId);
+      }
+      if (!additive && !range) {
+        lastTakeClickIndexRef.current = index;
+      } else if (range) {
+        lastTakeClickIndexRef.current = index;
+      }
+      return next;
+    });
+  }
+
+  async function reprocessSelectedTakes() {
+    if (!selectedPipeline || selectedTakeIds.size === 0) return;
+    const takeIds = Array.from(selectedTakeIds);
+    const stageParams = build25dStageParams();
+    const maxConcurrent = 3;
+    let completed = 0;
+    let failed = 0;
+    setPipelineActionBusy(true);
+    setPipelineActionMessage(`Reprocessing ${takeIds.length} takes...`);
+    setResultStale(true);
+    try {
+      for (let i = 0; i < takeIds.length; i += maxConcurrent) {
+        const batch = takeIds.slice(i, i + maxConcurrent);
+        const results = await Promise.allSettled(
+          batch.map((takeId) => processTakeWithSelectedPipeline(takeId, true, stageParams))
+        );
+        completed += results.filter((item) => item.status === "fulfilled").length;
+        failed += results.filter((item) => item.status === "rejected").length;
+        setPipelineActionMessage(
+          `Reprocessing takes... ${completed + failed}/${takeIds.length} (ok: ${completed}, failed: ${failed})`
+        );
+      }
+      await load();
+      if (detail?.take_id) {
+        setDetail(await api.take(detail.take_id));
+      }
+      setPipelineActionMessage(
+        failed > 0
+          ? `Bulk reprocess finished with ${failed} failures (${completed} succeeded).`
+          : `Bulk reprocess completed for ${completed} takes.`
+      );
+    } catch (err) {
+      setPipelineActionMessage(`Bulk reprocess failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setPipelineActionBusy(false);
+      setResultStale(false);
+    }
   }
 
   async function upsertObjectAnnotation(payload: Record<string, unknown>) {
@@ -1563,24 +1761,89 @@ export default function ProcessingLabPage() {
             </select>
           </label>
         </div>
+        <div className="studio-take-bulkbar">
+          <label>
+            <input
+              type="checkbox"
+              checked={allVisibleSelected}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                setSelectedTakeIds(checked ? new Set(allVisibleTakeIds) : new Set());
+                if (!checked) lastTakeClickIndexRef.current = null;
+              }}
+            />
+            Select visible
+          </label>
+          <small>{bulkSelectionCount} selected</small>
+          <button
+            type="button"
+            disabled={pipelineActionBusy || !selectedPipeline || bulkSelectionCount === 0}
+            onClick={() => void reprocessSelectedTakes()}
+          >
+            Reprocess selected
+          </button>
+          <button
+            type="button"
+            disabled={bulkSelectionCount === 0}
+            onClick={() => {
+              setSelectedTakeIds(new Set());
+              lastTakeClickIndexRef.current = null;
+            }}
+          >
+            Clear
+          </button>
+        </div>
         <div className="studio-take-list">
-          {filteredTakes.map((take) => (
-            <button className={take.take_id === selectedTakeId ? "active" : ""} key={take.take_id} onClick={() => setSelectedTakeId(take.take_id)} type="button">
-              <strong>{take.friendly_name || take.take_id}</strong>
-              {take.friendly_name && take.friendly_name !== take.take_id && <small>{take.take_id}</small>}
-              <div className="take-card-main">
-                {take.thumbnail_path ? (
-                  <img alt={take.friendly_name || take.take_id} className="take-thumb" src={fileUrl(take.take_id, take.thumbnail_path)} />
-                ) : (
-                  <div aria-hidden className="take-thumb take-thumb-empty" />
-                )}
-                <div className="take-class-meta">
-                  <small>Class: {take.semantic_labels?.join(", ") || "-"}</small>
-                  <small>Superclass: {take.superclass_labels?.join(", ") || "-"}</small>
-                </div>
+          {filteredTakes.map((take, index) => {
+            const classText = (take.processed_class_label && take.processed_class_label.trim())
+              || take.semantic_labels?.join(", ")
+              || "-";
+            const superclassText = (take.processed_superclass && take.processed_superclass.trim())
+              || take.superclass_labels?.join(", ")
+              || "-";
+            const isSelectedForBulk = selectedTakeIds.has(take.take_id);
+            return (
+              <div className="take-card-row" key={take.take_id}>
+                <input
+                  aria-label={`Select ${take.friendly_name || take.take_id}`}
+                  checked={isSelectedForBulk}
+                  onChange={() => undefined}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    handleTakeSelection(take.take_id, index, true, event.shiftKey);
+                  }}
+                  type="checkbox"
+                />
+                <button
+                  className={`${take.take_id === selectedTakeId ? "active" : ""} ${isSelectedForBulk ? "multi-selected" : ""}`}
+                  onClick={(event) => {
+                    if (event.shiftKey || event.metaKey || event.ctrlKey) {
+                      event.preventDefault();
+                      handleTakeSelection(take.take_id, index, event.metaKey || event.ctrlKey, event.shiftKey);
+                      return;
+                    }
+                    setSelectedTakeId(take.take_id);
+                    lastTakeClickIndexRef.current = index;
+                  }}
+                  type="button"
+                >
+                  <strong>{take.friendly_name || take.take_id}</strong>
+                  {take.friendly_name && take.friendly_name !== take.take_id && <small>{take.take_id}</small>}
+                  <div className="take-card-main">
+                    {take.thumbnail_path ? (
+                      <img alt={take.friendly_name || take.take_id} className="take-thumb" src={fileUrl(take.take_id, take.thumbnail_path)} />
+                    ) : (
+                      <div aria-hidden className="take-thumb take-thumb-empty" />
+                    )}
+                    <div className="take-class-meta">
+                      <small>Class: {classText}</small>
+                      <small>Superclass: {superclassText}</small>
+                    </div>
+                  </div>
+                </button>
               </div>
-            </button>
-          ))}
+            );
+          })}
         </div>
         <div className="studio-pipeline-card">
           <span>Take management</span>
@@ -1916,6 +2179,207 @@ export default function ProcessingLabPage() {
                 <button type="button" disabled={pipelineActionBusy} onClick={() => void save25dParamsAsDefaults()}>Save defaults</button>
                 <button type="button" disabled={pipelineActionBusy} onClick={() => { setPlaneQaParams(planeQaPersistedParams); setPlaneQaDirty(false); }}>Reset</button>
               </div>
+              <details className="advanced-params-details">
+                <summary><strong>Advanced parameters</strong> <small>(plateau, stripe filter, height gate, plot rendering)</small></summary>
+                <div className="advanced-params-grid">
+                  {String(planeQaParams.background_detection_strategy ?? "low_gradient_surface") === "low_gradient_depth_plateaus" && (
+                    <fieldset>
+                      <legend>Plateau detection</legend>
+                      <div className="segmentation-controls-row">
+                        <label>Hessian filter
+                          <input type="checkbox" checked={Boolean(planeQaParams.low_gradient_plateau_use_hessian_filter ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_use_hessian_filter: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Hessian pct
+                          <input type="number" min={1} max={99} step={1} value={Number(planeQaParams.low_gradient_plateau_hessian_percentile ?? 70)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_hessian_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Hist bins
+                          <input type="number" min={16} max={512} step={1} value={Number(planeQaParams.low_gradient_plateau_hist_bins ?? 96)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_hist_bins: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Min fraction
+                          <input type="number" min={0} max={1} step={0.01} value={Number(planeQaParams.low_gradient_plateau_min_fraction ?? 0.05)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_min_fraction: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Min pixels
+                          <input type="number" min={16} max={1000000} step={50} value={Number(planeQaParams.low_gradient_plateau_min_pixels ?? 500)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_min_pixels: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Smooth σ (bins)
+                          <input type="number" min={0.5} max={20} step={0.1} value={Number(planeQaParams.low_gradient_plateau_smoothing_sigma_bins ?? 2.5)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_smoothing_sigma_bins: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Peak drop
+                          <input type="number" min={0.05} max={0.95} step={0.01} value={Number(planeQaParams.low_gradient_plateau_peak_drop_ratio ?? 0.40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_peak_drop_ratio: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Select min frac
+                          <input type="number" min={0} max={1} step={0.01} value={Number(planeQaParams.low_gradient_plateau_select_min_area_fraction ?? 0.20)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_select_min_area_fraction: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Selection
+                          <select value={String(planeQaParams.low_gradient_plateau_selection_mode ?? "lowest_dominant")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_selection_mode: e.target.value } : c); setPlaneQaDirty(true); }}>
+                            <option value="lowest_dominant">lowest_dominant</option>
+                            <option value="largest">largest</option>
+                            <option value="lowest">lowest</option>
+                            <option value="robust_band">robust_band</option>
+                          </select>
+                        </label>
+                        <label>k·MAD
+                          <input type="number" min={0.5} max={10} step={0.1} value={Number(planeQaParams.low_gradient_plateau_robust_band_mad_k ?? 3.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_robust_band_mad_k: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Detect floor
+                          <input type="number" min={1} max={10000} step={1} value={Number(planeQaParams.low_gradient_plateau_detection_min_count_floor ?? 25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_detection_min_count_floor: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Detect frac
+                          <input type="number" min={0} max={1} step={0.05} value={Number(planeQaParams.low_gradient_plateau_detection_min_count_fraction ?? 0.25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_plateau_detection_min_count_fraction: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                      </div>
+                    </fieldset>
+                  )}
+                  <fieldset>
+                    <legend>Belt stripe filter</legend>
+                    <div className="segmentation-controls-row">
+                      <label>Enabled
+                        <input type="checkbox" checked={Boolean(planeQaParams.belt_stripe_filter_enabled ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Scope
+                        <select value={String(planeQaParams.belt_stripe_filter_scope ?? "global")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_scope: e.target.value } : c); setPlaneQaDirty(true); }}>
+                          <option value="global">global</option>
+                          <option value="bg_plateau">bg_plateau</option>
+                        </select>
+                      </label>
+                      <label>Baseline
+                        <select value={String(planeQaParams.belt_stripe_filter_baseline_mode ?? "opening")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_baseline_mode: e.target.value } : c); setPlaneQaDirty(true); }}>
+                          <option value="opening">opening</option>
+                          <option value="erosion">erosion</option>
+                        </select>
+                      </label>
+                      <label>Direction
+                        <select value={String(planeQaParams.belt_stripe_filter_direction ?? "auto")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_direction: e.target.value } : c); setPlaneQaDirty(true); }}>
+                          <option value="auto">auto</option>
+                          <option value="raised">raised</option>
+                          <option value="recessed">recessed</option>
+                        </select>
+                      </label>
+                      <label>Window mm
+                        <input type="number" min={1} max={500} step={1} value={Number(planeQaParams.belt_stripe_filter_window_mm ?? 30.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_window_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Threshold
+                        <select value={String(planeQaParams.belt_stripe_filter_threshold_mode ?? "otsu")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_threshold_mode: e.target.value } : c); setPlaneQaDirty(true); }}>
+                          <option value="otsu">otsu</option>
+                          <option value="k_mad">k_mad</option>
+                          <option value="fixed">fixed</option>
+                        </select>
+                      </label>
+                      <label>Min alt mm
+                        <input type="number" min={0} max={500} step={0.5} value={Number(planeQaParams.belt_stripe_filter_min_altitude_mm ?? 10.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_min_altitude_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>k·MAD
+                        <input type="number" min={0.1} max={20} step={0.1} value={Number(planeQaParams.belt_stripe_filter_k_mad ?? 3.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_k_mad: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Fixed thr mm
+                        <input type="number" min={0} max={500} step={0.5} value={Number(planeQaParams.belt_stripe_filter_fixed_threshold_mm ?? 10.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_fixed_threshold_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Min stripe frac
+                        <input type="number" min={0} max={1} step={0.005} value={Number(planeQaParams.belt_stripe_filter_min_stripe_fraction ?? 0.02)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_min_stripe_fraction: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>z-floor enabled
+                        <input type="checkbox" checked={Boolean(planeQaParams.belt_stripe_filter_z_floor_enabled ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Use upper bound
+                        <input type="checkbox" checked={Boolean(planeQaParams.belt_stripe_filter_z_floor_use_upper_bound ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_use_upper_bound: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>z margin mm
+                        <input type="number" min={0} max={500} step={0.5} value={Number(planeQaParams.belt_stripe_filter_z_floor_margin_mm ?? 20.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_margin_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Max stripe h mm
+                        <input type="number" min={0} max={5000} step={1} value={Number(planeQaParams.belt_stripe_filter_max_stripe_height_mm ?? 500.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_max_stripe_height_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Close mm
+                        <input type="number" min={0} max={500} step={1} value={Number(planeQaParams.belt_stripe_filter_above_belt_close_mm ?? 30.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_above_belt_close_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Object kernel mm
+                        <input type="number" min={1} max={1000} step={1} value={Number(planeQaParams.belt_stripe_filter_object_kernel_mm ?? 100.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_object_kernel_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Kernel shape
+                        <select value={String(planeQaParams.belt_stripe_filter_object_kernel_shape ?? "ellipse")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_object_kernel_shape: e.target.value } : c); setPlaneQaDirty(true); }}>
+                          <option value="ellipse">ellipse</option>
+                          <option value="rect">rect</option>
+                        </select>
+                      </label>
+                      <label>Alt hist bins
+                        <input type="number" min={8} max={512} step={1} value={Number(planeQaParams.belt_stripe_filter_altitude_hist_bins ?? 64)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_altitude_hist_bins: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Auto bimodal m
+                        <input type="number" min={1.0} max={5.0} step={0.05} value={Number(planeQaParams.belt_stripe_filter_auto_bimodality_margin ?? 1.10)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_auto_bimodality_margin: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>z-floor upper pct
+                        <input type="number" min={50} max={100} step={0.5} value={Number(planeQaParams.belt_stripe_filter_z_floor_upper_percentile ?? 99.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_upper_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Fallback lower
+                        <input type="number" min={0} max={50} step={0.5} value={Number(planeQaParams.belt_stripe_filter_z_floor_fallback_lower_percentile ?? 10.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_fallback_lower_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Fallback upper
+                        <input type="number" min={0} max={100} step={0.5} value={Number(planeQaParams.belt_stripe_filter_z_floor_fallback_upper_percentile ?? 25.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_z_floor_fallback_upper_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Warn removed
+                        <input type="number" min={0} max={1} step={0.05} value={Number(planeQaParams.belt_stripe_filter_warn_removed_fraction ?? 0.40)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, belt_stripe_filter_warn_removed_fraction: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                    </div>
+                  </fieldset>
+                  {String(planeQaParams.background_detection_strategy ?? "low_gradient_surface") === "low_gradient_surface" && (
+                    <fieldset>
+                      <legend>Low-gradient surface tuning</legend>
+                      <div className="segmentation-controls-row">
+                        <label>z MAD ×
+                          <input type="number" min={0.5} max={10} step={0.1} value={Number(planeQaParams.low_gradient_surface_support_z_mad_multiplier ?? 2.5)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_surface_support_z_mad_multiplier: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>z floor mm
+                          <input type="number" min={0} max={50} step={0.1} value={Number(planeQaParams.low_gradient_surface_support_z_floor_mm ?? 1.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_surface_support_z_floor_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>MAD floor mm
+                          <input type="number" min={0} max={10} step={0.05} value={Number(planeQaParams.low_gradient_surface_support_z_mad_floor_mm ?? 0.25)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_surface_support_z_mad_floor_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                        <label>Ridge pct
+                          <input type="number" min={1} max={99} step={1} value={Number(planeQaParams.low_gradient_surface_ridge_percentile ?? 90.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, low_gradient_surface_ridge_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                        </label>
+                      </div>
+                    </fieldset>
+                  )}
+                  <fieldset>
+                    <legend>Height gate</legend>
+                    <div className="segmentation-controls-row">
+                      <label>Enabled
+                        <input type="checkbox" checked={Boolean(planeQaParams.reference_surface_height_gate_enabled ?? true)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_enabled: e.target.checked } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Margin mm
+                        <input type="number" min={0} max={200} step={0.5} value={Number(planeQaParams.reference_surface_height_gate_margin_mm ?? 8.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_margin_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Min coverage
+                        <input type="number" min={0.01} max={0.95} step={0.01} value={Number(planeQaParams.reference_surface_height_gate_min_coverage_ratio ?? 0.10)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_min_coverage_ratio: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Max coverage
+                        <input type="number" min={0.05} max={0.99} step={0.01} value={Number(planeQaParams.reference_surface_height_gate_max_coverage_ratio ?? 0.95)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_max_coverage_ratio: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Gap floor mm
+                        <input type="number" min={0} max={100} step={0.1} value={Number(planeQaParams.reference_surface_height_gate_gap_floor_mm ?? 1.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_gap_floor_mm: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Gap ratio
+                        <input type="number" min={1} max={100} step={0.5} value={Number(planeQaParams.reference_surface_height_gate_gap_ratio ?? 8.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_height_gate_gap_ratio: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                    </div>
+                  </fieldset>
+                  <fieldset>
+                    <legend>Plot rendering</legend>
+                    <div className="segmentation-controls-row">
+                      <label>Depth dots cap
+                        <input type="number" min={1000} max={1000000} step={1000} value={Number(planeQaParams.plot_depth_plot_max_render_samples ?? 60000)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plot_depth_plot_max_render_samples: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                      <label>Y robust pct
+                        <input type="number" min={50} max={100} step={0.5} value={Number(planeQaParams.plot_y_robust_percentile ?? 98.0)} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, plot_y_robust_percentile: Number(e.target.value) } : c); setPlaneQaDirty(true); }} />
+                      </label>
+                    </div>
+                  </fieldset>
+                </div>
+                <div className="segmentation-controls-row">
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(false)}>Apply</button>
+                  <button type="button" disabled={pipelineActionBusy} onClick={() => applyPlaneQaParams(true)}>Apply + rerun</button>
+                </div>
+              </details>
             </section>
           )}
           {canonicalSelectedStageId === "load_heightmap" && planeQaParams && (

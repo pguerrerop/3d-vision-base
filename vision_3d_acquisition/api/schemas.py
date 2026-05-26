@@ -73,6 +73,8 @@ class TakeSummary(BaseModel):
     tags: list[str] = Field(default_factory=list)
     semantic_labels: list[str] = Field(default_factory=list)
     superclass_labels: list[str] = Field(default_factory=list)
+    processed_class_label: str | None = None
+    processed_superclass: str | None = None
     normalized_class: str | None = None
     normalization_version: str | None = None
     validation_status: str | None = None

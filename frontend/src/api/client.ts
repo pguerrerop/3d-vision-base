@@ -350,6 +350,8 @@ export interface TakeSummary {
   tags?: string[];
   semantic_labels?: string[];
   superclass_labels?: string[];
+  processed_class_label?: string | null;
+  processed_superclass?: string | null;
   normalized_class?: string | null;
   normalization_version?: string | null;
   validation_status?: string | null;

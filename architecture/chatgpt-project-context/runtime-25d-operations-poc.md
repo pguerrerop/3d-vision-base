@@ -19,12 +19,28 @@ Three independent processes are expected:
 - writes `runtime_state.json` with `state=acquired`
 - does not start processing
 
-2. `scripts/run_25d_worker.py`
+python scripts/watch_trispector_folder.py \
+  --watch-dir data/trispector_uploads \
+  --data-dir data \
+  --source-id trispector_ftp \
+  --poll-interval-sec 1.0
+
+### FTP server mode (project-hosted TriSpector ingress)
+When this repository hosts the FTP endpoint directly (instead of watching an externally written folder), start the supervised FTP runtime process:
+
+source .venv/bin/activate
+python scripts/runtime.py start trispector_ftp --foreground
+
+Use this mode instead of `watch_trispector_folder.py` for the same upload flow.
+
+2. Detection: `scripts/run_25d_worker.py`
 - polls takes from `data/incoming`
 - handles runtime states: `queued`, `processing`, `completed`, `failed`
 - executes only `mining_steel_ball_classification_25d`
 - preserves existing pipeline stage/artifact semantics
 - publishes operations cards and updates runtime index
+
+python scripts/run_25d_worker.py
 
 3. API/UI process (`python -m vision_3d_acquisition.api.main`)
 - exposes lightweight operations feed via `/api/operations/cards`

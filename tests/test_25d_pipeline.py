@@ -16,7 +16,7 @@ from vision_3d_acquisition.vision_core.pipelines.stages_25d import (
     _contour_metrics_in_metric_space,
     _compose_diameter_metrics,
 )
-from vision_3d_acquisition.vision_core.heightmap import load_heightmap_npz
+from vision_3d_acquisition.vision_core.heightmap import HeightmapFrame, load_heightmap_npz, save_heightmap_npz
 
 
 def _load_result(data_dir: Path, take_id: str) -> dict:
@@ -743,3 +743,39 @@ def test_numeric_height_source_rejects_preview_png(tmp_path: Path) -> None:
         assert "Preview image cannot be used as numeric height source" in str(exc)
     else:
         raise AssertionError("Expected ValueError when PNG is used as numeric height source")
+
+
+def test_load_heightmap_frame_excludes_nonpositive_z(tmp_path: Path) -> None:
+    repo_take = Path(__file__).resolve().parents[1] / "data" / "incoming" / "2026-05-25T145918_022"
+    if not (repo_take / "height16.tif").is_file():
+        pytest.skip("fixture take not available")
+
+    metadata = json.loads((repo_take / "metadata.json").read_text(encoding="utf-8"))
+    from vision_3d_acquisition.vision_core.pipelines.stages_25d import _load_heightmap_frame
+
+    frame = _load_heightmap_frame(
+        repo_take / "height16.tif",
+        repo_take / "reflectance.png",
+        metadata,
+    )
+    valid_z = frame.z_mm[frame.valid_mask]
+    assert valid_z.size > 0
+    assert float(np.min(valid_z)) > 0.0
+    assert int(np.count_nonzero(frame.valid_mask & (frame.z_mm <= 0.0))) == 0
+
+    stale_npz = tmp_path / "heightmap_frame.npz"
+    save_heightmap_npz(
+        HeightmapFrame(
+            z_mm=frame.z_mm,
+            valid_mask=np.isfinite(frame.z_mm),
+            reflectance=None,
+            x_resolution_mm=frame.x_resolution_mm,
+            y_resolution_mm=frame.y_resolution_mm,
+            origin_x_mm=frame.origin_x_mm,
+            origin_y_mm=frame.origin_y_mm,
+            coordinate_system=frame.coordinate_system,
+        ),
+        stale_npz,
+    )
+    reloaded = _load_heightmap_frame(stale_npz, None, metadata)
+    assert int(np.count_nonzero(reloaded.valid_mask & (reloaded.z_mm <= 0.0))) == 0

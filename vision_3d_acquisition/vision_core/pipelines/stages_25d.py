@@ -504,6 +504,31 @@ class DetectBeltPlaneStage:
     belt_stripe_filter_above_belt_close_mm: float = 30.0
     belt_stripe_filter_object_kernel_mm: float = 100.0  # binary opening kernel that separates objects (≥ this width) from stripes (< this width)
     belt_stripe_filter_object_kernel_shape: str = "ellipse"  # ellipse | rect — ellipse is smoother on round/irregular objects
+    # ── Previously-hardcoded knobs surfaced for tuning ──────────────────
+    # All defaults match the pre-existing hardcoded constants so behavior
+    # is unchanged unless the user overrides them.
+    belt_stripe_filter_altitude_hist_bins: int = 64
+    belt_stripe_filter_auto_bimodality_margin: float = 1.10        # recessed wins only if bm > raised * margin
+    belt_stripe_filter_z_floor_upper_percentile: float = 99.0       # plateau percentile used as the "above belt" reference
+    belt_stripe_filter_z_floor_fallback_lower_percentile: float = 10.0  # used when no BG plateau is available
+    belt_stripe_filter_z_floor_fallback_upper_percentile: float = 25.0
+    belt_stripe_filter_warn_removed_fraction: float = 0.40          # warn if BG-scope filter removes > this fraction of BG plateau
+    low_gradient_plateau_robust_band_mad_k: float = 3.0             # k for median ± k·MAD fallback band in plateau detection
+    low_gradient_plateau_detection_min_count_floor: int = 25        # absolute floor on the laxer per-bin detection threshold
+    low_gradient_plateau_detection_min_count_fraction: float = 0.25 # fraction of min_pixels used as the detection floor
+    # ── Low-gradient surface (legacy strategy) tuning ────────────────────
+    # These were previously hardcoded inside the strategy branch.
+    low_gradient_surface_support_z_mad_multiplier: float = 2.5  # extends candidate's z window by k·MAD
+    low_gradient_surface_support_z_floor_mm: float = 1.0        # never extend by less than this many mm
+    low_gradient_surface_support_z_mad_floor_mm: float = 0.25   # MAD floor used inside max(floor, k·MAD)
+    low_gradient_surface_ridge_percentile: float = 90.0         # gradient percentile used as ridge rejection threshold
+    # Height-gate gap detection (used to clip away foreground modes from
+    # the candidate flat-pixel set).
+    reference_surface_height_gate_gap_floor_mm: float = 1.0
+    reference_surface_height_gate_gap_ratio: float = 8.0
+    # Depth-plot rendering — adaptive caps for the Studio diagnostics.
+    plot_depth_plot_max_render_samples: int = 60000
+    plot_y_robust_percentile: float = 98.0   # used to clip y-axis ceilings in histograms
     reference_surface_selection_mode: str = "largest_constant_z"
     reference_surface_region_mode: str = "none"
     reference_surface_min_area_ratio: float = 0.08
@@ -614,6 +639,8 @@ class DetectBeltPlaneStage:
                 margin_mm=float(self.reference_surface_height_gate_margin_mm),
                 min_coverage_ratio=float(self.reference_surface_height_gate_min_coverage_ratio),
                 max_coverage_ratio=float(self.reference_surface_height_gate_max_coverage_ratio),
+                gap_floor_mm=float(self.reference_surface_height_gate_gap_floor_mm),
+                gap_ratio=float(self.reference_surface_height_gate_gap_ratio),
             )
             active_height_gate_mask = height_gate_mask if self.background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus"} else valid_for_fit
 
@@ -640,7 +667,7 @@ class DetectBeltPlaneStage:
                     u8 = (low_grad_mask.astype(np.uint8) * 255)
                     u8 = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((ok, ok), np.uint8))
                     u8 = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, np.ones((ck, ck), np.uint8))
-                    low_grad_mask = u8 > 0
+                    low_grad_mask = (u8 > 0) & valid_for_fit
                 raised_candidate_rejected_mask = np.zeros_like(valid_for_fit, dtype=bool)
                 write_heightmap_preview_png(grad, valid_for_fit, output_dir / "depth_gradient_magnitude.png")
                 cv2.imwrite(str(output_dir / "low_gradient_mask.png"), (low_grad_mask.astype(np.uint8) * 255))
@@ -666,8 +693,12 @@ class DetectBeltPlaneStage:
                         zvals = frame.z_mm[candidate_mask].astype(np.float64)
                         z_med = float(np.median(zvals))
                         z_mad = float(np.median(np.abs(zvals - z_med)))
-                        max_support_z = z_med + max(1.0, 2.5 * max(0.25, z_mad))
-                        ridge_thr = float(np.percentile(grad[candidate_mask], 90)) if np.count_nonzero(candidate_mask) else 0.0
+                        z_mad_floor = float(self.low_gradient_surface_support_z_mad_floor_mm)
+                        z_mad_mult = float(self.low_gradient_surface_support_z_mad_multiplier)
+                        z_floor_mm = float(self.low_gradient_surface_support_z_floor_mm)
+                        max_support_z = z_med + max(z_floor_mm, z_mad_mult * max(z_mad_floor, z_mad))
+                        ridge_pct = float(np.clip(self.low_gradient_surface_ridge_percentile, 1.0, 99.0))
+                        ridge_thr = float(np.percentile(grad[candidate_mask], ridge_pct)) if np.count_nonzero(candidate_mask) else 0.0
                         keep_mask = candidate_mask & (frame.z_mm <= max_support_z) & (grad <= ridge_thr)
                         raised_candidate_rejected_mask = candidate_mask & (~keep_mask)
                         candidate_mask = keep_mask
@@ -750,6 +781,9 @@ class DetectBeltPlaneStage:
                         min_pixels=max(16, int(self.low_gradient_plateau_min_pixels)),
                         smoothing_sigma_bins=float(self.low_gradient_plateau_smoothing_sigma_bins),
                         peak_drop_ratio=float(self.low_gradient_plateau_peak_drop_ratio),
+                        robust_band_mad_k=float(self.low_gradient_plateau_robust_band_mad_k),
+                        detection_min_count_floor=int(self.low_gradient_plateau_detection_min_count_floor),
+                        detection_min_count_fraction=float(self.low_gradient_plateau_detection_min_count_fraction),
                     )
                     plateaus = plateau_result.get("plateaus", [])
                     selected_plateau = _select_background_plateau(
@@ -852,6 +886,11 @@ class DetectBeltPlaneStage:
                             above_belt_close_mm=float(self.belt_stripe_filter_above_belt_close_mm),
                             object_kernel_mm=float(self.belt_stripe_filter_object_kernel_mm),
                             object_kernel_shape=str(self.belt_stripe_filter_object_kernel_shape),
+                            altitude_hist_bins=int(self.belt_stripe_filter_altitude_hist_bins),
+                            auto_bimodality_margin=float(self.belt_stripe_filter_auto_bimodality_margin),
+                            z_floor_upper_percentile=float(self.belt_stripe_filter_z_floor_upper_percentile),
+                            z_floor_fallback_lower_percentile=float(self.belt_stripe_filter_z_floor_fallback_lower_percentile),
+                            z_floor_fallback_upper_percentile=float(self.belt_stripe_filter_z_floor_fallback_upper_percentile),
                         )
                         stripes_mask = stripe_result["stripes_mask"]
                         baseline_map = stripe_result["baseline_map"]
@@ -881,7 +920,8 @@ class DetectBeltPlaneStage:
                                 else 0.0
                             )
                             if (
-                                stripe_info["stripes_fraction_of_bg"] > 0.40
+                                stripe_info["stripes_fraction_of_bg"]
+                                > float(self.belt_stripe_filter_warn_removed_fraction)
                                 and filter_scope == "bg_plateau"
                             ):
                                 warnings.append("belt_stripe_filter_removed_large_bg_fraction")
@@ -945,6 +985,7 @@ class DetectBeltPlaneStage:
                         sample_count=flat_candidate_count,
                         strategy="low_gradient_depth_plateaus",
                         notes=plot_notes,
+                        robust_y_percentile=float(self.plot_y_robust_percentile),
                     )
                     # Sorted-z scanline of filtered points only — same style as
                     # the existing background_depth_plot but restricted to the
@@ -958,6 +999,7 @@ class DetectBeltPlaneStage:
                         title_override="Filtered depth distribution (low-gradient candidates)",
                         near_label="plateau_z_min",
                         far_label="plateau_z_max",
+                        max_render_samples=int(self.plot_depth_plot_max_render_samples),
                     )
                     cv2.imwrite(
                         str(output_dir / "background_selected_plateau_mask.png"),
@@ -1021,6 +1063,7 @@ class DetectBeltPlaneStage:
                     _write_altitude_histogram_png(
                         altitude_hist_payload,
                         out_path=output_dir / "belt_altitude_histogram.png",
+                        robust_y_percentile=float(self.plot_y_robust_percentile),
                     )
                     (output_dir / "belt_altitude_histogram.json").write_text(
                         json.dumps(altitude_hist_payload, indent=2), encoding="utf-8"
@@ -1059,7 +1102,13 @@ class DetectBeltPlaneStage:
                 "far_q": far_q,
             }
             (output_dir / "background_depth_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
-            _write_depth_plot_png(z_values, near_q=near_q, far_q=far_q, out_path=output_dir / "background_depth_plot.png")
+            _write_depth_plot_png(
+                z_values,
+                near_q=near_q,
+                far_q=far_q,
+                out_path=output_dir / "background_depth_plot.png",
+                max_render_samples=int(self.plot_depth_plot_max_render_samples),
+            )
             # The plateau plot only makes semantic sense for the
             # `low_gradient_depth_plateaus` strategy. For every other strategy
             # write an explicit placeholder so Studio shows a clear "not
@@ -1620,6 +1669,24 @@ class DetectBeltPlaneStage:
                 "belt_stripe_filter_above_belt_close_mm": self.belt_stripe_filter_above_belt_close_mm,
                 "belt_stripe_filter_object_kernel_mm": self.belt_stripe_filter_object_kernel_mm,
                 "belt_stripe_filter_object_kernel_shape": self.belt_stripe_filter_object_kernel_shape,
+                # Newly-exposed knobs (previously hardcoded)
+                "belt_stripe_filter_altitude_hist_bins": self.belt_stripe_filter_altitude_hist_bins,
+                "belt_stripe_filter_auto_bimodality_margin": self.belt_stripe_filter_auto_bimodality_margin,
+                "belt_stripe_filter_z_floor_upper_percentile": self.belt_stripe_filter_z_floor_upper_percentile,
+                "belt_stripe_filter_z_floor_fallback_lower_percentile": self.belt_stripe_filter_z_floor_fallback_lower_percentile,
+                "belt_stripe_filter_z_floor_fallback_upper_percentile": self.belt_stripe_filter_z_floor_fallback_upper_percentile,
+                "belt_stripe_filter_warn_removed_fraction": self.belt_stripe_filter_warn_removed_fraction,
+                "low_gradient_plateau_robust_band_mad_k": self.low_gradient_plateau_robust_band_mad_k,
+                "low_gradient_plateau_detection_min_count_floor": self.low_gradient_plateau_detection_min_count_floor,
+                "low_gradient_plateau_detection_min_count_fraction": self.low_gradient_plateau_detection_min_count_fraction,
+                "low_gradient_surface_support_z_mad_multiplier": self.low_gradient_surface_support_z_mad_multiplier,
+                "low_gradient_surface_support_z_floor_mm": self.low_gradient_surface_support_z_floor_mm,
+                "low_gradient_surface_support_z_mad_floor_mm": self.low_gradient_surface_support_z_mad_floor_mm,
+                "low_gradient_surface_ridge_percentile": self.low_gradient_surface_ridge_percentile,
+                "reference_surface_height_gate_gap_floor_mm": self.reference_surface_height_gate_gap_floor_mm,
+                "reference_surface_height_gate_gap_ratio": self.reference_surface_height_gate_gap_ratio,
+                "plot_depth_plot_max_render_samples": self.plot_depth_plot_max_render_samples,
+                "plot_y_robust_percentile": self.plot_y_robust_percentile,
             },
         }
         residual_hist_counts, residual_hist_edges = np.histogram(residuals.astype(np.float64) if residuals.size else np.asarray([0.0]), bins=64)
@@ -4103,6 +4170,21 @@ class Generate25DOverlaysStage:
         )
 
 
+def _apply_heightmap_valid_mask_rules(
+    z_mm: np.ndarray,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    """Drop non-finite and non-positive z values from the valid mask.
+
+    TriSpector height images encode no-return as 0. Acquisition already
+    treats those as invalid; mirror that rule whenever a heightmap frame is
+    loaded so diagnostics never treat sensor holes as real belt points.
+    """
+    z = np.asarray(z_mm, dtype=np.float32)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(z) & (z > 0.0)
+    return valid
+
+
 def _load_heightmap_frame(height_path: Path, reflectance_path: Path | None, metadata: dict[str, Any]) -> HeightmapFrame:
     if not height_path.is_file():
         raise FileNotFoundError(f"Heightmap file not found: {height_path}")
@@ -4113,6 +4195,16 @@ def _load_heightmap_frame(height_path: Path, reflectance_path: Path | None, meta
         )
     if height_path.suffix.lower() == ".npz":
         frame = load_heightmap_npz(height_path)
+        frame = HeightmapFrame(
+            z_mm=frame.z_mm,
+            valid_mask=_apply_heightmap_valid_mask_rules(frame.z_mm, frame.valid_mask),
+            reflectance=frame.reflectance,
+            x_resolution_mm=frame.x_resolution_mm,
+            y_resolution_mm=frame.y_resolution_mm,
+            origin_x_mm=frame.origin_x_mm,
+            origin_y_mm=frame.origin_y_mm,
+            coordinate_system=frame.coordinate_system,
+        )
     else:
         z = cv2.imread(str(height_path), cv2.IMREAD_UNCHANGED)
         if z is None:
@@ -4123,14 +4215,7 @@ def _load_heightmap_frame(height_path: Path, reflectance_path: Path | None, meta
         z = z.astype(np.float32)
         calib = metadata.get("calibration") if isinstance(metadata.get("calibration"), dict) else {}
         z = z * float(calib.get("z_scale") or 1.0) + float(calib.get("z_offset") or 0.0)
-        valid = np.isfinite(z)
-        # TriSpector-style 16-bit height images commonly encode no-return as 0.
-        # If zeros dominate a non-NPZ source, treat them as invalid/no-return.
-        finite_count = int(np.count_nonzero(valid))
-        zero_mask = valid & (z == 0.0)
-        zero_fraction = float(np.count_nonzero(zero_mask) / max(1, finite_count))
-        if zero_fraction >= 0.02:
-            valid = valid & (z > 0.0)
+        valid = _apply_heightmap_valid_mask_rules(z, np.isfinite(z))
         frame = HeightmapFrame(
             z_mm=z,
             valid_mask=valid,
@@ -4165,6 +4250,8 @@ def _reference_height_gate_from_distribution(
     margin_mm: float,
     min_coverage_ratio: float,
     max_coverage_ratio: float,
+    gap_floor_mm: float = 1.0,
+    gap_ratio: float = 8.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     valid = np.asarray(valid_mask, dtype=bool)
     if not enabled:
@@ -4202,14 +4289,14 @@ def _reference_height_gate_from_distribution(
     gap_values = np.diff(sorted_vals)
     search_gaps = gap_values[gap_start:gap_end]
     gap_cutoff: float | None = None
-    gap_ratio = 0.0
+    measured_gap_ratio = 0.0
     if search_gaps.size:
         local_gap_idx = int(np.argmax(search_gaps))
         gap_idx = gap_start + local_gap_idx
         robust_gap_scale = float(np.median(gap_values[gap_values > 0])) if np.any(gap_values > 0) else 0.0
         largest_gap = float(gap_values[gap_idx])
-        gap_ratio = largest_gap / max(robust_gap_scale, 1e-6)
-        if largest_gap >= max(1.0, robust_gap_scale * 8.0):
+        measured_gap_ratio = largest_gap / max(robust_gap_scale, 1e-6)
+        if largest_gap >= max(float(gap_floor_mm), robust_gap_scale * float(gap_ratio)):
             gap_cutoff = float(sorted_vals[gap_idx] + max(0.0, margin_mm))
 
     smooth_window = max(5, min(51, (sample_count // 40) | 1))
@@ -4252,7 +4339,7 @@ def _reference_height_gate_from_distribution(
             "margin_mm": float(max(0.0, margin_mm)),
             "coverage_percent": coverage_percent,
             "sample_count": int(vals.size),
-            "largest_gap_ratio": float(gap_ratio),
+            "largest_gap_ratio": float(measured_gap_ratio),
         },
     )
 
@@ -4441,6 +4528,11 @@ def _compute_belt_stripe_filter(
     above_belt_close_mm: float = 30.0,
     object_kernel_mm: float = 100.0,
     object_kernel_shape: str = "ellipse",
+    altitude_hist_bins: int = 64,
+    auto_bimodality_margin: float = 1.10,
+    z_floor_upper_percentile: float = 99.0,
+    z_floor_fallback_lower_percentile: float = 10.0,
+    z_floor_fallback_upper_percentile: float = 25.0,
 ) -> dict[str, Any]:
     """Separate belt-base pixels from raised surface texture (e.g. chevron ribs).
 
@@ -4468,7 +4560,17 @@ def _compute_belt_stripe_filter(
     Output arrays are zeroed outside ``domain_mask`` so they're safe to render.
     """
     h, w = z_mm.shape[:2]
-    dom = np.asarray(domain_mask, dtype=bool)
+    dom_raw = np.asarray(domain_mask, dtype=bool)
+    # Defensive guard: exclude non-finite / non-positive z (TriSpector
+    # no-return holes) from the morphology domain. Without this, an erode
+    # window touching a z=0 pixel would set baseline=0 and altitude≈z,
+    # producing a fake "0 .. ~12k mm" altitude range that misleads stripe
+    # detection. LoadHeightmapCapture also strips these at load time; this
+    # is belt-and-braces in case a stale or upstream mask leaks them in.
+    z_in_for_validity = np.asarray(z_mm, dtype=np.float32)
+    dom_validity = np.isfinite(z_in_for_validity) & (z_in_for_validity > 0.0)
+    dom = dom_raw & dom_validity
+    dropped_invalid_z = int(np.count_nonzero(dom_raw & (~dom_validity)))
     n_dom = int(np.count_nonzero(dom))
     base_skeleton: dict[str, Any] = {
         "enabled": True,
@@ -4486,6 +4588,8 @@ def _compute_belt_stripe_filter(
         # Aliases kept for backward-compat with existing JSON consumers
         # (the field "bg_plateau_count_px" predates the global-domain rename).
         "domain_count_px": n_dom,
+        "domain_input_count_px": int(np.count_nonzero(dom_raw)),
+        "domain_dropped_invalid_z_px": dropped_invalid_z,
         "bg_plateau_count_px": n_dom,
         "belt_base_count_px": n_dom,
         "stripes_count_px": 0,
@@ -4581,10 +4685,11 @@ def _compute_belt_stripe_filter(
     direction_norm = str(direction or "auto").strip().lower()
     chosen = direction_norm
     bm_raised = bm_recessed = 0.0
+    bimodality_margin = float(max(1.0, auto_bimodality_margin))
     if direction_norm == "auto":
         base_r, alt_r, bm_raised = _hat("raised")
         base_d, alt_d, bm_recessed = _hat("recessed")
-        if bm_recessed > bm_raised * 1.10:  # 10% margin to avoid ties flipping
+        if bm_recessed > bm_raised * bimodality_margin:
             chosen = "recessed"
             baseline_map[:] = base_d
             altitude_map[:] = alt_d
@@ -4658,25 +4763,31 @@ def _compute_belt_stripe_filter(
     threshold_high_mm: float | None = None
     bg_input: np.ndarray | None = None
     if bg_plateau_mask is not None:
-        bg_input = np.asarray(bg_plateau_mask, dtype=bool)
+        bg_input = np.asarray(bg_plateau_mask, dtype=bool) & dom_validity
         # The BG plateau may already have been narrowed by an upstream caller.
         # Use whatever was passed; if empty, fall back to the domain itself
         # to keep belt_z_estimate well-defined for diagnostics.
         if int(np.count_nonzero(bg_input)) == 0:
             bg_input = None
+    upper_pct = float(np.clip(z_floor_upper_percentile, 50.0, 100.0))
+    fb_lower_pct = float(np.clip(z_floor_fallback_lower_percentile, 0.0, 50.0))
+    fb_upper_pct = float(np.clip(z_floor_fallback_upper_percentile, fb_lower_pct, 100.0))
     if bool(z_floor_enabled):
         if bg_input is not None and int(np.count_nonzero(bg_input)) > 0:
             belt_z_estimate = float(np.median(z_in[bg_input]))
-            # Use p99 instead of max to be robust to a few sentinel/outlier
-            # samples that may have slipped through gradient filtering.
-            belt_z_upper = float(np.percentile(z_in[bg_input], 99))
+            # Use a robust upper percentile (default p99) instead of max so a
+            # few sentinel/outlier samples that slipped through gradient
+            # filtering don't push the reference too high.
+            belt_z_upper = float(np.percentile(z_in[bg_input], upper_pct))
         elif n_dom > 0:
             # No BG plateau available — estimate belt-z from the lowest decile
             # of the domain (a defensive fallback; assumes most of the domain
             # is belt).
-            belt_z_estimate = float(np.percentile(z_in[dom], 10))
-            belt_z_upper = float(np.percentile(z_in[dom], 25))
-            shape_skip_reason = "no_bg_plateau_used_p10_of_domain"
+            belt_z_estimate = float(np.percentile(z_in[dom], fb_lower_pct))
+            belt_z_upper = float(np.percentile(z_in[dom], fb_upper_pct))
+            shape_skip_reason = (
+                f"no_bg_plateau_used_p{fb_lower_pct:g}_p{fb_upper_pct:g}_of_domain"
+            )
         if belt_z_estimate is not None and chosen == "raised":
             # Reference threshold is on the plateau's upper bound by default;
             # users can revert to median behaviour by setting
@@ -4781,7 +4892,12 @@ def _compute_belt_stripe_filter(
         belt_base_mask = dom & (~stripes_mask)
         base_skeleton["belt_base_count_px"] = int(np.count_nonzero(belt_base_mask))
 
-    hist_counts, hist_edges = np.histogram(alt_vals_dom, bins=64) if alt_vals_dom.size else (np.zeros(64, dtype=np.int64), np.linspace(0, 1, 65))
+    hist_bins = max(8, int(altitude_hist_bins))
+    hist_counts, hist_edges = (
+        np.histogram(alt_vals_dom, bins=hist_bins)
+        if alt_vals_dom.size
+        else (np.zeros(hist_bins, dtype=np.int64), np.linspace(0, 1, hist_bins + 1))
+    )
     altitude_hist = {
         "sample_count": int(alt_vals_dom.size),
         "bin_counts": [int(x) for x in hist_counts.tolist()],
@@ -4805,8 +4921,81 @@ def _compute_belt_stripe_filter(
     }
 
 
-def _write_altitude_histogram_png(payload: dict[str, Any], *, out_path: Path) -> None:
-    """Render the belt-stripe altitude histogram with the chosen threshold marked."""
+def _adaptive_tick_format(span: float) -> str:
+    """Choose a printf-style format for axis labels that fits the data span.
+
+    The plot helpers used to hardcode ``.1f``/``.2f``, which yields useless
+    "0.0" labels for raw-sensor z values in the 10⁴ range and ugly "11685.4"
+    labels when the relevant span is 10–20 mm. This picks a precision that
+    keeps roughly 3 significant digits of resolution across a tick step of
+    ``span / 5``.
+    """
+    span = float(max(abs(span), 1e-12))
+    step = span / 5.0
+    if step <= 0:
+        return "%.3f"
+    decimals = int(max(0, min(6, -np.floor(np.log10(step)) + 1)))
+    return f"%.{decimals}f"
+
+
+def _adaptive_x_ticks(z_lo: float, z_hi: float, *, target_count: int = 5) -> list[float]:
+    """Return ``target_count``-ish "nice" tick z-values for an X axis.
+
+    Uses the standard 1/2/5 ladder rounded to a power of 10 so the labels
+    land on round numbers regardless of whether the values are in mm
+    (e.g. -10..50) or raw counts (11000..14500).
+    """
+    span = float(max(abs(z_hi - z_lo), 1e-12))
+    raw_step = span / max(1, int(target_count))
+    exp = float(np.floor(np.log10(raw_step)))
+    base = raw_step / (10.0 ** exp)
+    if base < 1.5:
+        nice = 1.0
+    elif base < 3.0:
+        nice = 2.0
+    elif base < 7.0:
+        nice = 5.0
+    else:
+        nice = 10.0
+    step = nice * (10.0 ** exp)
+    if step <= 0:
+        return [z_lo, z_hi]
+    first = float(np.ceil(z_lo / step) * step)
+    ticks: list[float] = []
+    val = first
+    safety = 0
+    while val <= z_hi + 0.5 * step and safety < 50:
+        ticks.append(val)
+        val += step
+        safety += 1
+    if not ticks:
+        ticks = [float(z_lo), float(z_hi)]
+    return ticks
+
+
+def _adaptive_count_ceiling(counts: np.ndarray, *, robust_percentile: float = 98.0) -> int:
+    """Clip y-axis ceiling to a robust upper count so a handful of giant bins
+    don't make every other bar invisible. Always at least 1.
+    """
+    arr = np.asarray(counts, dtype=np.float64)
+    if arr.size == 0:
+        return 1
+    raw_max = float(np.max(arr))
+    if raw_max <= 0:
+        return 1
+    pct = float(np.clip(robust_percentile, 50.0, 100.0))
+    cap_val = float(np.percentile(arr[arr > 0], pct)) if np.any(arr > 0) else raw_max
+    cap = max(cap_val, raw_max * 0.25)
+    return max(1, int(np.ceil(cap)))
+
+
+def _write_altitude_histogram_png(payload: dict[str, Any], *, out_path: Path, robust_y_percentile: float = 98.0) -> None:
+    """Render the belt-stripe altitude histogram with the chosen threshold marked.
+
+    The y-axis ceiling is taken from ``robust_y_percentile`` so a single tall
+    bin doesn't flatten the rest of the distribution; x-axis tick spacing
+    and label precision scale to whatever altitude range is present.
+    """
     counts = np.asarray(payload.get("bin_counts") or [], dtype=np.int64)
     edges = np.asarray(payload.get("bin_edges") or [], dtype=np.float64)
     width, height = 900, 320
@@ -4818,7 +5007,8 @@ def _write_altitude_histogram_png(payload: dict[str, Any], *, out_path: Path) ->
         cv2.putText(canvas, "Belt-stripe altitude histogram (no samples)", (margin_l, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
         cv2.imwrite(str(out_path), canvas)
         return
-    cmax = max(1, int(np.max(counts)))
+    raw_max = max(1, int(np.max(counts)))
+    cmax = _adaptive_count_ceiling(counts, robust_percentile=robust_y_percentile)
     z_lo = float(edges[0])
     z_hi = float(edges[-1])
     z_span = max(1e-6, z_hi - z_lo)
@@ -4828,7 +5018,7 @@ def _write_altitude_histogram_png(payload: dict[str, Any], *, out_path: Path) ->
             continue
         x0 = int(round(margin_l + (i / max(1, counts.size)) * plot_w))
         x1 = int(round(margin_l + ((i + 1) / max(1, counts.size)) * plot_w))
-        y_top = int(round(y_axis - (float(c) / cmax) * plot_h))
+        y_top = int(round(y_axis - min(1.0, float(c) / cmax) * plot_h))
         cv2.rectangle(canvas, (x0, y_top), (max(x0 + 1, x1), y_axis), (170, 170, 170), -1)
     cv2.rectangle(canvas, (margin_l, margin_t + 14), (width - margin_r, y_axis), (100, 100, 100), 1)
 
@@ -4839,15 +5029,16 @@ def _write_altitude_histogram_png(payload: dict[str, Any], *, out_path: Path) ->
 
     thr_x = _x_for_z(thr)
     cv2.line(canvas, (thr_x, margin_t + 14), (thr_x, y_axis), (60, 220, 80), 2)
-    cv2.putText(canvas, f"thr={thr:.2f}mm", (min(width - margin_r - 100, thr_x + 4), margin_t + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 220, 80), 1, cv2.LINE_AA)
-    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-        zv = z_lo + frac * z_span
-        x = _x_for_z(zv)
+    fmt = _adaptive_tick_format(z_span)
+    thr_label = f"thr={fmt % thr}mm"
+    cv2.putText(canvas, thr_label, (min(width - margin_r - 100, thr_x + 4), margin_t + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 220, 80), 1, cv2.LINE_AA)
+    for tick in _adaptive_x_ticks(z_lo, z_hi, target_count=5):
+        x = _x_for_z(tick)
         cv2.line(canvas, (x, y_axis), (x, y_axis + 4), (160, 160, 160), 1)
-        cv2.putText(canvas, f"{zv:.2f}", (x - 14, y_axis + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, fmt % tick, (x - 14, y_axis + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
     cv2.putText(canvas, "altitude over local-min baseline (mm)", (width - margin_r - 260, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
     direction = str(payload.get("direction_used") or "raised")
-    cv2.putText(canvas, f"Belt-stripe altitude histogram  |  direction={direction}  |  n={int(payload.get('sample_count') or 0)}", (margin_l, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Belt-stripe altitude histogram  |  direction={direction}  |  n={int(payload.get('sample_count') or 0)}  |  cap={cmax}  raw_max={raw_max}", (margin_l, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1, cv2.LINE_AA)
     cv2.imwrite(str(out_path), canvas)
 
 
@@ -4860,6 +5051,8 @@ def _detect_depth_plateaus(
     smoothing_sigma_bins: float = 2.5,
     peak_drop_ratio: float = 0.4,
     robust_band_mad_k: float = 3.0,
+    detection_min_count_floor: int = 25,
+    detection_min_count_fraction: float = 0.25,
 ) -> dict[str, Any]:
     """Detect dominant depth plateaus via smoothed-histogram peak detection.
 
@@ -4916,7 +5109,10 @@ def _detect_depth_plateaus(
     # reported on the plot). `detection_min_count` is intentionally laxer
     # so a broad uniform belt distribution still produces a detectable peak.
     selection_min_count = max(int(min_pixels), int(np.ceil(float(min_fraction) * float(vals.size))))
-    detection_min_count = max(int(np.ceil(0.25 * float(min_pixels))), 25)
+    detection_min_count = max(
+        int(np.ceil(float(detection_min_count_fraction) * float(min_pixels))),
+        int(detection_min_count_floor),
+    )
     drop_ratio = float(np.clip(peak_drop_ratio, 0.05, 0.95))
 
     # Robust band around the median — works even when the histogram has no
@@ -5103,12 +5299,25 @@ def _write_plateau_plot_png(
     sample_count: int | None = None,
     strategy: str | None = None,
     notes: str | None = None,
+    robust_y_percentile: float = 98.0,
+    min_band_marker_width_px: int = 3,
 ) -> None:
     """Render the flat-candidate depth histogram with detected plateaus highlighted.
 
     Designed to be the canonical Studio "Plateau plot" diagnostic for the
     `low_gradient_depth_plateaus` strategy. The selected (background) plateau is
     drawn in green, rejected (raised) plateaus in red, raw histogram in grey.
+
+    Adaptive behavior
+    -----------------
+    - Y axis is clipped to ``robust_y_percentile`` of nonzero bin counts so
+      one giant bin doesn't flatten the rest. The raw max is still shown
+      in the subtitle.
+    - X tick spacing and label precision adapt to the z range (mm vs raw
+      counts).
+    - Narrow plateau bands are widened to ``min_band_marker_width_px`` so
+      the selected plateau is always visible even when its z-span is tiny
+      compared to the full histogram range.
     """
     counts = np.asarray(plateau_payload.get("bin_counts") or [], dtype=np.int32)
     edges = np.asarray(plateau_payload.get("bin_edges") or [], dtype=np.float64)
@@ -5135,7 +5344,10 @@ def _write_plateau_plot_png(
     z_lo = float(edges[0])
     z_hi = float(edges[-1])
     z_span = max(1e-6, z_hi - z_lo)
-    cmax = max(1, int(np.max(counts)))
+    raw_cmax = max(1, int(np.max(counts)))
+    cmax = _adaptive_count_ceiling(counts, robust_percentile=robust_y_percentile)
+    tick_fmt = _adaptive_tick_format(z_span)
+    band_min_px = max(1, int(min_band_marker_width_px))
 
     def _x_for_z(z: float) -> int:
         return int(round(margin_l + ((z - z_lo) / z_span) * plot_w))
@@ -5150,7 +5362,7 @@ def _write_plateau_plot_png(
             continue
         x0 = _x_for_bin(i)
         x1 = _x_for_bin(i + 1)
-        y_top = int(round(y_axis - (float(c) / cmax) * plot_h))
+        y_top = int(round(y_axis - min(1.0, float(c) / cmax) * plot_h))
         cv2.rectangle(canvas, (x0, y_top), (max(x0 + 1, x1), y_axis), (170, 170, 170), -1)
 
     # Smoothed-histogram polyline (cyan) — the curve the peak-detection works on.
@@ -5159,7 +5371,7 @@ def _write_plateau_plot_png(
         sm_pts: list[tuple[int, int]] = []
         for i in range(smoothed.size):
             cx = int(round((_x_for_bin(i) + _x_for_bin(i + 1)) / 2))
-            cy = int(round(y_axis - (float(smoothed[i]) / cmax) * plot_h))
+            cy = int(round(y_axis - min(1.0, float(smoothed[i]) / cmax) * plot_h))
             sm_pts.append((cx, cy))
         for a, b in zip(sm_pts, sm_pts[1:]):
             cv2.line(canvas, a, b, (220, 220, 90), 1, cv2.LINE_AA)
@@ -5177,6 +5389,10 @@ def _write_plateau_plot_png(
     if isinstance(robust_band, dict) and robust_band.get("z_min") is not None and robust_band.get("z_max") is not None:
         rb_x0 = _x_for_z(float(robust_band.get("z_min") or 0.0))
         rb_x1 = _x_for_z(float(robust_band.get("z_max") or 0.0))
+        if rb_x1 - rb_x0 < band_min_px:
+            mid = (rb_x0 + rb_x1) // 2
+            rb_x0 = mid - band_min_px // 2
+            rb_x1 = rb_x0 + band_min_px
         for x_seg in range(min(rb_x0, rb_x1), max(rb_x0, rb_x1), 10):
             cv2.line(canvas, (x_seg, margin_t + 24), (min(rb_x1, x_seg + 5), margin_t + 24), (200, 90, 220), 1)
             cv2.line(canvas, (x_seg, y_axis), (min(rb_x1, x_seg + 5), y_axis), (200, 90, 220), 1)
@@ -5184,7 +5400,7 @@ def _write_plateau_plot_png(
         cv2.line(canvas, (rb_x1, margin_t + 24), (rb_x1, y_axis), (200, 90, 220), 1)
         cv2.putText(
             canvas,
-            "median ± k·MAD",
+            "median +/- k*MAD",
             (min(rb_x0, rb_x1) + 4, y_axis - 6),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.34,
@@ -5211,6 +5427,10 @@ def _write_plateau_plot_png(
         b1 = int(row.get("band_end_bin") or b0)
         x0 = _x_for_bin(b0)
         x1 = _x_for_bin(b1 + 1)
+        if x1 - x0 < band_min_px:
+            mid = (x0 + x1) // 2
+            x0 = mid - band_min_px // 2
+            x1 = x0 + band_min_px
         selected = _is_selected(row)
         outline = (60, 220, 80) if selected else (60, 90, 230)
         fill_alpha = 0.18 if selected else 0.10
@@ -5218,22 +5438,22 @@ def _write_plateau_plot_png(
         cv2.rectangle(overlay, (x0, margin_t + 24), (max(x0 + 1, x1), y_axis), outline, -1)
         cv2.addWeighted(overlay, fill_alpha, canvas, 1.0 - fill_alpha, 0, canvas)
         cv2.rectangle(canvas, (x0, margin_t + 24), (max(x0 + 1, x1), y_axis), outline, 2)
-        label_z = f"z={float(row.get('z_center', 0.0)):.1f}"
+        label_z = f"z={tick_fmt % float(row.get('z_center', 0.0))}"
         label_frac = f"{float(row.get('fraction', 0.0)) * 100.0:.1f}%"
         cv2.putText(canvas, label_z, (x0 + 4, margin_t + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.38, outline, 1, cv2.LINE_AA)
         cv2.putText(canvas, label_frac, (x0 + 4, margin_t + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.38, outline, 1, cv2.LINE_AA)
         if selected:
             cv2.putText(canvas, "BG", (x0 + 4, margin_t + 76), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 220, 80), 1, cv2.LINE_AA)
 
-    # X-axis ticks (mm).
+    # X-axis ticks (data units, adaptive).
     cv2.rectangle(canvas, (margin_l, margin_t + 24), (width - margin_r, y_axis), (100, 100, 100), 1)
-    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-        zv = z_lo + frac * z_span
-        x = _x_for_z(zv)
+    for tick in _adaptive_x_ticks(z_lo, z_hi, target_count=6):
+        x = _x_for_z(tick)
         cv2.line(canvas, (x, y_axis), (x, y_axis + 4), (160, 160, 160), 1)
-        cv2.putText(canvas, f"{zv:.1f}", (x - 14, y_axis + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, tick_fmt % tick, (x - 14, y_axis + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
     cv2.putText(canvas, "z (mm)", (width - margin_r - 60, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"count (max={cmax})", (8, margin_t + 24 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
+    y_axis_legend = f"count (cap={cmax}, raw_max={raw_cmax})" if cmax != raw_cmax else f"count (max={raw_cmax})"
+    cv2.putText(canvas, y_axis_legend, (8, margin_t + 24 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 200, 200), 1, cv2.LINE_AA)
 
     title = "Flat-candidate depth plateaus"
     subtitle_parts: list[str] = []
@@ -5247,12 +5467,11 @@ def _write_plateau_plot_png(
     if sigma is not None and drop is not None:
         subtitle_parts.append(f"smooth_sigma={float(sigma):.1f}bins  drop={float(drop):.2f}")
     if selected_plateau:
+        sel_lo = float(selected_plateau.get("z_min") or 0.0)
+        sel_hi = float(selected_plateau.get("z_max") or 0.0)
+        sel_frac = float(selected_plateau.get("fraction") or 0.0)
         subtitle_parts.append(
-            "selected[BG]=[{:.2f},{:.2f}] mm (frac={:.1%})".format(
-                float(selected_plateau.get("z_min") or 0.0),
-                float(selected_plateau.get("z_max") or 0.0),
-                float(selected_plateau.get("fraction") or 0.0),
-            )
+            f"selected[BG]=[{tick_fmt % sel_lo},{tick_fmt % sel_hi}] (frac={sel_frac:.1%})"
         )
     if notes:
         subtitle_parts.append(notes)
@@ -5379,13 +5598,28 @@ def _write_depth_plot_png(
     title_override: str | None = None,
     near_label: str = "near_q",
     far_label: str = "far_q",
+    max_render_samples: int = 60000,
+    y_robust_percentile: float | None = None,
 ) -> None:
+    """Plot the sorted-z scanline of valid pixels.
+
+    Parameters
+    ----------
+    max_render_samples:
+        Cap on the number of dots rendered. A deterministic stride is used
+        so the plot stays visually stable across reprocessings.
+    y_robust_percentile:
+        Optional percentile used to clip the y-axis (and a matching one
+        from the bottom). Defaults to the data min/max. Setting this in
+        the (95, 100) range produces a plot focused on the bulk of the
+        distribution when a handful of outliers stretch the range.
+    """
     vals = np.asarray(z_values, dtype=np.float64)
     if vals.size == 0:
         canvas = np.zeros((420, 1200, 3), dtype=np.uint8)
         cv2.putText(
             canvas,
-            title_override or "Depth distribution — no samples",
+            title_override or "Depth distribution - no samples",
             (40, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -5401,38 +5635,57 @@ def _write_depth_plot_png(
     plot_h = height - margin_t - margin_b
     canvas = np.full((height, width, 3), 22, dtype=np.uint8)
 
-    # deterministic downsample to keep rendering stable and fast
-    if vals.size > 60000:
-        step = int(np.ceil(vals.size / 60000))
+    full_count = int(vals.size)
+    cap = max(100, int(max_render_samples))
+    if vals.size > cap:
+        step = int(np.ceil(vals.size / cap))
         vals = vals[::step]
     vals_sorted = np.sort(vals)
-    vmin = float(vals_sorted[0])
-    vmax = float(vals_sorted[-1])
+    raw_min = float(vals_sorted[0])
+    raw_max = float(vals_sorted[-1])
+    if y_robust_percentile is not None and 50.0 < float(y_robust_percentile) < 100.0:
+        hi_p = float(y_robust_percentile)
+        lo_p = 100.0 - hi_p
+        vmin = float(np.percentile(vals_sorted, lo_p))
+        vmax = float(np.percentile(vals_sorted, hi_p))
+    else:
+        vmin = raw_min
+        vmax = raw_max
     if vmax <= vmin:
         vmax = vmin + 1.0
+    y_span = vmax - vmin
 
     xs = np.linspace(0, vals_sorted.size - 1, num=vals_sorted.size, dtype=np.float64)
     xpix = margin_l + (xs / max(1.0, float(vals_sorted.size - 1))) * plot_w
-    ypix = margin_t + (1.0 - ((vals_sorted - vmin) / (vmax - vmin))) * plot_h
+    ypix = margin_t + (1.0 - np.clip(((vals_sorted - vmin) / y_span), 0.0, 1.0)) * plot_h
     pts = np.column_stack((xpix.astype(np.int32), ypix.astype(np.int32)))
     for p in pts:
         cv2.circle(canvas, (int(p[0]), int(p[1])), 1, (180, 180, 180), -1)
 
     def y_for(v: float) -> int:
-        return int(round(margin_t + (1.0 - ((v - vmin) / (vmax - vmin))) * plot_h))
+        clipped = float(np.clip(v, vmin, vmax))
+        return int(round(margin_t + (1.0 - ((clipped - vmin) / y_span)) * plot_h))
 
+    fmt = _adaptive_tick_format(y_span)
     if np.isfinite(near_q):
         y_near = y_for(near_q)
         cv2.line(canvas, (margin_l, y_near), (margin_l + plot_w, y_near), (255, 180, 0), 1)
-        cv2.putText(canvas, f"{near_label}={near_q:.1f}", (margin_l + 6, max(14, y_near - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{near_label}={fmt % float(near_q)}", (margin_l + 6, max(14, y_near - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1, cv2.LINE_AA)
     if np.isfinite(far_q):
         y_far = y_for(far_q)
         cv2.line(canvas, (margin_l, y_far), (margin_l + plot_w, y_far), (0, 220, 255), 1)
-        cv2.putText(canvas, f"{far_label}={far_q:.1f}", (margin_l + 6, max(14, y_far - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{far_label}={fmt % float(far_q)}", (margin_l + 6, max(14, y_far - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
     cv2.rectangle(canvas, (margin_l, margin_t), (margin_l + plot_w, margin_t + plot_h), (90, 90, 90), 1)
     title = title_override or "Depth distribution (valid z)"
-    cv2.putText(canvas, f"{title}, n={vals_sorted.size}", (margin_l, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"z_min={vmin:.1f}  z_max={vmax:.1f}", (margin_l, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+    rendered = int(vals_sorted.size)
+    title_extra = f"n_render={rendered}/{full_count}" if rendered != full_count else f"n={full_count}"
+    cv2.putText(canvas, f"{title}, {title_extra}", (margin_l, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    y_label = (
+        f"y_min={fmt % vmin}  y_max={fmt % vmax}  (raw_min={fmt % raw_min}, raw_max={fmt % raw_max})"
+        if (vmin != raw_min or vmax != raw_max)
+        else f"z_min={fmt % vmin}  z_max={fmt % vmax}"
+    )
+    cv2.putText(canvas, y_label, (margin_l, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
     cv2.imwrite(str(out_path), canvas)
 
 
