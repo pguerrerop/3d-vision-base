@@ -40,7 +40,6 @@ import type { RoiPolygon, RoiRect } from "../components/roiMapping";
 import type { RoiType } from "../components/ProjectionArtifactViewer";
 import type { StudioDebugMode } from "../components/studioDebugMode";
 import type { HoverInspectionSample } from "../components/hoverInspectionModel";
-import { nextDatasetSelectionAfterCreate, nextSessionSelectionAfterCreate } from "../components/datasetSidebarModel";
 import { buildCapturePayload, captureDisabledReason, nextSelectedTakeAfterCapture } from "../components/captureWorkflowModel";
 import { resolveNextSelectedTakeId } from "../components/takeSelectionModel";
 
@@ -114,8 +113,10 @@ export default function ProcessingLabPage() {
   const [modalityFilter, setModalityFilter] = useState<CaptureModality | "all">("all");
   const [takeFilter, setTakeFilter] = useState<TakeFilter>("all");
   const [takeSearch, setTakeSearch] = useState("");
-  const [tagFilter, setTagFilter] = useState("");
-  const [validationFilter, setValidationFilter] = useState<"all" | "unreviewed" | "valid" | "invalid" | "needs_review">("all");
+  const [takesHasMore, setTakesHasMore] = useState(false);
+  const [takesOffset, setTakesOffset] = useState(0);
+  const [takesLoading, setTakesLoading] = useState(false);
+  const [takesLoadingMore, setTakesLoadingMore] = useState(false);
   const [detail, setDetail] = useState<TakeDetail | null>(null);
   const [selectedObjectId, setSelectedObjectId] = useState<number | null>(null);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
@@ -131,17 +132,6 @@ export default function ProcessingLabPage() {
   const [pipelineFamilyFilter, setPipelineFamilyFilter] = useState<"all" | "2d" | "3d" | "25d" | "fusion" | "generic">("all");
   const [lastUsedPipelineByTake, setLastUsedPipelineByTake] = useState<Record<string, string>>({});
   const [tabFallbackMessage, setTabFallbackMessage] = useState<string | null>(null);
-  const [showDatasetCreate, setShowDatasetCreate] = useState(false);
-  const [showDatasetSessionCreate, setShowDatasetSessionCreate] = useState(false);
-  const [newDatasetName, setNewDatasetName] = useState("");
-  const [newDatasetNotes, setNewDatasetNotes] = useState("");
-  const [newSessionName, setNewSessionName] = useState("");
-  const [newSessionNotes, setNewSessionNotes] = useState("");
-  const [creatingDataset, setCreatingDataset] = useState(false);
-  const [creatingDatasetSession, setCreatingDatasetSession] = useState(false);
-  const [createDatasetError, setCreateDatasetError] = useState<string | null>(null);
-  const [createSessionError, setCreateSessionError] = useState<string | null>(null);
-  const [showCaptureCreate, setShowCaptureCreate] = useState(false);
   const [captureFriendlyName, setCaptureFriendlyName] = useState("");
   const [captureTags, setCaptureTags] = useState("");
   const [captureExpectedClass, setCaptureExpectedClass] = useState("");
@@ -186,15 +176,59 @@ export default function ProcessingLabPage() {
   const [selectedTakeIds, setSelectedTakeIds] = useState<Set<string>>(new Set());
   const lastTakeClickIndexRef = useRef<number | null>(null);
   const selectedTakeIdRef = useRef(selectedTakeId);
+  const takesRequestIdRef = useRef(0);
+
+  const [debouncedTakeSearch, setDebouncedTakeSearch] = useState("");
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedTakeSearch(takeSearch), 220);
+    return () => window.clearTimeout(timer);
+  }, [takeSearch]);
 
   useEffect(() => {
     selectedTakeIdRef.current = selectedTakeId;
   }, [selectedTakeId]);
 
 
+  const takePageParams = useMemo(() => ({
+    session_id: selectedSession || undefined,
+    dataset_id: selectedDataset || undefined,
+    search: debouncedTakeSearch || undefined,
+    show_archived: showArchived,
+  }), [selectedSession, selectedDataset, debouncedTakeSearch, showArchived]);
+
+  const loadTakePage = useCallback(async (offset: number, append: boolean) => {
+    const requestId = ++takesRequestIdRef.current;
+    if (append) setTakesLoadingMore(true);
+    else setTakesLoading(true);
+    try {
+      const page = await api.pagedTakes({
+        ...takePageParams,
+        limit: 50,
+        offset,
+      });
+      if (takesRequestIdRef.current !== requestId) return;
+      setTakes((prev) => (append ? [...prev, ...page.items] : page.items));
+      setTakesOffset(page.next_offset ?? page.offset + page.items.length);
+      setTakesHasMore(Boolean(page.has_more));
+      if (!append) {
+        const nextTakeId = resolveNextSelectedTakeId({
+          currentSelectedTakeId: selectedTakeIdRef.current,
+          availableTakeIds: page.items.map((take) => take.take_id),
+          preferredTakeId: page.items[0]?.take_id ?? null,
+        }) ?? "";
+        setSelectedTakeId(nextTakeId);
+      }
+    } finally {
+      if (takesRequestIdRef.current === requestId) {
+        setTakesLoading(false);
+        setTakesLoadingMore(false);
+      }
+    }
+  }, [takePageParams]);
+
   const load = useCallback(async () => {
     const [
-      nextTakes,
       nextSessions,
       nextPipelines,
       nextRuntime,
@@ -205,14 +239,6 @@ export default function ProcessingLabPage() {
       nextBindings,
       nextLatestPublished,
     ] = await Promise.all([
-      api.filteredTakes({
-        session_id: selectedSession || undefined,
-        dataset_id: selectedDataset || undefined,
-        validation_status: validationFilter === "all" ? undefined : validationFilter,
-        tag: tagFilter || undefined,
-        search: takeSearch || undefined,
-        show_archived: showArchived,
-      }),
       api.sessions(),
       api.pipelines(),
       api.state(),
@@ -224,7 +250,6 @@ export default function ProcessingLabPage() {
       api.latestPublishedInspectionResult().catch(() => null as InspectionPublishedResult | null),
     ]);
     const nextDatasetSessions = selectedDataset ? await api.datasetSessions(selectedDataset) : [];
-    setTakes(nextTakes);
     setSessions(nextSessions);
     setDatasets(nextDatasets);
     setDatasetSessions(nextDatasetSessions);
@@ -237,17 +262,17 @@ export default function ProcessingLabPage() {
     setLatestPublishedResult(nextLatestPublished);
     setSelectedPipelineInstanceId((current) => current || nextInstances[0]?.id || "");
     setSelectedPipelineId((current) => current || nextPipelines[0]?.id || "3d_ball_inspection");
-    const nextTakeId = resolveNextSelectedTakeId({
-      currentSelectedTakeId: selectedTakeIdRef.current,
-      availableTakeIds: nextTakes.map((take) => take.take_id),
-      preferredTakeId: nextTakes[0]?.take_id ?? null,
-    }) ?? "";
-    setSelectedTakeId(nextTakeId);
-  }, [selectedSession, selectedDataset, validationFilter, tagFilter, takeSearch, showArchived]);
+    await loadTakePage(0, false);
+  }, [selectedDataset, loadTakePage]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  const loadMoreTakes = useCallback(async () => {
+    if (!takesHasMore || takesLoadingMore) return;
+    await loadTakePage(takesOffset, true);
+  }, [takesHasMore, takesLoadingMore, takesOffset, loadTakePage]);
 
   useEffect(() => {
     let cancelled = false;
@@ -743,6 +768,34 @@ export default function ProcessingLabPage() {
     if (takeFilter === "warnings" && !(take.warning_count ?? 0)) return false;
     return true;
   });
+  const selectedDatasetInfo = useMemo(
+    () => datasets.find((item) => item.id === selectedDataset) ?? null,
+    [datasets, selectedDataset],
+  );
+  const selectedDatasetSessionInfo = useMemo(
+    () => datasetSessions.find((item) => item.id === selectedExperimentSession) ?? null,
+    [datasetSessions, selectedExperimentSession],
+  );
+  const selectedSessionTags = useMemo(
+    () => (selectedDatasetSessionInfo?.tags ?? []).map((item) => String(item)).filter(Boolean),
+    [selectedDatasetSessionInfo?.tags],
+  );
+  const selectedTakeSummary = useMemo(
+    () => takes.find((item) => item.take_id === selectedTakeId) ?? null,
+    [takes, selectedTakeId],
+  );
+  const selectedContextDatasetName = selectedTakeSummary?.dataset_name || selectedDatasetInfo?.name || (selectedDataset || "All datasets");
+  const selectedContextSessionName = selectedTakeSummary?.experiment_session_name || selectedDatasetSessionInfo?.name || (selectedExperimentSession || "All sessions");
+  const selectedContextSessionType = String(selectedTakeSummary?.experiment_session_type || selectedDatasetSessionInfo?.session_type || "engineering");
+  const activeFilterChips = useMemo(() => {
+    const chips: string[] = [];
+    if (selectedDataset) chips.push(`dataset:${selectedDataset}`);
+    if (selectedExperimentSession) chips.push(`dataset_session:${selectedExperimentSession}`);
+    if (selectedSession) chips.push(`acquisition_session:${selectedSession}`);
+    if (takeSearch) chips.push(`search:${takeSearch}`);
+    if (showArchived) chips.push("show_archived");
+    return chips;
+  }, [selectedDataset, selectedExperimentSession, selectedSession, takeSearch, showArchived]);
   const allVisibleTakeIds = useMemo(() => filteredTakes.map((take) => take.take_id), [filteredTakes]);
   const selectedVisibleCount = useMemo(
     () => allVisibleTakeIds.filter((takeId) => selectedTakeIds.has(takeId)).length,
@@ -1123,7 +1176,7 @@ export default function ProcessingLabPage() {
     await load();
   }
 
-  async function editTakeMetadata(field: "friendly_name" | "notes" | "expected_class" | "expected_diameter_mm" | "tags") {
+  async function editTakeMetadata(field: "friendly_name" | "notes" | "expected_class" | "expected_diameter_mm" | "physical_object_id" | "tags") {
     if (!detail) return;
     const meta = (detail.take_metadata ?? {}) as Record<string, unknown>;
     const current = field === "tags" ? String((meta.tags as string[] | undefined)?.join(",") ?? "") : String(meta[field] ?? "");
@@ -1137,6 +1190,8 @@ export default function ProcessingLabPage() {
       payload.expected_diameter_mm = next.trim() ? Number(next) : null;
     } else if (field === "tags") {
       payload.tags = next.split(",").map((item) => item.trim()).filter(Boolean);
+    } else if (field === "physical_object_id") {
+      payload.physical_object_id = next.trim() || null;
     } else {
       payload[field] = next.trim() || null;
     }
@@ -1284,47 +1339,6 @@ export default function ProcessingLabPage() {
     setDetail(null);
   }
 
-  async function createDatasetInline() {
-    if (!newDatasetName.trim()) return;
-    setCreatingDataset(true);
-    setCreateDatasetError(null);
-    try {
-      const created = await api.createDataset({ name: newDatasetName.trim(), notes: newDatasetNotes.trim() || null });
-      const next = nextDatasetSelectionAfterCreate(datasets, created);
-      setDatasets(next.datasets);
-      setSelectedDataset(next.selectedDataset);
-      setSelectedExperimentSession("");
-      setShowDatasetCreate(false);
-      setNewDatasetName("");
-      setNewDatasetNotes("");
-      await load();
-    } catch (err) {
-      setCreateDatasetError(err instanceof Error ? err.message : "Failed to create dataset");
-    } finally {
-      setCreatingDataset(false);
-    }
-  }
-
-  async function createDatasetSessionInline() {
-    if (!selectedDataset || !newSessionName.trim()) return;
-    setCreatingDatasetSession(true);
-    setCreateSessionError(null);
-    try {
-      const created = await api.createDatasetSession(selectedDataset, { name: newSessionName.trim(), notes: newSessionNotes.trim() || null });
-      const next = nextSessionSelectionAfterCreate(datasetSessions, created);
-      setDatasetSessions(next.sessions);
-      setSelectedExperimentSession(next.selectedSession);
-      setShowDatasetSessionCreate(false);
-      setNewSessionName("");
-      setNewSessionNotes("");
-      await load();
-    } catch (err) {
-      setCreateSessionError(err instanceof Error ? err.message : "Failed to create session");
-    } finally {
-      setCreatingDatasetSession(false);
-    }
-  }
-
   async function captureNewTakeInline(runAfterCapture = false) {
     const disabled = captureDisabledReason(selectedDataset, selectedExperimentSession);
     if (disabled) return;
@@ -1346,7 +1360,6 @@ export default function ProcessingLabPage() {
       setSelectedTakeId((current) => nextSelectedTakeAfterCapture(current, takeId));
       const nextDetail = await api.take(takeId);
       setDetail(nextDetail);
-      setShowCaptureCreate(false);
       setCaptureFriendlyName("");
       setCaptureTags("");
       setCaptureExpectedClass("");
@@ -1621,58 +1634,56 @@ export default function ProcessingLabPage() {
       <aside className="studio-sidebar">
         <div className="studio-sidebar-title">
           <span className="eyebrow">Studio</span>
-          <strong>Data browser</strong>
+          <strong>Processing Lab</strong>
+        </div>
+        <div className="studio-handoff-note">
+          <small>Semantic curation is managed in <a href="/datasets">Datasets</a>.</small>
+        </div>
+        <div className="studio-curation-context">
+          <small className="studio-curation-context-title">Selected take</small>
+          <div className="studio-selected-take-link">
+            <span className="semantic-chip active-take-chip">{selectedTakeSummary?.friendly_name || detail?.take_id || "No take selected"}</span>
+            {selectedTakeSummary?.thumbnail_path && (
+              <img
+                className="selected-context-thumb"
+                alt={selectedTakeSummary?.friendly_name || selectedTakeSummary?.take_id}
+                src={fileUrl(selectedTakeSummary.take_id, selectedTakeSummary.thumbnail_path)}
+              />
+            )}
+          </div>
+          <div className="studio-selected-take-meta">
+            <small>{selectedContextDatasetName}</small>
+            <small>{selectedContextSessionName}</small>
+          </div>
+          {activeFilterChips.length > 0 && (
+            <div className="studio-filters-applied">
+              <small>Operational filters</small>
+              <div className="semantic-chip-row">
+                {activeFilterChips.map((chip) => <span key={chip} className="semantic-chip filter-chip">{chip}</span>)}
+              </div>
+            </div>
+          )}
         </div>
         <label className="field-label">
-          <span className="inline-label-row">
-            <span>Dataset</span>
-            <button type="button" className="inline-plus-btn" onClick={() => setShowDatasetCreate((v) => !v)}>+</button>
-          </span>
+          Dataset
           <select value={selectedDataset} onChange={(event) => { setSelectedDataset(event.target.value); setSelectedExperimentSession(""); }}>
             <option value="">All datasets</option>
             {datasets.map((dataset) => (
               <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
             ))}
           </select>
-          {!datasets.length && <small>No datasets yet</small>}
-          {!datasets.length && <small>Create your first dataset</small>}
-          {showDatasetCreate && (
-            <div className="inline-create-card">
-              <input value={newDatasetName} onChange={(event) => setNewDatasetName(event.target.value)} placeholder="dataset name" />
-              <input value={newDatasetNotes} onChange={(event) => setNewDatasetNotes(event.target.value)} placeholder="notes (optional)" />
-              <div className="inline-create-actions">
-                <button type="button" disabled={creatingDataset || !newDatasetName.trim()} onClick={() => void createDatasetInline()}>{creatingDataset ? "Creating..." : "Create"}</button>
-                <button type="button" disabled={creatingDataset} onClick={() => setShowDatasetCreate(false)}>Cancel</button>
-              </div>
-              {createDatasetError && <small>{createDatasetError}</small>}
-            </div>
-          )}
         </label>
         <label className="field-label">
-          <span className="inline-label-row">
-            <span>Experiment session</span>
-            <button type="button" className="inline-plus-btn" disabled={!selectedDataset} onClick={() => setShowDatasetSessionCreate((v) => !v)}>+</button>
-          </span>
+          Dataset session
           <select value={selectedExperimentSession} onChange={(event) => setSelectedExperimentSession(event.target.value)} disabled={!selectedDataset}>
             <option value="">All dataset sessions</option>
             {datasetSessions.map((session) => (
               <option key={session.id} value={session.id}>{session.name}</option>
             ))}
           </select>
-          {showDatasetSessionCreate && (
-            <div className="inline-create-card">
-              <input value={newSessionName} onChange={(event) => setNewSessionName(event.target.value)} placeholder="session name" />
-              <input value={newSessionNotes} onChange={(event) => setNewSessionNotes(event.target.value)} placeholder="notes (optional)" />
-              <div className="inline-create-actions">
-                <button type="button" disabled={creatingDatasetSession || !newSessionName.trim() || !selectedDataset} onClick={() => void createDatasetSessionInline()}>{creatingDatasetSession ? "Creating..." : "Create"}</button>
-                <button type="button" disabled={creatingDatasetSession} onClick={() => setShowDatasetSessionCreate(false)}>Cancel</button>
-              </div>
-              {createSessionError && <small>{createSessionError}</small>}
-            </div>
-          )}
         </label>
         <label className="field-label">
-          Session
+          Acquisition session
           <select value={selectedSession} onChange={(event) => setSelectedSession(event.target.value)}>
             <option value="">All sessions</option>
             {sessions.map((session) => (
@@ -1680,61 +1691,42 @@ export default function ProcessingLabPage() {
             ))}
           </select>
         </label>
-        <div className="studio-pipeline-card">
-          <span className="inline-label-row">
-            <span>Capture new take</span>
-            <button type="button" className="inline-plus-btn" onClick={() => setShowCaptureCreate((v) => !v)}>+</button>
-          </span>
+        <details className="studio-pipeline-card studio-capture-card">
+          <summary>Capture take</summary>
+          {!selectedDataset && <small>Select a dataset/session to enable capture.</small>}
           {!!captureDisabledReason(selectedDataset, selectedExperimentSession) && (
             <small>{captureDisabledReason(selectedDataset, selectedExperimentSession)}</small>
           )}
-          {showCaptureCreate && (
-            <div className="inline-create-card">
-              <input value={captureFriendlyName} onChange={(event) => setCaptureFriendlyName(event.target.value)} placeholder="friendly name (optional)" />
-              <input value={captureTags} onChange={(event) => setCaptureTags(event.target.value)} placeholder="tags comma-separated (optional)" />
-              <input value={captureExpectedClass} onChange={(event) => setCaptureExpectedClass(event.target.value)} placeholder="expected class (optional)" />
-              <input value={captureExpectedDiameter} onChange={(event) => setCaptureExpectedDiameter(event.target.value)} placeholder="expected diameter mm (optional)" />
-              <input value={captureNotes} onChange={(event) => setCaptureNotes(event.target.value)} placeholder="notes (optional)" />
-              <div className="inline-create-actions">
-                <button
-                  type="button"
-                  disabled={captureLoading || !!captureDisabledReason(selectedDataset, selectedExperimentSession)}
-                  onClick={() => void captureNewTakeInline(false)}
-                  title={captureDisabledReason(selectedDataset, selectedExperimentSession) ?? ""}
-                >
-                  {captureLoading ? "Capturing..." : "Capture"}
-                </button>
-                <button
-                  type="button"
-                  disabled={captureLoading || !!captureDisabledReason(selectedDataset, selectedExperimentSession)}
-                  onClick={() => void captureNewTakeInline(true)}
-                  title={captureDisabledReason(selectedDataset, selectedExperimentSession) ?? ""}
-                >
-                  {captureLoading ? "Capturing..." : "Capture + Run"}
-                </button>
-                <button type="button" disabled={captureLoading} onClick={() => setShowCaptureCreate(false)}>Cancel</button>
-              </div>
-              {captureError && <small>{captureError}</small>}
+          <div className="inline-create-card">
+            <input value={captureFriendlyName} onChange={(event) => setCaptureFriendlyName(event.target.value)} placeholder="friendly name (optional)" />
+            <input value={captureTags} onChange={(event) => setCaptureTags(event.target.value)} placeholder="tags comma-separated (optional)" />
+            <input value={captureExpectedClass} onChange={(event) => setCaptureExpectedClass(event.target.value)} placeholder="expected class (optional)" />
+            <input value={captureExpectedDiameter} onChange={(event) => setCaptureExpectedDiameter(event.target.value)} placeholder="expected diameter mm (optional)" />
+            <input value={captureNotes} onChange={(event) => setCaptureNotes(event.target.value)} placeholder="notes (optional)" />
+            <div className="inline-create-actions">
+              <button
+                type="button"
+                disabled={captureLoading || !!captureDisabledReason(selectedDataset, selectedExperimentSession)}
+                onClick={() => void captureNewTakeInline(false)}
+                title={captureDisabledReason(selectedDataset, selectedExperimentSession) ?? ""}
+              >
+                {captureLoading ? "Capturing..." : "Capture"}
+              </button>
+              <button
+                type="button"
+                disabled={captureLoading || !!captureDisabledReason(selectedDataset, selectedExperimentSession)}
+                onClick={() => void captureNewTakeInline(true)}
+                title={captureDisabledReason(selectedDataset, selectedExperimentSession) ?? ""}
+              >
+                {captureLoading ? "Capturing..." : "Capture + Run"}
+              </button>
             </div>
-          )}
-        </div>
+            {captureError && <small>{captureError}</small>}
+          </div>
+        </details>
         <label className="field-label">
           Search
           <input value={takeSearch} onChange={(event) => setTakeSearch(event.target.value)} placeholder="take id or name" />
-        </label>
-        <label className="field-label">
-          Tag
-          <input value={tagFilter} onChange={(event) => setTagFilter(event.target.value)} placeholder="good, wet, broken..." />
-        </label>
-        <label className="field-label">
-          Validation
-          <select value={validationFilter} onChange={(event) => setValidationFilter(event.target.value as typeof validationFilter)}>
-            <option value="all">All</option>
-            <option value="unreviewed">Unreviewed</option>
-            <option value="valid">Valid</option>
-            <option value="invalid">Invalid</option>
-            <option value="needs_review">Needs review</option>
-          </select>
         </label>
         <label>
           <input checked={showArchived} type="checkbox" onChange={(event) => setShowArchived(event.target.checked)} />
@@ -1761,46 +1753,43 @@ export default function ProcessingLabPage() {
             </select>
           </label>
         </div>
-        <div className="studio-take-bulkbar">
-          <label>
-            <input
-              type="checkbox"
-              checked={allVisibleSelected}
-              onChange={(event) => {
-                const checked = event.target.checked;
-                setSelectedTakeIds(checked ? new Set(allVisibleTakeIds) : new Set());
-                if (!checked) lastTakeClickIndexRef.current = null;
+        <details className="studio-take-bulkbar">
+          <summary>Batch ({bulkSelectionCount})</summary>
+          <div className="studio-take-bulkbar-body">
+            <label>
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setSelectedTakeIds(checked ? new Set(allVisibleTakeIds) : new Set());
+                  if (!checked) lastTakeClickIndexRef.current = null;
+                }}
+              />
+              Select visible
+            </label>
+            <button
+              type="button"
+              disabled={pipelineActionBusy || !selectedPipeline || bulkSelectionCount === 0}
+              onClick={() => void reprocessSelectedTakes()}
+            >
+              Reprocess selected
+            </button>
+            <button
+              type="button"
+              disabled={bulkSelectionCount === 0}
+              onClick={() => {
+                setSelectedTakeIds(new Set());
+                lastTakeClickIndexRef.current = null;
               }}
-            />
-            Select visible
-          </label>
-          <small>{bulkSelectionCount} selected</small>
-          <button
-            type="button"
-            disabled={pipelineActionBusy || !selectedPipeline || bulkSelectionCount === 0}
-            onClick={() => void reprocessSelectedTakes()}
-          >
-            Reprocess selected
-          </button>
-          <button
-            type="button"
-            disabled={bulkSelectionCount === 0}
-            onClick={() => {
-              setSelectedTakeIds(new Set());
-              lastTakeClickIndexRef.current = null;
-            }}
-          >
-            Clear
-          </button>
-        </div>
+            >
+              Clear
+            </button>
+          </div>
+        </details>
         <div className="studio-take-list">
+          {takesLoading && !filteredTakes.length && <div className="empty-state compact">Loading takes…</div>}
           {filteredTakes.map((take, index) => {
-            const classText = (take.processed_class_label && take.processed_class_label.trim())
-              || take.semantic_labels?.join(", ")
-              || "-";
-            const superclassText = (take.processed_superclass && take.processed_superclass.trim())
-              || take.superclass_labels?.join(", ")
-              || "-";
             const isSelectedForBulk = selectedTakeIds.has(take.take_id);
             return (
               <div className="take-card-row" key={take.take_id}>
@@ -1835,52 +1824,34 @@ export default function ProcessingLabPage() {
                     ) : (
                       <div aria-hidden className="take-thumb take-thumb-empty" />
                     )}
-                    <div className="take-class-meta">
-                      <small>Class: {classText}</small>
-                      <small>Superclass: {superclassText}</small>
+                    <div className="take-card-meta">
+                      <div className="semantic-chip-row">
+                        {take.latest_run_status && <span className="semantic-chip">{take.latest_run_status}</span>}
+                        {(take.modalities ?? []).slice(0, 2).map((item) => <span key={item} className="semantic-chip tag-chip">{item}</span>)}
+                      </div>
+                      <div className="take-class-meta">
+                        <small>{take.dataset_name || "No dataset"}</small>
+                        <small>{take.experiment_session_name || "No session"}</small>
+                      </div>
                     </div>
                   </div>
                 </button>
               </div>
             );
           })}
-        </div>
-        <div className="studio-pipeline-card">
-          <span>Take management</span>
-          <button type="button" disabled={!detail} onClick={() => void editTakeMetadata("friendly_name")}>Rename take</button>
-          <button type="button" disabled={!detail} onClick={() => void editTakeMetadata("notes")}>Edit notes</button>
-          <button type="button" disabled={!detail} onClick={() => void editTakeMetadata("tags")}>Edit tags</button>
-          <button type="button" disabled={!detail} onClick={() => void editTakeMetadata("expected_class")}>Set expected class</button>
-          <button type="button" disabled={!detail} onClick={() => void editTakeMetadata("expected_diameter_mm")}>Set expected diameter</button>
-          <div className="chip-row">
-            {["good", "broken", "worn", "wet", "occluded", "touching_border", "bad_lighting", "multiple_objects"].map((chip) => (
-              <button key={chip} type="button" onClick={() => void toggleSuggestedTag(chip)}>{chip}</button>
-            ))}
-          </div>
-          <div className="chip-row">
-            {(["unreviewed", "valid", "invalid", "needs_review"] as const).map((status) => (
-              <button key={status} type="button" disabled={!detail} onClick={() => void setValidationStatus(status)}>{status}</button>
-            ))}
-          </div>
-          <button type="button" disabled={!detail} onClick={() => void rerunLatestPipeline()}>Rerun latest pipeline</button>
-          <button
-            type="button"
-            disabled={!detail || !((detail.processing_by_family ?? []).find((item) => item.family === "25d")?.hasCompletedOutput)}
-            onClick={() => void publish25dForSelectedTake()}
-          >
-            Publish 25D result
-          </button>
-          <button type="button" disabled={!detail} onClick={() => void removeFromDataset()}>Remove from dataset</button>
-          {!Boolean((detail?.take_metadata as Record<string, unknown> | undefined)?.archived) ? (
-            <button type="button" disabled={!detail} onClick={() => void archiveCurrentTake()}>Archive take</button>
-          ) : (
-            <button type="button" disabled={!detail} onClick={() => void restoreCurrentTake()}>Restore archived take</button>
+          {takesHasMore && (
+            <button
+              type="button"
+              className="load-more-takes-btn"
+              disabled={takesLoadingMore}
+              onClick={() => void loadMoreTakes()}
+            >
+              {takesLoadingMore ? "Loading…" : "Load more"}
+            </button>
           )}
-          <details>
-            <summary>Delete permanently (advanced)</summary>
-            <small>Deletes raw incoming take files, processed outputs, linked sidecar metadata, and indexed run directories for this take.</small>
-            <button type="button" disabled={!detail} onClick={() => void permanentDeleteCurrentTake()}>Delete permanently</button>
-          </details>
+        </div>
+        <div className="studio-pipeline-card studio-datasets-link-card">
+          <small>Labeling, validation, annotations, and dataset composition are in <a href="/datasets">Datasets</a>.</small>
         </div>
         <details className="studio-pipeline-card">
           <summary>Process config (advanced)</summary>
@@ -1950,8 +1921,8 @@ export default function ProcessingLabPage() {
 
       <section className="studio-center">
         <header className="studio-workspace-toolbar">
-          <span className="toolbar-chip">Take: {detail?.take_id ?? "none"}</span>
-          <label className="toolbar-chip">
+          <span className="toolbar-chip identity-chip">Take: {detail?.take_id ?? "none"}</span>
+          <label className="toolbar-chip pipeline-chip">
             Pipeline
             <select value={selectedPipelineId} onChange={(event) => selectPipeline(event.target.value)}>
               {pipelines.map((pipeline) => (
@@ -1959,7 +1930,7 @@ export default function ProcessingLabPage() {
               ))}
             </select>
           </label>
-          <label className="toolbar-chip">
+          <label className="toolbar-chip stage-chip">
             Stage
             <select value={selectedStageId} onChange={(event) => selectStage(event.target.value)}>
               {(selectedPipeline?.stages ?? []).map((stage) => (
@@ -1967,7 +1938,7 @@ export default function ProcessingLabPage() {
               ))}
             </select>
           </label>
-          <span className={`toolbar-chip ${compatible ? "ok" : "warn"}`}>{compatible ? "compatible" : "incompatible"}</span>
+          <span className={`toolbar-chip compatibility-chip ${compatible ? "ok" : "warn"}`}>{compatible ? "compatible" : "incompatible"}</span>
           <div className="studio-actions toolbar-actions">
             {(canonicalSelectedStageId === "fit_object_geometry" || canonicalSelectedStageId === "compute_height_metrics") && planeQaParams && (
               <button type="button" onClick={() => setMeasurementConfigOpen(true)}>Configure known-cube</button>
@@ -2542,6 +2513,12 @@ export default function ProcessingLabPage() {
         selectedObjectId={focusedObject?.object_id ?? null}
         hoverSample={hoverSample}
         stageId={canonicalSelectedStageId}
+        acquisitionContext={{
+          dataset: selectedContextDatasetName || null,
+          session: selectedContextSessionName || null,
+          sessionType: selectedContextSessionType || null,
+          sessionTags: selectedSessionTags,
+        }}
         onUpsertObjectAnnotation={(payload) => void upsertObjectAnnotation(payload)}
       />
     </main>
