@@ -129,6 +129,47 @@ This preserves backend contracts while preparing for future DAG pipelines:
 
 Future branching stages can map into the same model by exposing upstream/downstream edges while keeping the `selected stage -> stage workspace` contract unchanged.
 
+## Acquisition vs processing rendering intent (UI semantics)
+
+Studio keeps one architecture and one stage-centric workflow, but applies context-aware rendering intent:
+
+- Acquisition-centric intent:
+  - dataset/session browsing
+  - curated take review
+  - acquisition debugging
+  - full-frame previews + semantic acquisition chips
+- Processing/classification-centric intent:
+  - stage diagnostics
+  - object/class overlays
+  - measurement and classification QA
+
+This is a presentation-layer refinement only; no pipeline routing, stage contracts, or artifact schemas are split or duplicated.
+
+### Context resolution rule
+
+Studio distinguishes two independent semantic layers:
+
+- selected acquisition context: resolved from the currently selected take metadata/summary
+- browse filters: user-applied constraints for discovery/listing
+
+Selected context must not be replaced by filter defaults (`All datasets`, etc.) when a take is selected.
+
+### UI hierarchy rationale (non-architectural)
+
+To reduce semantic ambiguity without changing architecture:
+
+- top-bar control weighting follows acquisition identity -> pipeline -> stage -> actions
+- runtime cards keep classification-centric decisions prominent but allocate meaningful area to acquisition previews
+- inspector spacing is compacted while preserving full diagnostic coverage
+
+### Performance boundary: list vs detail
+
+To preserve stage-centric architecture while improving responsiveness:
+
+- list endpoints should return compact `TakeSummary` records only
+- selected take detail/artifacts are loaded via dedicated detail path
+- list pagination prevents large dataset scans from blocking initial UI interaction
+
 ## Stage capability registry and renderer abstraction
 
 Frontend now uses explicit semantic configuration for stage visualization:
@@ -1271,3 +1312,64 @@ Sensor Studio now supports a renderer-driven `Operator` vs `Engineering` mode wi
 ## Compatibility Direction
 
 The model stays compatible with future `RGB + 25D` fusion, point-cloud viewers, multimodal overlays, ML classifiers, and live runtime monitoring because contracts remain artifact-first and stage-scoped.
+
+## Studio vs Datasets UX composition boundary
+
+This architecture now treats Studio and Datasets as complementary workspaces:
+
+- Studio = engineering lab for acquisition-linked processing, stage diagnostics, overlays, compatibility checks, and reruns.
+- Datasets = semantic curation and ML preparation layer for labeling, review/validation, object annotations, split management, and dataset composition.
+
+UX composition rule:
+
+- keep Studio left rail operational and compact
+- move semantic curation/admin controls to Datasets
+- preserve existing pipeline/run/stage contracts and processing backends
+
+Refinement rule (lightweight UX pass):
+
+- batch/admin actions in Studio are discoverable but visually de-emphasized
+- orientation cards are compact and non-duplicative
+- selector naming must distinguish acquisition navigation from semantic curation scopes
+
+This is a composition refinement only. No processing contracts, run artifacts, or routing/back-end architecture are changed.
+
+## Dataset Session Export Service (Compositional)
+
+- Added `DatasetSessionExportService` in API layer to produce deterministic session export payloads.
+- Service composes existing contracts (`list_takes`, `list_takes_paged`, `get_take_detail`, DatasetService metadata) and does not duplicate processing-state logic.
+- New endpoints:
+  - `GET /api/dataset-sessions/{session_id}/summary`
+  - `GET /api/dataset-sessions/{session_id}/export`
+- Export is metadata/reference oriented, preserving raw acquisition immutability and compatibility with future import workflows.
+
+## ML Ingestion Reconciliation and Materialization Architecture
+
+Implemented additive ingestion modules:
+
+- `ingestion_wizard.py`
+- `label_manifest_builder.py`
+- `take_reference_resolver.py`
+- `range_expansion.py`
+- `label_normalization.py`
+- `object_grouping.py`
+- `ml_set_materializer.py`
+
+### API Layer
+
+Added compositional API endpoints for run lifecycle:
+
+- `POST /api/ml-ingestion/runs`
+- `GET /api/ml-ingestion/runs/{run_id}`
+- `POST /api/ml-ingestion/runs/{run_id}/table`
+- `POST /api/ml-ingestion/runs/{run_id}/reconcile`
+- `POST /api/ml-ingestion/runs/{run_id}/policy`
+- `POST /api/ml-ingestion/runs/{run_id}/manifest`
+- `POST /api/ml-ingestion/runs/{run_id}/materialize`
+- `POST /api/ml-ingestion/runs/{run_id}/apply-metadata`
+
+### Deterministic Contracts
+
+- Canonical manifest generation and ML set materialization are separated.
+- Materialized artifacts include `ml_set.json`, `label_manifest.csv`, `split_manifest.csv`, distributions, and `validation_report.json`.
+- Processing/studio runtime architecture remains unchanged; this path is semantic governance + data curation.

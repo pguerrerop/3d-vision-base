@@ -85,6 +85,33 @@ Processing Lab sidebar now supports:
   - quick tag chips
   - validation status update
 
+## Responsibility boundary (Studio vs Datasets)
+
+Studio and Datasets now have explicit ownership boundaries:
+
+- Studio (engineering/process-debugging workspace):
+  - acquisition-linked take selection
+  - lightweight operational filtering (dataset/session/search/modality/status)
+  - stage-by-stage processing inspection
+  - rerun/debug execution flows
+- Datasets (semantic curation/ML preparation workspace):
+  - labeling/tagging workflows
+  - validation governance/review
+  - object annotations and dataset composition
+  - split management and experiment preparation
+
+Rationale:
+
+- prevent duplicated responsibilities across pages
+- keep Studio focused on processing diagnostics
+- keep semantic curation in Datasets where governance workflows belong
+
+Final UX boundary notes:
+
+- Studio may expose navigation-time dataset/session scoping for processing selection.
+- Studio should not foreground curation administration (label edits, validation review flows, semantic bulk ops).
+- Datasets remains the primary workspace for metadata authoring, annotation governance, and ML-set preparation.
+
 ## Acquisition vs processing preserved
 
 Design invariant remains unchanged:
@@ -255,6 +282,80 @@ Take sidecar metadata now includes:
 - Each acquired take is stored exactly in the shape consumed by downstream heightmap pipelines.
 - Replay reproduces acquisition state; runs remain immutable processing interpretations.
 
+## Curated acquisition organization hardening (additive)
+
+The dataset layer now formalizes curated acquisition organization without changing raw take or run contracts.
+
+### Hardened semantics
+
+- `Dataset`: campaign/project scope (not day/session).
+- `Session`: stable acquisition context bucket.
+- `Take`: immutable acquisition unit with many processing runs.
+
+### Session sidecar extensions
+
+`session.json` now supports:
+
+- `session_type`: `engineering | curated | benchmark | operational` (default `engineering`)
+- contextual metadata buckets:
+  - `sensor_metadata`
+  - `conveyor_metadata`
+  - `lighting_metadata`
+  - `environment_metadata`
+- `metadata` (freeform extension payload)
+
+### Take sidecar extensions
+
+`takes/<take_id>/metadata.json` now supports:
+
+- `categories: string[]` (curation tags)
+- `reference_type: string | null`
+- `is_reference: bool`
+- `is_golden_sample: bool`
+- `session_notes: string | null`
+
+Suggested curation tags:
+
+- `empty_belt_reference`
+- `calibration_reference`
+- `golden_sample`
+- `stress_case`
+- `benchmark_case`
+- `ml_training_candidate`
+- `engineering_debug`
+- `operational_capture`
+
+### API + Studio filter behavior
+
+`GET /api/takes` now supports additive filters:
+
+- `session_type`
+- `category`
+- `reference_type`
+- `is_reference`
+- `is_golden_sample`
+
+Studio sidebar exposes the same dimensions for experiment-management-oriented browsing.
+
+### Studio semantics
+
+- Friendly take names remain the primary display label.
+- Immutable `take_id` remains visible secondarily for debugging/replay references.
+- Compact curation chips support quick category and reference/golden marking.
+- Persistent compact curation context (dataset/session/session-type/session-tags) remains visible during browsing.
+- Acquisition browser thumbnails are full-frame (`contain`) to preserve belt geometry and scene context.
+- Selected-take context is authoritative for curation identity; active filters are independent browse constraints.
+- Studio sidebar uses paginated summary listing (`/api/takes/paged`) while selected take detail remains independently hydrated.
+
+### Compatibility and invariants
+
+This remains metadata-only and preserves:
+
+- immutable raw acquisition payloads
+- many-runs-per-take processing model
+- existing processing output paths and stage contracts
+- existing take ids and replay compatibility
+
 ### Replayable Take Contract
 - New immutable sidecar: `data/incoming/<take_id>/replay_manifest.json`
 - Manifest includes:
@@ -348,12 +449,1412 @@ Take sidecar metadata now includes:
 - Semantic labels are canonical ML taxonomy annotations.
 - Both coexist permanently.
 
-### Mining Balls Coverage + Split-Tag Repair
+## Acquisition Grouping vs ML Grouping (Architectural Separation)
 
-- Taxonomy `mining_balls_v1` now includes observed dataset tags such as:
-  - `chica`, `chica 2`, `80%`, `ahuevada`, `mitad 2`, `golilla`, `cubo`, `encoder`, `cámara`, `tarro curry`, `tarro spray`, `zoquete`.
-- Known split-tag repair is supported during normalization only (raw tags unchanged):
-  - `ok 2 (2` + `5")` => interpreted as `ok 2 (2,5")`.
-- Repair is surfaced in normalization warnings as:
-  - `REPAIRED_SPLIT_TAG:<left + right -> merged>`.
-- Aliases are supported in taxonomy entries to preserve deterministic semantic mapping across spelling/format variants.
+### Rationale
+
+Sessions and ML datasets represent different concerns and should not share the same abstraction:
+
+- Acquisition grouping (`Session`): capture run context, setup, calibration, operator workflow, and experiment run boundaries.
+- ML grouping (`MLSet`): reusable training/evaluation cohorts, split assignment, benchmark sets, and task-specific views over takes.
+
+Using one concept for both causes ambiguity and leakage-prone workflows. Sensor Studio therefore separates them explicitly.
+
+### Target model
+
+- `Dataset`: top-level project/collection (example: `bolas-2-5-1`).
+- `Session`: acquisition context (examples: `morning_poc`, `evening_labeled_objects`, `conveyor_test_01`).
+- `MLSet`: ML experiment/training grouping (examples: `balls_scrap_classifier_v1`, `diameter_regression_v1`, `benchmark_june_2026`, `holdout_set_v1`).
+
+### Cardinality rules
+
+- One take belongs to exactly one session.
+- One take belongs to zero, one, or many ML sets.
+- Session assignment is acquisition provenance.
+- ML set membership is experiment curation.
+
+### New entities
+
+`MLSet`
+
+```text
+MLSet
+- id
+- dataset_id
+- name
+- description
+- task_type
+- created_at
+- updated_at
+- notes
+```
+
+Supported `task_type` values:
+
+- `classification`
+- `regression`
+- `detection`
+- `segmentation`
+- `clustering`
+- `benchmark`
+
+`MLSetMembership`
+
+```text
+MLSetMembership
+- ml_set_id
+- take_id
+- split
+- physical_object_id
+- include
+- notes
+- created_at
+- updated_at
+```
+
+Supported `split` values:
+
+- `train`
+- `validation`
+- `test`
+- `holdout`
+- `calibration`
+- `unassigned`
+
+### Persistence layout (filesystem)
+
+ML sets are persisted under the dataset sidecar root:
+
+```text
+data/
+  datasets/
+    dataset_<dataset_id>/
+      ml_sets/
+        ml_set_<ml_set_id>/
+          ml_set.json
+          memberships.json
+```
+
+`ml_set.json` stores MLSet metadata.
+
+`memberships.json` stores membership rows keyed by `take_id` semantics (no duplicates per MLSet).
+
+### Take metadata shape (extended)
+
+```json
+{
+  "take_id": "2026-05-25T183433_037",
+  "dataset_id": "bolas-2-5-1",
+  "session_id": "evening_labeled_objects",
+  "ml_set_memberships": [
+    {
+      "ml_set_id": "balls_scrap_classifier_v1",
+      "split": "train",
+      "physical_object_id": "obj_0005"
+    },
+    {
+      "ml_set_id": "diameter_regression_v1",
+      "split": "validation",
+      "physical_object_id": "obj_0005"
+    }
+  ]
+}
+```
+
+### Leakage prevention strategy (object-level split integrity)
+
+Split assignment must be object-aware:
+
+- A physical object can have many takes.
+- All takes from the same `physical_object_id` must stay in the same split within a given ML set.
+- Split assignment is performed over object groups first, then expanded to takes.
+
+This prevents train/test leakage for scenarios such as repeated captures of `obj_0005`.
+
+### Session regrouping CLI remains acquisition-only
+
+Existing command remains valid and intentionally acquisition-scoped:
+
+- `python scripts/sensor_studio_cli.py acquisition update-take-session`
+
+Semantics remain:
+
+- dry-run by default, `--apply` required for writes
+- preserves `dataset_id`; only `session_id` changes
+- does not mutate raw files or processing outputs
+
+This command should not be used to represent train/validation/test or ML classifier dataset membership.
+
+Usage patterns:
+
+- Explicit take IDs:
+  - `python scripts/sensor_studio_cli.py acquisition update-take-session --data-dir data --session-id ball_good_84mm --take-id 2026-05-25T183433_037 --take-id 2026-05-25T183434_038 --dry-run`
+- Newline take file:
+  - `python scripts/sensor_studio_cli.py acquisition update-take-session --data-dir data --session-id ball_good_84mm --take-file labels/ball_good_84mm_takes.txt --dry-run`
+- Create destination session + apply:
+  - `python scripts/sensor_studio_cli.py acquisition update-take-session --data-dir data --session-id ball_good_84mm --session-name "Good ball 84 mm" --create-session --take-file labels/ball_good_84mm_takes.txt --apply`
+
+Command behavior:
+
+- Input union: repeated `--take-id` and `--take-file` are merged and deduplicated.
+- Validation: prints requested/valid/missing summary and refuses when missing takes exist, unless `--allow-missing`.
+- Dataset inference: inferred from take metadata; multi-dataset input requires explicit `--dataset-id`.
+- Session creation: destination session is reused when present; created only with `--create-session`.
+- Dry-run: default mode; prints proposed old/new session mapping and writes nothing.
+- Apply mode: requires `--apply`; updates take sidecar metadata `session_id` only and writes audit log:
+  - `data/runtime/logs/update_take_session_<timestamp>.json`
+
+Immutability guarantees:
+
+- No move/duplication/deletion of raw take folders under `data/incoming/<take_id>/`.
+- No mutation of processed outputs under `data/processed/<take_id>/`.
+- No mutation of labels/classes/annotations except session association in dataset sidecar metadata.
+
+Why this helps supervised workflows:
+
+- Allows fast regrouping into acquisition sessions aligned with operator curation passes.
+- Supports labeling/reprocessing batches without recapturing data.
+- Preserves acquisition provenance while ML grouping is handled separately through `MLSet` membership.
+
+### Future ML workflow CLI architecture
+
+- Create ML set:
+  - `python scripts/sensor_studio_cli.py ml create-set --dataset-id bolas-2-5-1 --ml-set-id balls_scrap_classifier_v1 --name "Balls vs Scrap Classifier v1" --task-type classification`
+- Add takes:
+  - `python scripts/sensor_studio_cli.py ml add-takes --ml-set-id balls_scrap_classifier_v1 --take-file labels/balls_scrap_labeled_takes.txt --split unassigned`
+- List ML set:
+  - `python scripts/sensor_studio_cli.py ml list-set --ml-set-id balls_scrap_classifier_v1 --show-memberships`
+- Assign splits:
+  - `python scripts/sensor_studio_cli.py ml assign-splits`
+- Export dataset:
+  - `python scripts/sensor_studio_cli.py ml export-dataset`
+- Export features:
+  - `python scripts/sensor_studio_cli.py ml export-features`
+- Train classifier:
+  - `python scripts/sensor_studio_cli.py ml train-classifier`
+- Evaluate model:
+  - `python scripts/sensor_studio_cli.py ml evaluate`
+
+MLSet lookup semantics:
+
+- MLSet IDs are dataset-scoped, not globally unique.
+- Commands such as `ml add-takes` and `ml list-set` resolve `--ml-set-id` as follows:
+  - with `--dataset-id`: resolve only inside that dataset
+  - without `--dataset-id`:
+    - zero matches -> fail (`MLSet '<id>' not found.`)
+    - one match -> auto-resolve and continue
+    - multiple matches -> fail and require `--dataset-id`
+
+`ml assign-splits` semantics:
+
+- metadata-only operation over `MLSetMembership` rows
+- default mode is dry-run
+- apply mode requires `--apply`
+- deterministic assignment from stable grouping + seeded shuffle
+- ratio validation:
+  - each ratio must be `>= 0`
+  - `train + validation + test + holdout + calibration == 1.0`
+- leakage-safe grouping:
+  - with `--by-physical-object-id` (default), assignment unit is `physical_object_id`
+  - all takes for the same physical object are forced into the same split
+  - missing `physical_object_id` fails clearly with offending take IDs
+- without `--by-physical-object-id`, assignment unit is `take_id`
+- on apply, writes:
+  - `data/runtime/logs/ml_assign_splits_<timestamp>.json`
+
+`ml reprocess-set` semantics:
+
+- metadata-aware batch processing over MLSet memberships
+- supports optional split filtering (`--split` repeatable)
+- default mode is dry-run; apply requires `--apply`
+- uses explicit `pipeline_id` for all selected takes
+- does not mutate MLSet/session labels/splits/raw acquisitions
+- updates only processing outputs
+- apply writes:
+  - `data/runtime/logs/ml_reprocess_set_<timestamp>.json`
+
+`ml export-features` semantics:
+
+- deterministic one-row-per-take export (CSV)
+- joins:
+  - MLSet membership metadata (`ml_set_id`, `split`, `physical_object_id`)
+  - take metadata (`dataset_id`, `session_id`, expected labels when present)
+  - pipeline provenance (`pipeline_id`, `pipeline_run_id`, `pipeline_timestamp`)
+  - flattened stable scalar numeric features from compatible pipeline results
+- supports optional split filtering
+- `--require-processed` enforces complete compatible processing coverage
+- deterministic column ordering:
+  - metadata/provenance columns first
+  - feature columns sorted lexicographically
+
+`ml import-manifest` semantics:
+
+- preferred high-level ML curation entrypoint (CSV/JSON)
+- each manifest row represents one physical object with one-or-many take IDs
+- importer validates:
+  - MLSet resolution
+  - manifest schema
+  - take existence
+  - take dataset compatibility with MLSet dataset
+  - conflicting physical-object assignment
+- importer updates memberships idempotently (add-or-update, no duplicates)
+- supported membership metadata updates:
+  - `physical_object_id`
+  - `split`
+  - `include`
+  - `notes`
+  - `expected_label`, `expected_class`, `expected_subclass`
+  - optional numeric measurements (`d1_mm`, `d2_mm`, `d3_mm`)
+- default mode is dry-run; apply requires `--apply`
+- apply writes:
+  - `data/runtime/logs/ml_import_manifest_<timestamp>.json`
+
+### Grinding balls example
+
+- Dataset: `bolas-2-5-1`
+- Session: `evening_labeled_objects` (acquisition context)
+- ML set A: `balls_scrap_classifier_v1` with split=`train`
+- ML set B: `diameter_regression_v1` with split=`validation`
+- Shared `physical_object_id`: `obj_0005` across all takes of that ball
+
+Result:
+
+- Acquisition provenance stays stable in session metadata.
+- ML experiments can reuse the same takes with independent tasks and splits.
+- Leakage guard is enforced per ML set via object-level grouping.
+
+Future path from this foundation:
+
+- curate memberships in `MLSet`
+- import manifest-driven object groupings/labels (`ml import-manifest`)
+- assign leakage-safe splits using `physical_object_id` (`ml assign-splits`)
+- reprocess target MLSet (`ml reprocess-set`)
+- export features/datasets (`ml export-features`)
+- train classifier
+- evaluate model
+
+## Repeatability Platform Additions (Additive)
+
+An additive repeatability-analysis path is now documented on top of existing dataset/session/take and MLSet workflows.
+
+Additions:
+- optional take metadata field: `physical_object_id`
+- API filtering support in `GET /api/takes?physical_object_id=...`
+- Processing Lab inline curation support for `physical_object_id`
+- offline analysis entrypoint: `scripts/analyze_feature_repeatability.py`
+
+Analysis outputs:
+- per-object/per-feature repeatability metrics (`mean`, `std`, `cv`, `min`, `max`, `outlier_count`)
+- feature stability rankings and instability flags
+- orientation sensitivity classification (`low|medium|high`)
+- correlation summaries between feature instability and acquisition-quality signals
+
+Generated files:
+- `repeatability_summary.json`
+- `repeatability_per_object_feature.csv`
+- `repeatability_feature_stability.csv`
+- `repeatability_correlations.csv`
+
+Design invariant:
+- additive-only changes; no raw acquisition mutation, no session semantic drift, and no run output contract breakage.
+
+### Diagnostics-aware export/analysis (additive)
+
+`ml export-features` now supports optional diagnostics/provenance enrichments:
+
+- `--include-diagnostics`
+- `--include-invalidity-flags`
+- `--include-provenance-summary`
+
+`analyze_feature_repeatability.py` supports optional diagnostics-aware summaries:
+
+- `--include-diagnostics`
+- `--include-invalidity-flags`
+- `--include-provenance-summaries`
+
+All remain opt-in and preserve prior defaults/contracts.
+
+## Explainable 25D Rule Tuning
+
+Added offline threshold tuner:
+
+- `scripts/tune_25d_rules.py`
+
+Key properties:
+- deterministic search (`grid` or `random`)
+- object-safe split handling by `physical_object_id`
+- hierarchical rule-path evaluation with explicit path ids
+- output artifacts for rapid demo iteration (`best_rules.json`, metrics, confusion matrix, predictions)
+
+Why this helps:
+- faster operational iteration than full ML retraining
+- keeps rule topology interpretable for engineering/debug/client explanation
+- preserves clean separation from future learned classifiers
+
+Selectable rule sets:
+
+- configs live in `configs/classifiers/*.json`
+- reprocess flows can optionally pass `--classifier-rules <path>`
+- omission preserves built-in defaults for backward compatibility
+- discovery command: `sensor_studio_cli.py ml list-rule-sets`
+- optional `--json` for machine-readable output
+- optional `--classifier-id <id>` filter
+- listing includes id/version/classifier/path and metadata (`dataset_id`, `ml_set_id`, `optimized_metric`, validation score if present)
+
+Operational selection precedence:
+
+- runtime override (`ml reprocess-set --classifier-rules <path>`)
+- pipeline recipe classifier rule-set path
+- environment default (`SENSOR_STUDIO_DEFAULT_RULE_SET`)
+- built-in default rules
+
+Active selection inspection:
+
+- `sensor_studio_cli.py ml show-active-rule-set --pipeline-id mining_steel_ball_classification_25d`
+- optional `--json` for automation/runtime integration
+
+Immutability policy:
+
+- rule-set config files are treated as immutable release artifacts
+- do not overwrite tuned snapshots in place
+- create versioned successors (example: `*_v2.json`) for threshold updates
+
+## Studio vs Datasets Responsibility Split (2026-05-31)
+
+A new top-level semantic workspace is introduced at `/datasets` to separate engineering execution from ML/data governance concerns.
+
+### Top-level navigation ownership
+
+Primary product navigation now follows:
+
+- `Operations`
+- `Studio`
+- `Datasets`
+- `Classifiers`
+- `Runtime`
+- `Calibration`
+- `Diagnostics`
+
+### Mental model boundary
+
+- `Studio` answers: "What happened technically?"
+- `Datasets` answers: "What do we know semantically?"
+
+### Studio ownership (kept)
+
+- take -> pipeline -> run -> stage execution workflows
+- stage-native visualization and artifact inspection
+- segmentation/geometry/debug overlays and calibration validation
+- runtime engineering workflows and acquisition troubleshooting
+- lightweight dataset/session selection only
+
+### Datasets ownership (new)
+
+- dataset explorer hierarchy: dataset -> sessions -> takes -> object annotations
+- dataset dashboard: counts, validation coverage, class/split readiness indicators
+- session view: acquisition conditions + sensor/conveyor/lighting/calibration context
+- take browser for bulk semantic operations (validation/class assignment/tags)
+- object review workspace reusing `object_annotations` contracts
+- future ML set and split-management workflows with leakage diagnostics
+
+### Explicit non-goals
+
+This separation does **not** change:
+
+- pipeline execution architecture
+- runtime orchestration contracts
+- stage artifact/overlay contracts
+- take immutability or run immutability
+- processing APIs/backends
+
+### UX decomposition rationale
+
+Keeping Studio focused on execution/debugging preserves responsiveness and stage-centric clarity for engineering users. Moving semantic curation into Datasets prevents sidebar overloading, improves discoverability for labeling/review/split tasks, and creates a scalable surface for active-learning and classifier lifecycle workflows.
+
+### Incremental rollout path
+
+- Phase 1: `/datasets` route, explorer/dashboard/session-take-object views, bulk semantic updates.
+- Phase 2: explicit ML Set entities + split management + leakage and balance diagnostics.
+- Phase 3: training orchestration linkage, classifier lineage, active-learning/disagreement queues, deployment feedback loops.
+
+## Datasets Command Center UX Refinement (2026-05-31, Phase 2A/2B base)
+
+The `/datasets` workspace was refactored from stacked dashboard sections into a multi-context command-center layout optimized for semantic operations.
+
+### Workspace decomposition rationale
+
+The page now follows a stable three-pane operating model:
+
+- left: semantic explorer/filtering/navigation
+- center: tabbed operational workspace
+- right: contextual inspector
+
+This reduces context switching, improves density, and prevents semantic metadata from competing with core table/review workflows.
+
+### Tab ownership semantics
+
+Center workspace tabs define explicit responsibility ownership:
+
+- `Overview`: dataset health/readiness (counts, coverage, distribution, recent activity)
+- `Takes`: canonical bulk semantic take management surface
+- `Objects`: object annotation/review queues (contract-compatible placeholders included)
+- `Labels`: taxonomy and usage organization
+- `ML Sets`: composition/readiness placeholders for training datasets
+- `Splits`: split-governance and leakage diagnostics placeholders
+
+The previous independent stacked blocks (dashboard/session/take/object) are now contextual tab content.
+
+### Inspector responsibilities
+
+The right inspector now owns context metadata for selected entities:
+
+- dataset metadata context
+- session acquisition/calibration context
+- take semantic context
+- object annotation context
+- ML set context (when active)
+- split context (when active)
+
+This keeps center panes focused on actions and review density rather than metadata narration.
+
+### Semantic workflow direction
+
+The refined flow prioritizes operational curation:
+
+- filter in explorer
+- act in tabbed workspace (bulk review/edit/govern)
+- inspect context in right panel
+- jump to Studio only for technical stage/debug detail
+
+Subtle workflow links (`Open in Studio`, `Inspect pipeline outputs`, `Review segmentation`) preserve handoff without merging workflows.
+
+### Dataset governance UX philosophy
+
+The Datasets workspace is positioned as an industrial semantic governance surface, not a generic admin CRUD page:
+
+- compact controls
+- denser tables/cards
+- progressive disclosure via tabs and inspector
+- minimal prose, action-first layout
+
+### Studio vs Datasets workflow separation
+
+Boundary is reinforced at interaction level:
+
+- `Studio`: execution/debugging/stage visualization and engineering diagnosis
+- `Datasets`: labeling/review/semantic organization/ML curation/split governance
+
+No backend processing contracts, pipeline execution architecture, or object annotation data contracts were redesigned.
+
+## Datasets Command Center Refinement (2026-05-31, tab/reactivity pass)
+
+### Tab workspace semantics
+
+The center workspace now behaves as a true tabbed operational surface:
+
+- compact horizontal tab strip
+- active tab content anchored immediately below tabs
+- reduced framing/vertical dead space
+- Overview-owned KPI and summary composition (no detached dashboard region)
+
+### Overview tab ownership
+
+Overview now exclusively owns health/readiness summaries:
+
+- KPI strip
+- class/session distributions
+- split readiness
+- recent activity
+
+No pre-tab dashboard region is used.
+
+### Takes rendering/reactivity fix
+
+The takes rendering issue was corrected by separating data acquisition from local semantic filtering:
+
+- source list fetched into `rawTakes` from current dataset/session/server-side filters
+- UI-visible list derived reactively from `rawTakes` via `useMemo` for split/class/calibration filters
+- selection validity reconciled when derived list changes
+- explicit loading and empty states added to Takes tab
+
+Result:
+
+- takes list updates immediately and reliably on dataset/session/filter changes
+- no stale memoization path blocks rendering
+- explicit empty state text: `No takes match the current filters.`
+
+### Inspector action hierarchy
+
+Inspector actions now have clear priority and availability rules:
+
+- primary: `Open selected dataset in Studio`
+- secondary: `Inspect pipeline outputs`, `Review segmentation`
+- actions disable when required target context is missing
+- disabled states include inline `title` reason
+
+Metadata snapshot and actions are visually separated.
+
+### Operational density rationale
+
+Density was increased with tighter spacing and stronger interaction anchoring:
+
+- tighter tab/panel spacing
+- compact KPI cards and tables
+- sticky table header retained
+- clearer row hover + selected row styling
+- selection count surfaced in bulk action bar
+
+### Workspace composition refinement
+
+Placeholder tabs (Labels / ML Sets / Splits) were reduced to compact roadmap-style content to avoid empty-card/admin-dashboard feel while preserving future expansion direction.
+
+## Paginated Takes Loading In Datasets (2026-05-31)
+
+The `/datasets` Takes tab now uses paginated summary loading via `GET /api/takes/paged` instead of full take hydration.
+
+### Why paginated summaries
+
+Datasets is a semantic curation workspace and should remain responsive on large datasets. It now loads lightweight `TakeSummary` pages (`limit=50`) and avoids hydrating all takes/details upfront.
+
+### Loading model
+
+- initial request: `limit=50`, `offset=0`
+- server filters passed: `dataset_id`, `session_id`, `validation_status`, `search`, `tag`
+- client state tracks: `pagedTakes`, `offset`, `hasMore`, `isInitialLoading`, `isLoadingMore`
+- reset pagination on dataset/session/search/tag/validation changes
+- append results with explicit `Load more` action
+- client-side filters remain for non-paged params (split, expected class, calibration-only)
+
+### Rendering semantics
+
+- first load uses compact row-height skeleton placeholders
+- first page renders immediately when returned
+- empty result text after load: `No takes match the current filters.`
+- loaded/total state is surfaced (`Showing X of Y takes` where total is available)
+
+### Selection semantics
+
+- selection is reconciled against currently visible/loaded rows
+- selection is reset when base server-filter context changes
+- selection does not persist across non-visible rows
+
+### Separation from Studio detail hydration
+
+Datasets remains summary-first and only fetches take detail for explicitly selected takes/object review. Studio continues to own heavy technical detail and stage-level debugging workflows.
+
+## Compact Thumbnails In Datasets Takes Table (2026-05-31)
+
+The `/datasets` Takes tab now includes a compact thumbnail column for faster semantic scanning of large paginated lists.
+
+### Thumbnail semantics
+
+Each row resolves a lightweight preview using summary metadata only, with this priority order:
+
+1. `take.thumbnail_path` (preferred)
+2. source-like preview asset path (RGB/reflectance/image-like summary asset)
+3. heightmap-like preview asset path
+4. neutral modality-aware placeholder (`RGB`, `HMP`, `PCD`, fallback `TAKE`)
+
+No per-row take detail hydration is performed.
+
+### Paginated thumbnail loading rationale
+
+Thumbnails are loaded only for currently rendered rows in the paginated table and preserve summary-first behavior:
+
+- fixed dimensions to avoid layout shift
+- `loading="lazy"` and async decoding
+- table rows render immediately; images resolve progressively
+
+This keeps `/datasets` responsive for large sets while improving visual review speed.
+
+### Lightweight preview philosophy
+
+Datasets uses small visual evidence for semantic browsing, not full technical inspection:
+
+- compact thumbnail as row anchor
+- take id remains semantic identifier
+- lightweight placeholder when no preview exists
+
+### Relationship with Studio deep inspection
+
+Datasets thumbnails support quick recognition and navigation. Deep artifact/stage debugging remains in Studio/Take detail views. This preserves separation:
+
+- Datasets: semantic browsing/curation
+- Studio: execution/stage-level inspection
+
+## Selected Row And Inspector Thumbnail Sync (2026-05-31)
+
+Refinement to `/datasets` take review UX adds explicit selection semantics and synchronized preview behavior.
+
+### Row selection semantics
+
+- clicking a take row selects that take for semantic review context
+- bulk checkbox selection is preserved and does not trigger row-navigation side effects
+- inspector context updates immediately from selected row state
+
+### Thumbnail interaction semantics
+
+- thumbnail and take-id remain explicit interactive affordances
+- thumbnail hover title: `Open in Studio`
+- pointer affordance remains on explicit interactive elements (thumbnail/link/actions), not on the entire row
+
+### Inspector thumbnail synchronization
+
+Inspector preview now reuses the same resolved preview model used by table rows (same URL/placeholder/modality resolution path), preventing mismatch where row thumbnail exists but inspector shows placeholder.
+
+### Compact modality badge semantics
+
+Each thumbnail may overlay a compact modality badge when summary modalities are available:
+
+- `RGB`
+- `HMP`
+- `PCD`
+- `2.5D`
+
+This is lightweight row-context only and does not trigger extra fetches.
+
+### Performance guarantees
+
+- no per-row take-detail hydration
+- no full artifact list fetch for thumbnails
+- lazy image loading with fixed dimensions
+- paginated summary loading model remains unchanged
+
+## Large-Scale Semantic Curation Expansion (2026-05-31, Phase 3A-3F UX)
+
+### Dataset vs ML Set semantics
+
+The workspace now reinforces explicit ownership separation:
+
+- `Dataset`: operational semantic organization for captured takes and sessions.
+- `ML Set`: curated semantic membership for training/evaluation composition.
+
+Datasets do not collapse into ML Sets, and ML Sets do not own raw take storage.
+
+### Bulk semantic organization philosophy
+
+Takes tab now surfaces high-scale curation actions around row selection:
+
+- move selected takes to dataset/session
+- add/remove selected takes to/from ML set membership (additive membership semantics)
+- split assignment and validation workflows
+- add/remove/replace tag flows
+
+These actions are selection-first and optimized for many-row curation loops.
+
+### Hierarchy navigation rationale
+
+Dataset Explorer now includes a lightweight hierarchy browser (dataset -> sessions) with compact session-level status, while preserving filter controls. This separates navigation context from filtering context for faster scanning.
+
+### Semantic preview drawer semantics
+
+Inspector is expanded from metadata-only panel into semantic review drawer sections:
+
+- preview
+- metadata/context
+- processing summary
+- quick semantic actions
+- future curation architecture placeholders
+
+It remains non-Studio: no stage-debug controls are introduced.
+
+### Saved collection architecture
+
+Saved filters/smart collections are stored locally as reusable semantic views and can re-apply full filter context quickly. This provides a queue-like operational pattern and future bridge to active-learning collections.
+
+### Future active-learning direction
+
+Explicit placeholders were added for:
+
+- uncertainty/disagreement/outlier queues
+- similarity and embedding neighborhood browsing
+- anomaly/disagreement clustering
+- feature-space exploration linkage
+
+These remain additive UX scaffolding and do not merge Feature Analytics or Classifiers workflows.
+
+### Keyboard workflow extensibility
+
+A keyboard command map foundation was introduced behind a disabled flag for future scalable curation shortcuts (`j/k/x/v/r/t/s`).
+
+### Semantic governance philosophy
+
+The `/datasets` direction is summary-first, incremental, and curation-oriented:
+
+- paginated takes
+- no eager per-row detail hydration
+- semantic action density over debugging depth
+- Studio remains execution/debug authority
+
+### Phase 3A action refinements
+
+Additional bulk workflow refinements in Takes:
+
+- inline dataset creation from curation workflow
+- inline session creation from curation workflow
+- explicit future placeholder action for dataset copy semantics (`Copy to dataset (planned)`)
+- expanded validation states are accepted as semantic status values (`golden_sample`, `benchmark_approved`) without changing backend processing contracts
+
+## Phase 4 Semantic Governance Evolution (2026-05-31)
+
+### Temporal filtering semantics
+
+Datasets now supports operational temporal filtering with:
+
+- explicit `From`/`To` date range
+- quick presets (`Today`, `Last 24h`, `Last 7d`, `Last 30d`, `This week`, `This shift` placeholder)
+- pagination reset/reload when temporal filters change
+- saved collections persisting temporal filters and preset state
+
+Date filters are applied in summary-first browsing flow and integrated with paged loading requests.
+
+### Governance queue philosophy
+
+Queue presets are introduced as operational semantic workflows (not only static saved filters), for example:
+
+- unreviewed captures
+- missing labels
+- calibration review
+- benchmark approval
+- failed processing
+
+This establishes a human-in-the-loop curation rhythm and future bridge to active-learning queues.
+
+### Semantic review workflows
+
+The take-review flow now emphasizes high-throughput governance:
+
+- sticky multi-select action bar
+- bulk organization actions (dataset/session/ML-set/split/tag/validation)
+- queue preset activation
+- quick review actions for "next unresolved" / "next unreviewed" / "next missing label"
+
+### Compare-mode semantics
+
+A lightweight semantic compare mode (2–4 selected takes) is available in Takes:
+
+- side-by-side thumbnail and semantic metadata comparison
+- validation/split/processing/object/session/calibration context
+- no stage/debug artifact exploration
+
+### Dataset health rationale
+
+Overview now includes lightweight governance scoring and coverage summaries:
+
+- validation coverage
+- split coverage
+- processing coverage
+- calibration coverage
+- aggregated dataset health percentage (heuristic, intentionally simple)
+
+### ML-set lineage direction
+
+ML Set tab explicitly preserves governance separation and direction:
+
+- datasets own acquisition-semantic organization
+- ML sets own curated membership/composition semantics
+- placeholders for inclusion/exclusion rules, balancing constraints, split ownership, export and classifier compatibility
+
+### Feature Analytics interoperability boundaries
+
+Soft linkage is provided via "Open selection in Feature Analytics" actions while preserving app boundaries:
+
+- Datasets: semantic governance and operational curation
+- Feature Analytics: feature-space understanding and anomaly analysis
+
+No workflow merge is introduced.
+
+### Future object-governance direction
+
+Architecture placeholders maintain future path for object-centric governance without changing take ownership:
+
+- object-level datasets / ML sets / splits / validation (future)
+- current invariant preserved: take remains acquisition container
+
+### Keyboard workflow extensibility
+
+A keyboard command map foundation exists behind a disabled feature flag (`j/k/x/v/r/t/s`) to support future high-throughput review loops without forcing immediate behavior changes.
+
+### Semantic governance architecture evolution
+
+Phase 4 continues the summary-first, paginated, large-scale pattern:
+
+- incremental take loading
+- reactive governance filtering
+- compact visual review controls
+- no eager detail hydration
+- explicit separation across Datasets / Studio / Feature Analytics / Classifiers
+
+## Selection, Count, And Pagination Semantics Refinement (2026-05-31)
+
+### Visible vs filtered selection semantics
+
+Takes selection now uses explicit scope semantics:
+
+- `selectionScope = visible`:
+  - selection applies only to currently loaded/visible rows
+  - `selectedTakeIds` tracks selected loaded ids
+- `selectionScope = filtered`:
+  - selection conceptually represents all takes matching active filters
+  - `excludedTakeIds` tracks loaded rows manually unselected from filtered scope
+  - does not fetch all matching ids eagerly
+
+Controls include:
+
+- `Select visible`
+- `Clear selection`
+- `Select all matching filters`
+
+Selection messaging is scope-aware (`0 selected`, `N visible selected`, `All X filtered takes selected`, `All X filtered takes selected · Y excluded`).
+
+### Filtered count semantics
+
+Takes count display is filter-aware:
+
+- filtered view: `Showing loaded of filtered · total in dataset`
+- unfiltered view: `Showing loaded of total takes`
+
+Explorer header is also filter-aware (`filtered / total`) when filters are active.
+
+### Pagination terminal state
+
+Load more state is explicit and safe:
+
+- loading: `Loading more...`
+- more pages: `Load more`
+- terminal: `All filtered takes loaded`
+
+No active load-more action remains once `hasMore=false`.
+
+### Filter-change selection reset semantics
+
+When filters change, the page resets selection and pagination context:
+
+- clear `selectedTakeIds`
+- clear `excludedTakeIds`
+- reset `selectionScope` to `visible`
+- reload first page
+
+This prevents stale selection scope from leaking across filter contexts.
+
+### Backend requirement for filter-wide bulk actions
+
+Filter-wide bulk mutation is intentionally guarded when backend filter-bulk mutation APIs are unavailable:
+
+- filtered-scope selection can be represented in UI
+- bulk action execution remains disabled/guarded with explicit messaging
+- UI does not silently apply filtered-scope actions only to loaded rows
+
+This preserves safety and prevents false assumptions in large-scale governance workflows.
+
+## Filtered Counts, Selection Scope, And Pagination Semantics (2026-05-31)
+
+### filtered_count vs loaded item count
+
+`/api/takes/paged` now returns authoritative count fields that are independent of the current page size:
+
+- `items`: current page rows only
+- `filtered_count`: total rows matching active filters (across all pages)
+- `total_count`: total rows in selected dataset scope before active filters
+
+The UI no longer infers filtered totals from loaded rows.
+
+### First-page count availability
+
+Counts are available from the first paged response and immediately power:
+
+- filtered/total count labels
+- filtered-scope selection messaging
+- bulk-selection scope text
+
+No full-id hydration or full dataset loading is required.
+
+### Visible vs filtered selection scope
+
+Takes selection is explicit and safe:
+
+- `visible` scope: selected loaded rows only (`selectedTakeIds`)
+- `filtered` scope: all filtered rows conceptually selected; manual unchecks tracked as `excludedTakeIds`
+
+Filter-wide actions are guarded when backend filter-bulk mutation support is unavailable.
+
+### Filter-change reset semantics
+
+When filters change, selection and paging context reset atomically:
+
+- `selectionScope -> visible`
+- clear `selectedTakeIds`
+- clear `excludedTakeIds`
+- reload first page
+
+This avoids stale cross-filter selection ambiguity.
+
+### Terminal pagination state
+
+`has_more` drives terminal state directly:
+
+- active: `Load more`
+- loading: `Loading more...`
+- terminal: `All filtered takes loaded`
+
+No active load-more action remains at terminal state.
+
+### Density/layout refinements
+
+To reduce command-center clutter while preserving throughput:
+
+- compact horizontal tabs with low-height active state
+- queue cards compressed into compact chips/counters
+- primary bulk actions kept visible; secondary actions moved into `More actions`
+- sidebar sections made collapsible (hierarchy / filters / needs attention / saved collections)
+- inspector primary Studio action label is context-aware (selected take vs selected dataset)
+- table row spacing tightened while preserving thumbnail readability
+
+## Overview KPI Authoritative Count Semantics (2026-05-31)
+
+### KPI source of truth
+
+Overview and governance counters in `/datasets` are now sourced from backend paging metadata, not loaded rows:
+
+- `filtered_count`
+- `total_count`
+- `summary_counts`
+
+This prevents KPI drift on large datasets where only the first page is loaded.
+
+### `/api/takes/paged` summary contract
+
+Paged responses now carry governance-safe aggregates:
+
+- `summary_counts.validation.validated`
+- `summary_counts.validation.unreviewed`
+- `summary_counts.validation.rejected`
+- `summary_counts.validation.needs_review`
+- `summary_counts.validation.golden_sample`
+- `summary_counts.validation.benchmark_approved`
+- `summary_counts.missing_labels`
+- `summary_counts.missing_split`
+- `summary_counts.missing_calibration`
+- `summary_counts.processing_failed`
+- `summary_counts.processing_incomplete`
+- `summary_counts.no_objects_detected`
+
+### Overview TAKES semantics
+
+- if filters are active: `TAKES = filtered_count`
+- if no filters are active: `TAKES = total_count`
+
+`pagedTakes.length` is never used as the authoritative governance total.
+
+### Queue and sidebar count semantics
+
+Queue chips and overview KPI cards prefer `summary_counts` when available. Loaded-row fallbacks are only used if backend summary metadata is unavailable.
+
+### Pagination invariants
+
+Loading additional pages appends `items` only; it does not redefine filtered governance totals. Count semantics remain stable until filters change and page zero is requested again.
+
+## Command-Center Density And Toolbar Ergonomics (2026-05-31)
+
+### Compact unified takes toolbar
+
+The Takes workspace now uses one compact horizontal toolbar that combines:
+
+- selection scope/status text
+- count context (`showing X of Y`)
+- selection controls (`Select visible`, `Clear selection`, `Select all matching filters`)
+- primary bulk actions (`Validated`, `Needs review`, `Rejected`, `Add tags`, `Split assignment`)
+- `More` menu for secondary actions
+
+Selection safety semantics are unchanged: visible-vs-filtered scope remains explicit, and filter-wide mutation remains guarded when backend support is unavailable.
+
+### Primary vs secondary bulk actions
+
+Primary actions stay visible for fast repeated review workflows. Secondary actions moved to `More`:
+
+- move/create dataset
+- move/create session
+- add/remove ML set
+- remove/replace tags
+- expected class
+- golden sample / benchmark approved
+- archive / restore
+- copy-to-dataset placeholder
+
+### Queue chip density model
+
+Queue controls were reduced from card-like elements to compact pill chips with inline counts. They remain clickable filter presets and wrap only when needed on narrow viewports.
+
+### Tab/workspace whitespace reduction
+
+Workspace density was tightened so active content starts immediately below tabs:
+
+- smaller command-center outer padding
+- reduced headline bottom spacing
+- tighter center-column and tab-panel gaps
+- compact tab bar/button heights
+
+### Inspector empty-state behavior
+
+When no take is selected, inspector preview text now communicates the intended workflow:
+
+- `Select a take to review metadata, labels, split, preview, and semantic actions.`
+
+Dataset-level Studio action remains available; take-specific actions remain disabled with lower visual emphasis.
+
+### Table action copy refinement
+
+Per-row action label changed from verbose `Inspect pipeline outputs` to compact `Inspect` with tooltip clarifying Studio pipeline-output inspection intent.
+
+## Toolbar Density, Sidebar Overflow, And Modal Bulk Workflows (2026-05-31)
+
+### Compact toolbar container rules
+
+The Takes command toolbar remains a single compact flex row with wrap support and no oversized parent framing:
+
+- removed extra vertical padding/margins from toolbar wrappers
+- no fixed tall container behavior around disabled controls
+- compact button heights with stable inline layout
+- table starts immediately after compact queue + toolbar sections
+
+### Sidebar overflow and long-name handling
+
+Dataset Explorer now prevents horizontal overflow and remains usable with long names:
+
+- `overflow-x: hidden`, `min-width: 0`, `max-width: 100%` on sidebar shell
+- controls constrained to container width
+- hierarchy header title truncates safely with ellipsis
+- session node primary text clamps to two lines and metadata stays compact
+- helper buttons (for example `Hide`) are non-expanding and do not force horizontal scroll
+
+### Modal-based bulk workflows replacing prompt()
+
+Prompt-based bulk organization flows were replaced with selector-driven modals:
+
+- Move to Dataset: dataset selector + optional session selector
+- Move to Session: session selector
+- Add to ML Set: ML set selector + additive-membership note
+- Split assignment: split selector
+- Tag management: mode (`add/remove/replace`) + tag input
+
+All modals show scope-aware summary (`selected` vs `all filtered`) and preserve current selection semantics.
+
+### Selector-based organization semantics
+
+Bulk organization actions now use preloaded selector data where possible:
+
+- datasets from existing datasets state
+- sessions from selected dataset state, with on-demand session load for alternate dataset in modal
+- ML sets from `api.mlDatasets()`
+
+No raw id typing is required for standard workflows.
+
+### Filter-wide guard behavior in modals
+
+When `selectionScope === "filtered"` and backend filter-wide mutation is unsupported:
+
+- modal shows explicit warning: `Filter-wide bulk updates require backend support.`
+- confirm action is disabled
+- visible-selection semantics are unchanged
+
+This keeps large-scale curation safe and explicit.
+
+## Center Workspace Non-Stretch Layout Semantics (2026-06-01)
+
+The `/datasets` 3-column command-center layout now explicitly prevents center-column vertical stretching caused by taller sidebars.
+
+### Grid alignment rule
+
+`datasets-grid` now uses non-stretch cross-axis semantics:
+
+- `align-items: start`
+- `grid-auto-rows: max-content`
+- removed viewport-driven min-height stretching (`min-height: 0`)
+
+This allows left/right panels to be independently tall while center content keeps intrinsic height.
+
+### Center workspace sizing rule
+
+`datasets-center` now opts into content-owned height:
+
+- `align-self: start`
+- `align-content: start`
+- `height: auto`
+- `min-height: 0`
+
+No center fill/stretch behavior is used.
+
+### Tab bar sizing semantics
+
+`datasets-tabs` now explicitly stays compact and non-stretched:
+
+- `align-self: start`
+- `height: auto`
+- compact `min-height` and padding retained
+
+Tab bar width can remain full-width, but height is owned by tab controls only.
+
+### Active-tab-only layout ownership
+
+`datasets-tab-panel` is constrained to content-owned height:
+
+- `align-self: start`
+- `align-content: start`
+- `height: auto`
+
+Because only active tab content is rendered in React, inactive tabs do not reserve vertical space.
+
+## Filter-Wide Bulk Metadata Update Semantics (2026-06-01)
+
+### Bulk operation modes
+
+`/datasets` now supports backend bulk metadata mutation through `POST /api/takes/bulk-metadata` with two targeting modes:
+
+- `mode: "ids"`: explicit visible selection (`take_ids`)
+- `mode: "filter"`: backend-resolved filtered scope (`filters`) with `exclude_take_ids`
+
+This avoids frontend take-id hydration for large filtered sets.
+
+### Filter-wide safety and confirmation
+
+For filter-wide actions, frontend performs a dry-run request first and surfaces authoritative count confirmation:
+
+- dry-run returns `affected_count` before apply
+- modal shows: `This will move N filtered takes.`
+- confirm CTA is count-aware (`Move N takes`)
+- confirm remains disabled while counting or when required fields are missing
+
+### Exclude behavior
+
+When user selects `all filtered` and manually unchecks rows, unchecks are preserved as `exclude_take_ids` and respected server-side in filter mode.
+
+### Current prioritized workflow
+
+Enabled first-class workflow:
+
+- Move to session for visible selection and filter-wide selection
+- Optional inline create-session path in modal
+- Date-range-driven default session naming:
+  - same day: `Session YYYY-MM-DD`
+  - range: `Session YYYY-MM-DD to YYYY-MM-DD`
+
+After success:
+
+- selection is cleared
+- `selectionScope` resets to `visible`
+- sessions/takes are reloaded
+- filtered counts and summary counts refresh via paged reload
+
+### Response contract
+
+Bulk endpoint returns operational result stats:
+
+- `matched_count`
+- `affected_count`
+- `skipped_count`
+- `failed_count`
+- `failed_ids` (sample)
+
+### Governance boundaries preserved
+
+No Studio behavior changes, no full take-detail hydration, and paginated summary-first browsing remains the default interaction model.
+
+## Full Filter-Wide Bulk Support Matrix (2026-06-01)
+
+### Enabled filter-wide actions (backend + UI)
+
+`/datasets` now enables filter-wide execution for all actions currently supported by `POST /api/takes/bulk-metadata`:
+
+- Move to session
+- Move to dataset
+- Add to ML set
+- Remove from ML set
+- Assign split
+- Tag add / remove / replace
+- Validation updates (`valid`, `needs_review`, `invalid`, `golden_sample`, `benchmark_approved`)
+- Set expected class
+
+No supported action remains disabled solely because `selectionScope === "filtered"`.
+
+### Execution modes
+
+Each action executes through the same dual-mode pathway:
+
+- visible selection: `mode="ids"` + `take_ids`
+- filtered selection: `mode="filter"` + active filter object + `exclude_take_ids`
+
+The frontend never loads all matching IDs for filter-wide operations.
+
+### Dry-run and confirmation flow
+
+All bulk modals use dry-run before apply:
+
+- `dry_run: true` call retrieves authoritative `affected_count`
+- modal shows affected-count summary
+- confirm CTA is count-specific (for example `Move 151 takes`, `Assign split to 151 takes`, `Apply tags to 151 takes`)
+
+### Exclude semantics
+
+When user selects all filtered and manually unchecks rows, `exclude_take_ids` is passed to backend in filter mode and must be respected. Operations do not silently re-include excluded rows.
+
+### Action-specific modal semantics
+
+- Move to session: session selector, optional create-session inline fields (name + notes), date-range default naming
+- Move to dataset: dataset/session selectors + placeholders for create dataset/session
+- ML set: action mode (`add`/`remove`) + ML set selector, additive-membership note
+- Split: split selector
+- Tags: mode (`add`/`remove`/`replace`) + tag input
+- Validation: target state selector
+- Expected class: class input
+
+### Post-apply behavior
+
+After successful bulk apply:
+
+- clear selection
+- reset `selectionScope` to `visible`
+- clear exclusions
+- reload paged takes to refresh `filtered_count`, `total_count`, and `summary_counts`
+- refresh sessions when organization operations affect session context
+
+### Guardrails
+
+Unsupported/placeholder workflows (for example copy-to-dataset) remain explicitly disabled and must not silently degrade to visible-only behavior.
+
+## Create-ML-Set From Filtered Selection (2026-06-01)
+
+### Workflow support in Add to ML Set modal
+
+Add-to-ML-Set now supports two paths in the same bulk modal:
+
+- add/remove membership for an existing ML set
+- create a new ML set and immediately add the selected scope membership
+
+Selection scope behavior is preserved for both visible and filtered selection modes.
+
+### Dry-run and affected-count confirmation
+
+Before apply, modal runs dry-run and shows authoritative affected counts. Confirm CTA is count-specific and scope-aware, including create-and-add flow:
+
+- `Create ML Set and add N takes`
+- `Add N takes`
+- `Remove N takes`
+
+Filtered mode always uses backend filter resolution and `exclude_take_ids`; it never degrades to visible-only behavior.
+
+### Dataset-scoped ML set persistence
+
+ML set metadata is stored under dataset-sidecar storage:
+
+- `data/datasets/dataset_<id>/ml_sets/ml_set_<ml_set_id>/ml_set.json`
+- `data/datasets/dataset_<id>/ml_sets/ml_set_<ml_set_id>/memberships.json`
+
+Creation enriches metadata with membership + semantics blocks for governance context:
+
+- membership mode (`ids` or `filter_snapshot`)
+- filter snapshot + excludes for filter-origin memberships
+- semantics source (`manual_bulk_selection`), validation requirements, split-strategy placeholder, notes
+
+### Membership modes and ownership boundary
+
+Dataset vs ML set boundary remains explicit:
+
+- Datasets own acquisition/take organization
+- ML sets store curated membership metadata and membership criteria/snapshots
+- ML sets do not own raw take storage
+
+### API additions
+
+Added dataset-scoped ML set API surface:
+
+- `GET /api/datasets/{dataset_id}/ml-sets`
+- `POST /api/datasets/{dataset_id}/ml-sets`
+- `POST /api/datasets/{dataset_id}/ml-sets/{ml_set_id}/members`
+
+Members endpoint supports `ids` and `filter` modes with `exclude_take_ids`, plus dry-run.
+
+### ML Sets tab visibility
+
+ML Sets tab now lists dataset ML sets with operational summary columns:
+
+- name
+- source dataset
+- member count
+- membership mode
+- created_at
+- readiness placeholder
+
+## Entity Detail Drawer Architecture (Phase: Dataset Session)
+
+- Introduced reusable non-modal right-side `EntityDetailDrawer` as canonical entity management surface in Datasets.
+- First implementation: `DatasetSessionDrawer` with inspect/edit/export/navigation actions while preserving page context.
+- Shared compositional UI primitives:
+  - `EntityDetailDrawer`, `EntitySummaryCards`, `EntityStatisticsGrid`, `EntityMetadataForm`, `EntityExportActions`.
+- Session drawer includes summary KPIs, editable metadata, compact paginated take list, and Studio navigation action.
+
+### Session Export + Summary Contracts
+
+- Added backend endpoints:
+  - `GET /api/dataset-sessions/{session_id}/summary?dataset_id=...`
+  - `GET /api/dataset-sessions/{session_id}/export?dataset_id=...`
+- Export payload is deterministic and stable:
+  - includes `dataset`, `session`, aggregated `summary`, and sorted `takes[]` references.
+- Export remains metadata/reference-first and preserves immutable raw acquisition ownership.
+
+### Ownership Boundary
+
+- Datasets drawer: semantic governance and metadata curation.
+- Studio: processing execution and deep debugging.
+- Integration uses contextual navigation (`Open in Studio filtered to session`) rather than workflow merging.
+
+## Dataset Session Drawer Refinement (Correctness + Density)
+
+- Canonical session aggregation now follows dataset-managed identity (`dataset_id + session_id`) for drawer summary and export.
+- Added invariant: selected-session summary count and exported take count must match.
+- Added deterministic test coverage for summary/export/session-switch consistency (`tests/test_dataset_session_export.py`).
+
+### Entity Drawer Refinement
+
+- Compact default drawer width (~500px), responsive max-width, optional wide mode.
+- Sticky header/footer with independent drawer-body scrolling.
+- Header composition uses compact chips (take count, reviewed %, acquisition type, calibration status).
+
+### Session Drawer UX
+
+- Compact summary cards for governance KPIs; verbose processing diagnostics moved to collapsible details.
+- Editable metadata cleaned with consistent labels/spacing and collapsed advanced JSON metadata.
+- JSON validation gate prevents invalid save payloads.
+- Footer action hierarchy emphasizes Save, keeps Export/Studio as secondary, and de-emphasizes placeholders.
+- Deterministic export filename: `dataset_session_<session_id>_export.json`.
+
+## Human-In-The-Loop ML Set Ingestion Wizard
+
+Added a reusable two-layer architecture:
+
+- Layer A (wizard): parse/reconcile/normalize/group with explicit ambiguity visibility.
+- Layer B (deterministic): canonical manifest -> immutable ML-set artifacts.
+
+### Implemented reusable wizard components
+
+- `MLSetIngestionWizard.tsx`
+- `WizardStepLayout.tsx`
+- `TablePreviewStep.tsx`
+- `SessionReconciliationStep.tsx`
+- `RangeExpansionStep.tsx`
+- `LabelNormalizationStep.tsx`
+- `AmbiguityResolutionStep.tsx`
+- `PhysicalObjectGroupingStep.tsx`
+- `MLPolicyConfigurationStep.tsx`
+- `ManifestGenerationStep.tsx`
+
+### Canonical semantic policies
+
+- Schema id: `mining_balls_labels_v1`.
+- `CALIBRATION_CUBE` remains distinct (`REFERENCE_OBJECT`).
+- `EMPTY_SCENE` remains explicit and task-dependent.
+- Unlabeled/review-required rows are excluded from supervised splits by default and retained for review queues.
+- Splits are generated by `physical_object_id` to prevent leakage.
+
+### Manifest authority
+
+Canonical manifest under `data/ml_ingestion_runs/<run_id>/canonical_manifest/` is the authoritative semantic artifact consumed by deterministic materialization.

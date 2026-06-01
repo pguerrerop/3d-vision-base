@@ -192,6 +192,39 @@ export interface RuntimeQueueStatus {
   active_claims: Array<Record<string, unknown>>;
 }
 
+export interface ReplaySessionState {
+  active: boolean;
+  historical?: boolean;
+  status?: string;
+  dataset_id?: string | null;
+  session_id?: string | null;
+  started_at?: string | null;
+  stopped_at?: string | null;
+  paused_at?: string | null;
+  created_by?: string | null;
+  persisted_on_restart?: boolean | null;
+  persist_on_restart?: boolean | null;
+  auto_start_on_startup?: boolean | null;
+  replay_mode?: string | null;
+  replay_source?: string | null;
+  dataset_exists?: boolean;
+  session_exists?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface RuntimeRoutingState {
+  live_routing: Record<string, unknown> | null;
+  persistent_default: Record<string, unknown> | null;
+  resolved: {
+    routing_mode: string;
+    active_dataset_id?: string | null;
+    active_session_id?: string | null;
+    source: string;
+    ownership_explanation?: string;
+  };
+  replay_override_active: boolean;
+}
+
 export interface SourceInfo {
   id: string;
   label: string;
@@ -357,13 +390,137 @@ export interface TakeSummary {
   validation_status?: string | null;
   expected_class?: string | null;
   expected_diameter_mm?: number | null;
+  physical_object_id?: string | null;
   thumbnail_path?: string | null;
   dataset_id?: string | null;
   dataset_name?: string | null;
   experiment_session_id?: string | null;
   experiment_session_name?: string | null;
+  experiment_session_type?: string | null;
   latest_run_status?: string | null;
+  categories?: string[];
+  reference_type?: string | null;
+  is_reference?: boolean;
+  is_golden_sample?: boolean;
   acquisition_processing_status?: Record<string, unknown> | null;
+}
+
+export interface TakeSummaryPage {
+  items: TakeSummary[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  next_offset?: number | null;
+  total_count?: number;
+  filtered_count?: number;
+  summary_counts?: {
+    validation?: Record<string, number>;
+    missing_labels?: number;
+    missing_split?: number;
+    missing_calibration?: number;
+    processing_failed?: number;
+    processing_incomplete?: number;
+    no_objects_detected?: number;
+  };
+}
+
+export interface TakeBulkFilters {
+  dataset_id?: string;
+  session_id?: string;
+  validation_status?: string;
+  search?: string;
+  tag?: string;
+  created_from?: string;
+  created_to?: string;
+  split?: string;
+  expected_class?: string;
+  calibration_linkage_only?: boolean;
+}
+
+export interface TakeBulkMetadataRequest {
+  mode: "ids" | "filter";
+  action:
+    | "move_to_dataset"
+    | "move_to_session"
+    | "ml_set_add"
+    | "ml_set_remove"
+    | "tag_add"
+    | "tag_remove"
+    | "tag_replace"
+    | "set_validation_status"
+    | "set_split"
+    | "set_expected_class";
+  take_ids?: string[];
+  filters?: TakeBulkFilters;
+  exclude_take_ids?: string[];
+  dataset_id?: string;
+  session_id?: string;
+  tags?: string[];
+  validation_status?: string;
+  split?: string;
+  expected_class?: string;
+  dry_run?: boolean;
+}
+
+export interface TakeBulkMetadataResponse {
+  ok: boolean;
+  mode: "ids" | "filter";
+  action: string;
+  matched_count: number;
+  affected_count: number;
+  skipped_count: number;
+  failed_count: number;
+  failed_ids: string[];
+}
+
+export interface DatasetMlSet {
+  id: string;
+  dataset_id: string;
+  name: string;
+  description?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  notes?: string | null;
+  member_count?: number;
+  membership_mode?: string;
+}
+
+export interface DatasetSessionDetailSummary {
+  total_takes: number;
+  reviewed: number;
+  unreviewed: number;
+  rejected?: number;
+  needs_review?: number;
+  golden_sample?: number;
+  benchmark_approved?: number;
+  missing_labels: number;
+  missing_split?: number;
+  missing_calibration?: number;
+  processing_failed?: number;
+  processing_incomplete?: number;
+  no_objects_detected?: number;
+  split_distribution: Record<string, number>;
+  processing_by_family: Record<string, number>;
+  object_annotation_count: number;
+  object_candidate_count?: number;
+  last_acquisition_timestamp: string | null;
+  calibration_assignment: string | null;
+}
+
+export interface DatasetSessionDetailResponse {
+  dataset: DatasetSummary;
+  session: DatasetSessionSummary;
+  summary: DatasetSessionDetailSummary;
+}
+
+export interface IngestionRun {
+  run_id: string;
+  dataset_id: string;
+  session_ids: string[];
+  name?: string;
+  status: string;
+  created_at?: string;
+  policy?: Record<string, unknown>;
 }
 
 export interface ProcessingResult {
@@ -643,10 +800,153 @@ export interface DatasetSessionSummary {
   sensor_metadata?: Record<string, unknown>;
   conveyor_metadata?: Record<string, unknown>;
   lighting_metadata?: Record<string, unknown>;
+  environment_metadata?: Record<string, unknown>;
+  session_type?: "engineering" | "curated" | "benchmark" | "operational";
+  metadata?: Record<string, unknown>;
   created_at?: string | null;
   tags?: string[];
   notes?: string | null;
   take_count?: number;
+}
+
+export interface FeatureDefinition {
+  feature_key: string;
+  display_name: string;
+  semantic_group: string;
+  unit?: string | null;
+  description?: string | null;
+  source_stage?: string | null;
+  source_metric_path?: string | null;
+}
+
+export interface FeatureAnalyticsFeaturesResponse {
+  record_count: number;
+  object_count: number;
+  feature_definitions: FeatureDefinition[];
+}
+
+export interface FeatureAnalyticsDistributionGroup {
+  group: string;
+  count: number;
+  bins: number[];
+  stats: { min: number; max: number; mean: number; std: number };
+}
+
+export interface FeatureAnalyticsDistributionResponse {
+  feature_key: string;
+  group_by: string;
+  bins: number;
+  mode: "count" | "density";
+  range: { min: number; max: number; edges: number[] } | null;
+  groups: FeatureAnalyticsDistributionGroup[];
+  stats: {
+    count: number;
+    missing: number;
+    missing_pct: number;
+    min: number | null;
+    max: number | null;
+    mean: number | null;
+    std: number | null;
+  };
+}
+
+export interface FeatureAnalyticsObject {
+  take_id: string;
+  object_id: string;
+  dataset_id?: string | null;
+  session_id?: string | null;
+  pipeline_id?: string | null;
+  run_id?: string | null;
+  stage_id?: string | null;
+  superclass?: string | null;
+  labels?: string[];
+  feature_value: number;
+  timestamp?: string | null;
+  annotation?: Record<string, unknown> | null;
+}
+
+export interface FeatureAnalyticsObjectsResponse {
+  feature_key: string;
+  min_value?: number | null;
+  max_value?: number | null;
+  limit: number;
+  objects: FeatureAnalyticsObject[];
+  stats: FeatureAnalyticsDistributionResponse["stats"];
+}
+
+export interface MLDatasetSummary {
+  id: string;
+  name: string;
+  description?: string | null;
+  source_dataset_ids: string[];
+  filters: Record<string, unknown>;
+  label_schema: Record<string, unknown>;
+  object_count?: number;
+  tags?: string[];
+  notes?: string | null;
+}
+
+export interface MLExperimentSummary {
+  id: string;
+  name: string;
+  classifier_type: string;
+  classifier_types?: string[];
+  experiment_mode?: string;
+  feature_set_id: string;
+  dataset_id: string;
+  split_strategy: string;
+  training_config: Record<string, unknown>;
+  status: string;
+  metrics_summary?: Record<string, unknown>;
+  artifact_paths?: Record<string, string>;
+}
+
+export interface MLDeploymentSummary {
+  id: string;
+  model_id: string;
+  target_pipeline_id: string;
+  target_stage_id: string;
+  pipeline_family: string;
+  status: "inactive" | "active" | "superseded" | "rolled_back" | "invalid";
+  activated_at?: string | null;
+  deactivated_at?: string | null;
+  superseded_by?: string | null;
+  rollback_from?: string | null;
+  runtime_validation?: Record<string, unknown>;
+  compatibility_snapshot?: Record<string, unknown>;
+}
+
+export interface MLSmokeSummary {
+  passed: boolean;
+  phases: Array<{ name: string; ok: boolean; detail: string }>;
+  duration_ms?: number | null;
+  fallback_mode?: boolean;
+  failures?: Array<{ name: string; detail: string }>;
+  timestamp?: string;
+}
+
+export interface MLBackendInfo {
+  id: string;
+  backend_name: string;
+  backend_version: string;
+  interpretability_level: string;
+  training_speed: string;
+  inference_speed: string;
+  feature_requirements: Record<string, unknown>;
+  calibration_requirements: Record<string, unknown>;
+  operational_compatibility?: Record<string, unknown>;
+  description?: string;
+  enabled?: boolean;
+}
+
+export interface MLDatasetInsights {
+  dataset_id: string;
+  object_count: number;
+  class_counts: Record<string, number>;
+  session_counts: Record<string, number>;
+  source_dataset_counts: Record<string, number>;
+  validation_counts: Record<string, number>;
+  warnings: string[];
 }
 
 export interface FusionObjectCandidate {
@@ -918,6 +1218,18 @@ export interface RuntimeConfigResponse {
     default_calibration_file: string | null;
     require_calibration_for_demo: boolean;
     allow_auto_plane_without_calibration: boolean;
+    runtime?: {
+      trispector_ftp?: {
+        enabled?: boolean;
+        command?: string;
+        upload_dir?: string;
+        poll_interval_sec?: number;
+        stable_checks?: number;
+        source_id?: string;
+        auth_mode?: string;
+        username?: string | null;
+      };
+    };
   };
   path: string;
   default_calibration_file: string | null;
@@ -1074,6 +1386,10 @@ export function runtimePreviewUrl(cacheKey?: string | number): string {
   return `${API_BASE_URL}/api/runtime/preview${suffix}`;
 }
 
+export function objectThumbnailUrl(takeId: string, objectId: string | number, size = 56): string {
+  return `${API_BASE_URL}/api/takes/${encodeURIComponent(takeId)}/objects/${encodeURIComponent(String(objectId))}/thumbnail?size=${encodeURIComponent(String(size))}`;
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
   state: () => request<RuntimeState>("/api/state"),
@@ -1104,6 +1420,58 @@ export const api = {
     ),
   stopRuntimeWorker: (workerId: string) =>
     post<{ worker_id: string; stop_requested: boolean }>(`/api/runtime/workers/${encodeURIComponent(workerId)}/stop-request`, {}),
+  activeReplaySession: () =>
+    request<{ active_session: ReplaySessionState | null }>("/api/acquisition/replay/active-session"),
+  startReplaySession: (payload: { dataset_id: string; session_id: string; metadata?: Record<string, unknown> }) =>
+    post<ReplaySessionState>("/api/acquisition/replay/sessions/start", payload),
+  stopReplaySession: () =>
+    post<{ stopped_session: ReplaySessionState | null }>("/api/acquisition/replay/sessions/stop", {}),
+  runtimeReplayStart: (payload: {
+    dataset_id: string;
+    session_id: string;
+    metadata?: Record<string, unknown>;
+    persist_on_restart?: boolean;
+    replay_mode?: string;
+    auto_start_on_startup?: boolean;
+    replay_source?: string;
+  }) => post<ReplaySessionState>("/api/runtime/replay/start", payload),
+  runtimeReplayStop: () => post<{ stopped_session: ReplaySessionState | null }>("/api/runtime/replay/stop", {}),
+  runtimeReplayPause: () => post<{ paused_session: ReplaySessionState | null }>("/api/runtime/replay/pause", {}),
+  runtimeReplayClear: () => post<{ cleared: boolean }>("/api/runtime/replay/clear", {}),
+  updateRuntimeReplayConfig: (payload: {
+    dataset_id?: string;
+    session_id?: string;
+    persist_on_restart?: boolean;
+    auto_start_on_startup?: boolean;
+    replay_mode?: string;
+    replay_source?: string;
+    metadata?: Record<string, unknown>;
+  }) => put<{ session: ReplaySessionState }>("/api/runtime/replay/config", payload),
+  runtimeRouting: () => request<RuntimeRoutingState>("/api/runtime/routing"),
+  updateRuntimeRouting: (payload: {
+    dataset_id: string;
+    session_id: string;
+    routing_mode?: string;
+    source?: string;
+    updated_by?: string;
+  }) => put<{ live_routing: Record<string, unknown> }>("/api/runtime/routing", payload),
+  activateRuntimeRouting: (payload: {
+    dataset_id: string;
+    session_id: string;
+    routing_mode?: string;
+    source?: string;
+    updated_by?: string;
+  }) => post<{ live_routing: Record<string, unknown> }>("/api/runtime/routing/activate", payload),
+  clearRuntimeRouting: () => post<{ cleared: boolean }>("/api/runtime/routing/clear", {}),
+  runtimeDefaultDestination: () => request<{ default_destination: Record<string, unknown> | null }>("/api/runtime/default-destination"),
+  updateRuntimeDefaultDestination: (payload: {
+    default_dataset_id: string;
+    default_session_id: string;
+    auto_create_session?: boolean;
+    session_naming_policy?: string;
+    updated_by?: string;
+  }) => put<{ default_destination: Record<string, unknown> }>("/api/runtime/default-destination", payload),
+  clearRuntimeDefaultDestination: () => del<{ cleared: boolean }>("/api/runtime/default-destination"),
   sources: () => request<SourceInfo[]>("/api/sources"),
   sourceControls: (sourceId: string) => request<SourceControlsResponse>(`/api/sources/${encodeURIComponent(sourceId)}/controls`),
   updateSourceControls: (sourceId: string, payload: { controls: Record<string, { value?: number | null; auto?: boolean | null }> }) =>
@@ -1125,12 +1493,56 @@ export const api = {
   setDefaultCalibration: (path: string) => post<RuntimeConfigResponse>("/api/runtime-config/default-calibration", { path }),
   clearDefaultCalibration: () => del<RuntimeConfigResponse>("/api/runtime-config/default-calibration"),
   takes: (sessionId?: string) => request<TakeSummary[]>(`/api/takes${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ""}`),
-  filteredTakes: (params: { session_id?: string; dataset_id?: string; validation_status?: string; tag?: string; semantic_label?: string; superclass_label?: string; search?: string; show_archived?: boolean }) => {
+  filteredTakes: (params: {
+    session_id?: string;
+    dataset_id?: string;
+    validation_status?: string;
+    tag?: string;
+    semantic_label?: string;
+    superclass_label?: string;
+    physical_object_id?: string;
+    expected_class?: string;
+    split?: string;
+    calibration_linkage_only?: boolean;
+    search?: string;
+    show_archived?: boolean;
+    session_type?: string;
+    category?: string;
+    reference_type?: string;
+    is_reference?: boolean;
+    is_golden_sample?: boolean;
+  }) => {
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
       if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
     });
     return request<TakeSummary[]>(`/api/takes${qs.toString() ? `?${qs.toString()}` : ""}`);
+  },
+  pagedTakes: (params: {
+    limit?: number;
+    offset?: number;
+    session_id?: string;
+    dataset_id?: string;
+    validation_status?: string;
+    tag?: string;
+    semantic_label?: string;
+    superclass_label?: string;
+    physical_object_id?: string;
+    search?: string;
+    created_from?: string;
+    created_to?: string;
+    show_archived?: boolean;
+    session_type?: string;
+    category?: string;
+    reference_type?: string;
+    is_reference?: boolean;
+    is_golden_sample?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<TakeSummaryPage>(`/api/takes/paged${qs.toString() ? `?${qs.toString()}` : ""}`);
   },
   latest: () => request<TakeSummary | null>("/api/takes/latest"),
   sessions: () => request<SessionSummary[]>("/api/sessions"),
@@ -1138,8 +1550,139 @@ export const api = {
   createDataset: (payload: { name: string; notes?: string | null }) =>
     post<DatasetSummary>("/api/datasets", payload),
   datasetSessions: (datasetId: string) => request<DatasetSessionSummary[]>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions`),
+  featureAnalyticsFeatures: (params: {
+    datasets?: string;
+    sessions?: string;
+    labels?: string;
+    superclass?: string;
+    validation_status?: string;
+    split?: string;
+    pipeline?: string;
+    calibration?: string;
+    date_from?: string;
+    date_to?: string;
+    feature_selection?: string;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<FeatureAnalyticsFeaturesResponse>(`/api/feature-analytics/features${qs.toString() ? `?${qs.toString()}` : ""}`);
+  },
+  featureAnalyticsDistributions: (params: {
+    feature_key: string;
+    group_by?: "superclass" | "label";
+    bins?: number;
+    mode?: "count" | "density";
+    datasets?: string;
+    sessions?: string;
+    labels?: string;
+    superclass?: string;
+    validation_status?: string;
+    split?: string;
+    pipeline?: string;
+    calibration?: string;
+    date_from?: string;
+    date_to?: string;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<FeatureAnalyticsDistributionResponse>(`/api/feature-analytics/distributions?${qs.toString()}`);
+  },
+  featureAnalyticsObjects: (params: {
+    feature_key: string;
+    min_value?: number;
+    max_value?: number;
+    limit?: number;
+    datasets?: string;
+    sessions?: string;
+    labels?: string;
+    superclass?: string;
+    validation_status?: string;
+    split?: string;
+    pipeline?: string;
+    calibration?: string;
+    date_from?: string;
+    date_to?: string;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<FeatureAnalyticsObjectsResponse>(`/api/feature-analytics/objects?${qs.toString()}`);
+  },
   createDatasetSession: (datasetId: string, payload: { name: string; notes?: string | null }) =>
     post<DatasetSessionSummary>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions`, payload),
+  updateDatasetSession: (datasetId: string, sessionId: string, payload: Record<string, unknown>) =>
+    put<DatasetSessionSummary>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions/${encodeURIComponent(sessionId)}`, payload),
+  mlDatasets: () => request<MLDatasetSummary[]>("/api/ml/datasets"),
+  createMlDataset: (payload: MLDatasetSummary) => post<MLDatasetSummary>("/api/ml/datasets", payload),
+  mlExperiments: () => request<MLExperimentSummary[]>("/api/ml/experiments"),
+  mlBackends: () => request<MLBackendInfo[]>("/api/ml/backends"),
+  runMlExperiment: (payload: Omit<MLExperimentSummary, "status" | "metrics_summary" | "artifact_paths">) =>
+    post<MLExperimentSummary>("/api/ml/experiments", payload),
+  mlModels: () => request<Array<Record<string, unknown>>>("/api/ml/models"),
+  promoteMlModel: (modelId: string, notes?: string | null) =>
+    post<Record<string, unknown>>(`/api/ml/models/${encodeURIComponent(modelId)}/promote`, { notes: notes ?? null }),
+  evaluateMl: (payload: Omit<MLExperimentSummary, "status" | "metrics_summary" | "artifact_paths">) =>
+    post<MLExperimentSummary>("/api/ml/evaluate", payload),
+  mlDeployments: () => request<MLDeploymentSummary[]>("/api/ml/deployments"),
+  mlActiveDeployments: () => request<MLDeploymentSummary[]>("/api/ml/deployments/active"),
+  createMlDeployment: (payload: {
+    id: string;
+    model_id: string;
+    target_pipeline_id: string;
+    target_stage_id: string;
+    pipeline_family?: string;
+    deployed_by?: string;
+    notes?: string | null;
+  }) => post<MLDeploymentSummary>("/api/ml/deployments", payload),
+  activateMlDeployment: (deploymentId: string) =>
+    post<MLDeploymentSummary>(`/api/ml/deployments/${encodeURIComponent(deploymentId)}/activate`, {}),
+  deactivateMlDeployment: (deploymentId: string) =>
+    post<MLDeploymentSummary>(`/api/ml/deployments/${encodeURIComponent(deploymentId)}/deactivate`, {}),
+  rollbackMlDeployment: (deploymentId: string) =>
+    post<MLDeploymentSummary>(`/api/ml/deployments/${encodeURIComponent(deploymentId)}/rollback`, {}),
+  runMlSmokeTest: (payload?: { force_invalid_model?: boolean; ci_mode?: boolean }) =>
+    post<{ ok: boolean; returncode: number; stdout: string; stderr: string; result?: MLSmokeSummary | null }>("/api/ml/smoke-test/run", payload ?? {}),
+  mlSmokeLatest: () => request<MLSmokeSummary>("/api/ml/smoke-test/latest"),
+  mlSmokeHistory: () => request<{ items: MLSmokeSummary[] }>("/api/ml/smoke-test/history"),
+  mlRuntimeHealth: () => request<{
+    runtime_stats: Record<string, unknown>;
+    totals: {
+      inference_count: number;
+      fallback_rate: number;
+      heuristic_usage_rate: number;
+      incompatible_deployment_count: number;
+      average_inference_time_ms: number;
+    };
+    latest_smoke_test: MLSmokeSummary | null;
+  }>("/api/ml/runtime-health"),
+  mlRuntimeHealthHistory: (days = 14) => request<{ items: Array<{ day: string; stats: Record<string, unknown> }> }>(`/api/ml/runtime-health/history?days=${encodeURIComponent(String(days))}`),
+  mlDatasetInsights: (datasetId: string) => request<MLDatasetInsights>(`/api/ml/datasets/${encodeURIComponent(datasetId)}/insights`),
+  mlLabelsPreview: (datasetId: string, limit = 200) => request<{ dataset_id: string; count: number; items: Array<Record<string, unknown>> }>(`/api/ml/datasets/${encodeURIComponent(datasetId)}/labels-preview?limit=${encodeURIComponent(String(limit))}`),
+  mlFeaturesPreview: (datasetId: string, limit = 200) => request<{
+    dataset_id: string;
+    count: number;
+    schema: Record<string, unknown>;
+    diagnostics: Record<string, unknown>;
+    rows: Array<Record<string, unknown>>;
+  }>(`/api/ml/datasets/${encodeURIComponent(datasetId)}/features-preview?limit=${encodeURIComponent(String(limit))}`),
+  mlSplitPreview: (datasetId: string, strategy = "by_session", seed = 42) =>
+    request<{ dataset_id: string; strategy: string; seed: number; split_manifest: Record<string, unknown>; leakage_report: Record<string, unknown>; confidence_level: string }>(
+      `/api/ml/datasets/${encodeURIComponent(datasetId)}/split-preview?strategy=${encodeURIComponent(strategy)}&seed=${encodeURIComponent(String(seed))}`
+    ),
+  mlExperimentLogs: (experimentId: string) => request<{ experiment_id: string; logs: Array<{ file: string; line_count: number; tail: string[] }> }>(`/api/ml/experiments/${encodeURIComponent(experimentId)}/logs`),
+  mlEvaluationPreview: (experimentId: string) => request<{
+    experiment_id: string;
+    artifacts: Record<string, string | null>;
+    summary: Record<string, unknown>;
+    failed_examples: Array<Record<string, unknown>>;
+    confusion_matrix_csv: string;
+    per_class_metrics_csv: string;
+  }>(`/api/ml/experiments/${encodeURIComponent(experimentId)}/evaluation-preview`),
   captureTake: (payload: {
     dataset_id: string;
     dataset_session_id: string;
@@ -1151,9 +1694,48 @@ export const api = {
     camera_index?: number;
   }) => post<{ ok: boolean; take_id: string; take?: TakeDetail | null }>("/api/takes/capture", payload),
   sessionSummary: (sessionId: string) => request<SessionSummary>(`/api/sessions/${encodeURIComponent(sessionId)}/summary`),
+  datasetSessionSummary: (sessionId: string, datasetId?: string) =>
+    request<DatasetSessionDetailResponse>(`/api/dataset-sessions/${encodeURIComponent(sessionId)}/summary${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  createMlIngestionRun: (payload: { dataset_id: string; session_ids: string[]; name?: string }) =>
+    post<IngestionRun>("/api/ml-ingestion/runs", payload),
+  getMlIngestionRun: (runId: string) => request<IngestionRun>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}`),
+  ingestMlOperatorTable: (runId: string, payload: { content: string; input_format: string }) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/table`, payload),
+  reconcileMlIngestionRun: (runId: string) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/reconcile`, {}),
+  updateMlIngestionPolicy: (runId: string, policy: Record<string, unknown>) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/policy`, { policy }),
+  generateMlIngestionManifest: (runId: string) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/manifest`, {}),
+  materializeMlIngestionRun: (runId: string, mlSetId: string) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/materialize`, { ml_set_id: mlSetId }),
+  applyMlIngestionMetadata: (runId: string) =>
+    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/apply-metadata`, {}),
   take: (takeId: string) => request<TakeDetail>(`/api/takes/${encodeURIComponent(takeId)}`),
   updateTakeMetadata: (takeId: string, payload: Record<string, unknown>) =>
     put<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/metadata`, payload),
+  bulkUpdateTakeMetadata: (payload: TakeBulkMetadataRequest) =>
+    post<TakeBulkMetadataResponse>("/api/takes/bulk-metadata", payload),
+  datasetMlSets: (datasetId: string) => request<DatasetMlSet[]>(`/api/datasets/${encodeURIComponent(datasetId)}/ml-sets`),
+  createDatasetMlSet: (datasetId: string, payload: {
+    id?: string;
+    name: string;
+    description?: string;
+    notes?: string;
+    split_strategy?: string;
+    validation_requirements?: string[];
+  }) => post<DatasetMlSet>(`/api/datasets/${encodeURIComponent(datasetId)}/ml-sets`, payload),
+  updateDatasetMlSetMembers: (datasetId: string, mlSetId: string, payload: {
+    mode: "ids" | "filter";
+    action: "add" | "remove";
+    take_ids?: string[];
+    filters?: TakeBulkFilters;
+    exclude_take_ids?: string[];
+    dry_run?: boolean;
+  }) => post<{ ok: boolean; matched_count: number; affected_count: number; skipped_count: number; failed_count: number; failed_ids: string[] }>(
+    `/api/datasets/${encodeURIComponent(datasetId)}/ml-sets/${encodeURIComponent(mlSetId)}/members`,
+    payload
+  ),
   removeTakeFromDataset: (takeId: string) => post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/remove-from-dataset`, {}),
   archiveTake: (takeId: string, reason?: string | null) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/archive`, { reason: reason ?? null }),

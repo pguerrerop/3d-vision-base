@@ -258,6 +258,50 @@ Execution buttons use canonical selected pipeline compatibility.
 For the selected `Threshold + morphology` stage, Studio now resolves stage-native views from segmentation artifacts:
 
 - `Threshold mask`
+
+## Sidebar simplification (operational-first)
+
+Studio sidebar is intentionally reduced to operational navigation:
+
+- dataset selector
+- session selector
+- search
+- compact operational filters (`modality`, processing status, archived toggle)
+- compact thumbnail take list with lightweight processing status chips
+
+Removed from Studio sidebar (moved to Datasets ownership):
+
+- category/validation/object-id semantic filters
+- reference/golden curation toggles
+- labeling-heavy and bulk semantic editing controls
+- dataset/session curation actions
+
+Design intent:
+
+- reduce persistent left-rail density
+- recover horizontal width for the center engineering workspace
+- make stage debugging and reruns the primary visual focus
+
+## Final lightweight refinement pass
+
+The final pass keeps behavior unchanged while reducing cognitive load:
+
+- batch actions are present but collapsed/de-emphasized (`Batch` disclosure)
+- session labels are explicit and non-ambiguous:
+  - `Dataset session`
+  - `Acquisition session`
+- capture is secondary via collapsed treatment and lightweight affordance
+- selected-take context is compact orientation (not a secondary inspector)
+- Datasets handoff copy is concise and low-weight
+
+Navigation hierarchy in Studio sidebar is now:
+
+1. scope selectors (dataset/session)
+2. lightweight search + operational filters
+3. take browsing/selection
+4. optional batch/capture disclosures
+
+This preserves stage-centric engineering flow and avoids reintroducing semantic-curation controls.
 - `Cleaned mask`
 - `Overlay`
 - `Morphology params`
@@ -598,3 +642,51 @@ The Measurement stage prioritizes object inspection and validation over dashboar
 - `HeightLegend` draws its gradient from the active LUT (`turbo`/`viridis`/`magma`/`gray`); no hard-coded gradients.
 - Direction is data-native; `direction` only changes label/tick orientation.
 - Hover/debug reconstruction uses the same LUT as the renderer so scalar↔RGB diffs remain consistent across colormap choices.
+
+## Dataset curation UX status (additive)
+
+Studio sidebar now includes curation-aware filtering and marking while preserving existing processing flows:
+
+- filter fields: `dataset`, `session`, `session_type`, `tags`, `friendly_name/search`, `validation_status`, `reference/golden`
+- take-card semantics: friendly name first, immutable `take_id` second (debug/provenance)
+- compact curation chips for category tagging and quick reference marking (`empty belt`, `calibration ref`, `known object`, `golden`)
+
+This remains metadata-only and does not modify raw takes, run artifacts, or pipeline contracts.
+
+## Acquisition-centric rendering semantics (refinement)
+
+Processing Lab browsing now defaults to acquisition-centric semantics while preserving stage-centric engineering workflows:
+
+- persistent compact curation context
+- selected-take-first context resolution (dataset/session/type/categories/reference/golden from selected take metadata/summary)
+- filter state rendered separately as secondary “filters currently applied” browse semantics
+- selected-context linkage polish (active take chip + mini preview) for stronger visual continuity with the active workspace take
+- full-frame browse thumbnails (`contain`, aspect-ratio preserving, no aggressive crop)
+- take-card hierarchy: friendly name + semantic chips first; classification metadata second
+- semantic chips unify session-type and reference/golden/category visibility with low-clutter scanability
+
+Classification-centric rendering remains intact for runtime/operations and stage diagnostics, while runtime thumbnails also preserve full-frame acquisition geometry for readability.
+Runtime card balance is refined with larger previews and reduced watermark dominance to improve scanability without removing class/status emphasis.
+
+## Summary-first Studio loading
+
+Studio uses a split loading model:
+
+- paginated summary listing via `/api/takes/paged` for sidebar speed
+- selected-take detail loaded independently
+- heavy artifacts/results hydrated only for selected take context
+
+Pagination uses `limit`/`offset` plus `has_more`/`next_offset` and preserves existing filter semantics.
+
+Runtime cards use an intentional 3-column composition:
+
+- acquisition/status metadata
+- classification summary
+- full-frame preview (`contain`)
+
+Acquisition identity remains stable across reruns via dataset/session/friendly-name/semantic metadata, while immutable `take_id` and many-runs-per-take contracts are unchanged.
+
+## Dataset Drawer -> Studio Context Bridge
+
+- Dataset Session drawer adds a context-preserving launch action to Studio filtered by dataset/session.
+- Studio processing status ownership remains unchanged; no runtime/processing controls were moved into Datasets.

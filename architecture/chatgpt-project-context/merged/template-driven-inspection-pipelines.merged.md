@@ -93,3 +93,11 @@ Extensibility direction:
 ## Note on merged docs generation
 
 No merged-doc generation script was found in repository scripts; merged context was updated manually.
+
+## Mining Balls Ingestion Flow (Refined)
+
+Mining balls ML-set generation now uses a reusable ingestion wizard for semantic reconciliation prior to deterministic generation.
+
+- Human review remains explicit for unresolved/ambiguous rows.
+- Canonical manifest becomes the cross-workflow semantic contract.
+- Deterministic artifact generation remains reproducible and immutable-reference based.

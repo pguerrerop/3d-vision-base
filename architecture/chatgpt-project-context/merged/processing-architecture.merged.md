@@ -129,6 +129,39 @@ This preserves backend contracts while preparing for future DAG pipelines:
 
 Future branching stages can map into the same model by exposing upstream/downstream edges while keeping the `selected stage -> stage workspace` contract unchanged.
 
+## Acquisition-centric vs classification-centric rendering intent
+
+Studio now applies context-specific rendering semantics without introducing separate apps or pipeline forks:
+
+- acquisition-centric for take browsing/curation (full-frame previews, session/take semantic chips, dataset/session context prominence)
+- classification-centric for runtime/stage QA overlays and diagnostics
+
+The change is visual/semantic only and preserves:
+
+- stage-first navigation
+- artifact-first contracts
+- immutable take identity
+- many-runs-per-take processing model
+
+Context semantics are explicit:
+
+- selected context resolves from selected take metadata/summary
+- filter state remains separate browsing intent
+
+This avoids semantic confusion between “what I am inspecting” and “what list constraints are active.”
+
+Visual hierarchy refinements remain non-architectural:
+
+- control weighting: acquisition identity -> pipeline -> stage -> actions
+- runtime card density tuning: larger full-frame previews with preserved operational class/status emphasis
+- inspector compaction: reduced whitespace, unchanged diagnostic content
+
+Performance boundary is explicit:
+
+- sidebar list loading is summary-only and paginated
+- selected detail loading remains independent and lazy
+- stage/artifact hydration stays selected-take scoped
+
 ## Stage capability registry and renderer abstraction
 
 Frontend now uses explicit semantic configuration for stage visualization:
@@ -1263,3 +1296,59 @@ Sensor Studio now supports a renderer-driven `Operator` vs `Engineering` mode wi
 ## Compatibility Direction
 
 The model stays compatible with future `RGB + 25D` fusion, point-cloud viewers, multimodal overlays, ML classifiers, and live runtime monitoring because contracts remain artifact-first and stage-scoped.
+
+## Studio vs Datasets UX composition boundary
+
+This architecture now treats Studio and Datasets as complementary workspaces:
+
+- Studio = engineering lab for acquisition-linked processing, stage diagnostics, overlays, compatibility checks, and reruns.
+- Datasets = semantic curation and ML preparation layer for labeling, review/validation, object annotations, split management, and dataset composition.
+
+UX composition rule:
+
+- keep Studio left rail operational and compact
+- move semantic curation/admin controls to Datasets
+- preserve existing pipeline/run/stage contracts and processing backends
+
+Refinement rule (lightweight UX pass):
+
+- batch/admin actions in Studio are discoverable but visually de-emphasized
+- orientation cards are compact and non-duplicative
+- selector naming must distinguish acquisition navigation from semantic curation scopes
+
+This is a composition refinement only. No processing contracts, run artifacts, or routing/back-end architecture are changed.
+
+## Dataset Session Export Service
+
+- Added compositional API service `DatasetSessionExportService` for deterministic session summary/export generation.
+- New endpoints:
+  - `GET /api/dataset-sessions/{session_id}/summary`
+  - `GET /api/dataset-sessions/{session_id}/export`
+- Service reuses existing take summary/detail + DatasetService metadata; it avoids coupling export DTOs to frontend-specific views.
+- Export emphasizes metadata/references to maintain immutable acquisition and future import compatibility.
+
+## ML Ingestion Wizard Backend Architecture
+
+Added compositional backend modules and endpoints for ingestion runs.
+
+### Core modules
+
+- `ingestion_wizard.py`
+- `label_manifest_builder.py`
+- `take_reference_resolver.py`
+- `range_expansion.py`
+- `label_normalization.py`
+- `object_grouping.py`
+- `ml_set_materializer.py`
+
+### API endpoints
+
+- create/get ingestion run
+- table ingestion
+- reconciliation
+- policy update
+- canonical manifest generation
+- deterministic materialization
+- optional metadata application
+
+This architecture preserves immutable acquisition semantics and keeps ingestion UX decoupled from runtime/training execution concerns.

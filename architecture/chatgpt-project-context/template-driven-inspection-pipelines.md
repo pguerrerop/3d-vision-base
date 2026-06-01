@@ -191,3 +191,13 @@ Future extensibility strategy:
 3. add promotion gates and recipe approval checks
 4. add regression compare across recipe versions
 5. extend to synchronized 2D/3D/hybrid templates
+
+## Mining Balls Roadmap: Wizard-First Semantic Reconciliation
+
+Mining balls ML-set roadmap now follows a wizard-first workflow:
+
+1. Human-in-the-loop reconciliation of operator tables.
+2. Canonical manifest generation with explicit ambiguity diagnostics.
+3. Deterministic immutable ML-set artifact materialization.
+
+This keeps template-driven inspection pipelines decoupled from ingestion UX while improving semantic traceability, reproducibility, and future active-learning readiness.
