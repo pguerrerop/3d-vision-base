@@ -3,8 +3,11 @@ import DebugPage from "./pages/DebugPage";
 import TakeDetailPage from "./pages/TakeDetailPage";
 import CalibrationPage from "./pages/CalibrationPage";
 import ProcessingLabPage from "./pages/ProcessingLabPage";
+import DatasetsPage from "./pages/DatasetsPage";
+import ClassifiersPage from "./pages/ClassifiersPage";
 import RuntimePage from "./pages/RuntimePage";
 import SuperclassHistogramPage from "./pages/SuperclassHistogramPage";
+import FeatureAnalyticsPage from "./pages/FeatureAnalyticsPage";
 import AppHeader from "./components/AppHeader";
 import { productAreaForPath } from "./productNavigation";
 
@@ -14,6 +17,9 @@ type Route =
   | { name: "runtime" }
   | { name: "calibration" }
   | { name: "studio" }
+  | { name: "datasets" }
+  | { name: "classifiers" }
+  | { name: "feature_analytics" }
   | { name: "superclass_histograms" }
   | { name: "take"; takeId: string };
 
@@ -33,6 +39,9 @@ export default function App() {
       <AppHeader active={route.name} />
       {route.name === "calibration" && <CalibrationPage />}
       {route.name === "studio" && <ProcessingLabPage />}
+      {route.name === "datasets" && <DatasetsPage />}
+      {route.name === "classifiers" && <ClassifiersPage />}
+      {route.name === "feature_analytics" && <FeatureAnalyticsPage />}
       {route.name === "superclass_histograms" && <SuperclassHistogramPage />}
       {route.name === "runtime" && <RuntimePage />}
       {route.name === "diagnostics" && <DebugPage />}

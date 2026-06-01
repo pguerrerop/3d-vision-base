@@ -72,6 +72,15 @@ def test_25d_pipeline_plane_normalization_segmentation_measurement(tmp_path: Pat
         assert "max_height_mm" in heights
         assert "mean_height_mm" in heights
         assert "p95_height_mm" in heights
+        assert isinstance(obj.get("footprint_geometry"), dict)
+        assert isinstance(obj.get("surface_geometry"), dict)
+        assert isinstance(obj.get("sphere_consistency"), dict)
+        assert isinstance(obj.get("damage_metrics"), dict)
+        assert "circularity" in (obj.get("footprint_geometry") or {})
+        assert "radial_cv" in (obj.get("footprint_geometry") or {})
+        assert "sphere_fit_rmse_mm" in (obj.get("surface_geometry") or {})
+        assert "radial_height_rmse_mm" in (obj.get("sphere_consistency") or {})
+        assert "flat_region_ratio" in (obj.get("damage_metrics") or {})
         assert isinstance(obj.get("superclass"), str)
         assert isinstance(obj.get("label"), str)
     object_candidates = payload.get("object_candidates")
@@ -91,6 +100,8 @@ def test_25d_result_payload_contains_expected_fields(tmp_path: Path) -> None:
     assert files.get("heightmap_npz")
     assert files.get("normalized_heightmap")
     assert files.get("overlay")
+    assert files.get("feature_runtime_summary") == "feature_runtime_summary.json"
+    assert files.get("feature_studio_summary") == "feature_studio_summary.json"
 
     summary = payload.get("summary") or {}
     classification = payload.get("classification") or {}
@@ -99,8 +110,83 @@ def test_25d_result_payload_contains_expected_fields(tmp_path: Path) -> None:
     assert isinstance(summary.get("label"), str)
     assert isinstance(classification.get("superclass"), str)
     assert isinstance(classification.get("label"), str)
-    assert payload.get("processing_pipeline", {}).get("pipeline_family") == "25d"
+    pipeline_info = payload.get("processing_pipeline", {}) or {}
+    pipeline_family = pipeline_info.get("pipeline_family")
+    if pipeline_family is not None:
+        assert pipeline_family == "25d"
+    else:
+        assert str(pipeline_info.get("id") or "").endswith("_25d")
     assert isinstance(payload.get("object_candidates"), list)
+
+    objects = payload.get("objects") or []
+    if objects:
+        first = objects[0]
+        assert isinstance(first.get("feature_group_summaries"), list)
+        assert isinstance(first.get("feature_warnings"), list)
+        assert isinstance(first.get("feature_readiness"), dict)
+
+
+def test_25d_diagnostics_artifacts_are_generated_additively(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    payload = run_ball_inspection_25d_flow(data_dir, take_id=take_id).result_payload
+    artifacts = payload.get("artifacts") or []
+    by_id = {item.get("artifact_id"): item for item in artifacts if isinstance(item, dict)}
+
+    for artifact_id in ["measurement_diagnostics", "feature_vector", "feature_provenance", "quality_flags", "contour", "convex_hull", "fitted_ellipse", "principal_axes", "radial_profile"]:
+        assert artifact_id in by_id
+        assert by_id[artifact_id].get("stage_id") == "measurement_diagnostics"
+        assert by_id[artifact_id].get("kind") == "json"
+
+    processed_dir = data_dir / "processed" / take_id
+    feature_vector = json.loads((processed_dir / "feature_vector.json").read_text(encoding="utf-8"))
+    provenance = json.loads((processed_dir / "feature_provenance.json").read_text(encoding="utf-8"))
+    quality_flags = json.loads((processed_dir / "quality_flags.json").read_text(encoding="utf-8"))
+    assert isinstance(feature_vector.get("features"), dict)
+    assert "valid_pixel_ratio" in feature_vector["features"]
+    assert isinstance(provenance.get("equivalent_diameter_mm"), dict)
+    assert "source_stage" in provenance["equivalent_diameter_mm"]
+    assert isinstance(quality_flags.get("flags"), list)
+
+
+def test_25d_classification_provenance_defaults_present(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    payload = run_ball_inspection_25d_flow(data_dir, take_id=take_id).result_payload
+    cls = payload.get("classification") or {}
+    assert cls.get("classifier_engine") == "mining_steel_ball_classification_25d"
+    assert cls.get("rule_set_id") == "builtin_default"
+    assert cls.get("rule_set_source") == "builtin_default"
+    objects = cls.get("objects") or []
+    if objects:
+        assert "rule_path" in objects[0]
+
+
+def test_25d_classification_can_use_external_rule_set(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    cfg_dir = tmp_path / "configs" / "classifiers"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = cfg_dir / "demo_rules.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "classifier_id": "mining_steel_ball_classification_25d_rules",
+                "version": "demo_v1",
+                "params": {"good_min_sphericity": 0.7},
+            }
+        ),
+        encoding="utf-8",
+    )
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    payload = run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={"classify_25d": {"classifier_rules_path": str(cfg_path)}},
+    ).result_payload
+    cls = payload.get("classification") or {}
+    assert cls.get("rule_set_id") == "demo_rules"
+    assert cls.get("rule_set_version") == "demo_v1"
+    assert cls.get("rule_set_source") == "runtime_override"
 
 
 def test_reference_surface_roi_does_not_crop_segmentation_or_normalization(tmp_path: Path) -> None:
@@ -227,6 +313,10 @@ def test_classification_explanation_artifact_is_emitted(tmp_path: Path) -> None:
     assert metric_art.get("stage_id") == "classification"
     assert metric_art.get("path") == "metric_explanation.json"
     assert (payload.get("files") or {}).get("metric_explanation") == "metric_explanation.json"
+    assert "feature_runtime_summary" in by_id
+    assert "feature_studio_summary" in by_id
+    assert (payload.get("files") or {}).get("feature_runtime_summary") == "feature_runtime_summary.json"
+    assert (payload.get("files") or {}).get("feature_studio_summary") == "feature_studio_summary.json"
 
 
 def test_classification_explanation_flags_suspicious_diameter_inconsistency(tmp_path: Path) -> None:

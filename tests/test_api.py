@@ -9,6 +9,9 @@ from PIL import Image
 from vision_3d_acquisition.api.filesystem import safe_take_file
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
 from vision_3d_acquisition.api.main import (
+    feature_analytics_distributions,
+    feature_analytics_features,
+    feature_analytics_objects,
     health,
     latest,
     list_operations_cards,
@@ -28,6 +31,7 @@ from vision_3d_acquisition.api.main import (
     sessions,
     source_controls,
     sources,
+    take_object_thumbnail,
     take_detail,
     takes,
     update_source_controls,
@@ -523,3 +527,119 @@ def test_runtime_process_endpoints_delegate_to_supervisor(monkeypatch, tmp_path:
     assert runtime_process_restart("trispector_ftp")["restart_count"] == 1
     assert runtime_process_logs("trispector_ftp", limit=3)["lines"] == ["limit=3"]
     assert runtime_process_events("trispector_ftp", limit=4)["events"][0]["event_type"] == "PROCESS_STARTED"
+
+
+def test_feature_analytics_endpoints(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id = "take_fa_1"
+    write_take(data_dir, take_id, "2026-05-28T12:00:00Z")
+    result_dir = data_dir / "processed" / take_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    (result_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "take_id": take_id,
+                "processed_at": "2026-05-28T12:01:00Z",
+                "status": "ok",
+                "processing_pipeline": {"id": "mining_steel_ball_classification_25d"},
+                "summary": {"decision": "accept"},
+                "objects": [
+                    {
+                        "object_id": 1,
+                        "class_name": "BALL_GOOD",
+                        "superclass": "BALL_GOOD",
+                        "feature_eccentricity": 0.22,
+                        "feature_sphericity_3d": 0.94,
+                        "height_above_belt_mm": {"max": 13.1, "mean": 8.5},
+                        "confidence": 0.88,
+                    },
+                    {
+                        "object_id": 2,
+                        "class_name": "SCRAP_METAL",
+                        "superclass": "SCRAP",
+                        "feature_eccentricity": 0.78,
+                        "feature_sphericity_3d": 0.46,
+                        "height_above_belt_mm": {"max": 6.1, "mean": 3.2},
+                        "confidence": 0.55,
+                    },
+                ],
+                "rejected_objects": [],
+                "files": {},
+                "timing_ms": {"load": 1, "segmentation": 2, "classification": 3, "total": 6},
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (result_dir / "DONE").touch()
+    settings = make_test_settings(data_dir)
+
+    features_payload = feature_analytics_features(settings=settings)
+    assert features_payload["record_count"] == 2
+    assert any(item["feature_key"] == "feature_eccentricity" for item in features_payload["feature_definitions"])
+    assert "debug" in features_payload
+    assert features_payload["debug"]["takes_scanned"] >= 1
+
+    distribution_payload = feature_analytics_distributions(feature_key="feature_eccentricity", bins=8, settings=settings)
+    assert distribution_payload["feature_key"] == "feature_eccentricity"
+    assert len(distribution_payload["groups"]) >= 1
+    assert "debug" in distribution_payload
+
+    objects_payload = feature_analytics_objects(feature_key="feature_eccentricity", min_value=0.7, max_value=0.9, settings=settings)
+    assert len(objects_payload["objects"]) == 1
+    assert objects_payload["objects"][0]["object_id"] == "2"
+    assert "debug" in objects_payload
+
+
+def test_feature_analytics_features_empty_returns_immediately_with_debug(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path / "data")
+    payload = feature_analytics_features(settings=settings, max_takes=20, time_budget_ms=100)
+    assert payload["record_count"] == 0
+    assert payload["feature_definitions"] == []
+    assert payload["debug"]["duration_ms"] >= 0
+
+
+def test_take_object_thumbnail_endpoint_returns_cached_thumb(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id = "take_thumb_1"
+    write_take(data_dir, take_id, "2026-05-31T10:00:00Z")
+    take_dir = data_dir / "incoming" / take_id
+    Image.new("RGB", (180, 120), (120, 150, 180)).save(take_dir / "rgb.png")
+    (take_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "take_id": take_id,
+                "source": "test",
+                "mode": "offline",
+                "created_at": "2026-05-31T10:00:00Z",
+                "frame_count": 1,
+                "files": {"rgb": "rgb.png"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result_dir = data_dir / "processed" / take_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    (result_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "take_id": take_id,
+                "processed_at": "2026-05-31T10:01:00Z",
+                "status": "ok",
+                "summary": {"decision": "accept"},
+                "objects": [{"object_id": 7, "class_name": "BALL_GOOD", "bbox_px": [40, 20, 30, 24]}],
+                "rejected_objects": [],
+                "files": {"point_cloud": None, "input_preview": "rgb.png"},
+                "timing_ms": {"load": 1, "segmentation": 2, "classification": 3, "total": 6},
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (result_dir / "DONE").touch()
+    settings = make_test_settings(data_dir)
+
+    response = take_object_thumbnail(take_id, "7", settings=settings)
+    assert response.path is not None
+    thumb_path = Path(str(response.path))
+    assert thumb_path.is_file()

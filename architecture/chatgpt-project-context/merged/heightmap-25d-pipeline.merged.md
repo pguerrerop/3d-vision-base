@@ -568,3 +568,354 @@ Rules:
 - frontend resolution priority: explicit `color_mapping` → render context → display metadata → legacy fallback (warning).
 - `HeightLegend` draws the gradient from the same named LUT used by the renderer (`turbo`/`viridis`/`magma`/`gray`); no hard-coded gradients.
 - hover/debug reconstruction uses the same `colorMap` + `colorScaleMin/Max` for scalar↔RGB transforms.
+
+## Advanced Geometric Ball-Quality Semantics (v2 additive)
+
+The `measurement` + `classification` stages expose physically-grounded grouped metrics while preserving legacy flat fields.
+
+### Semantic metric groups
+
+Per-object payloads include:
+
+- `footprint_geometry`
+- `surface_geometry`
+- `sphere_consistency`
+- `damage_metrics`
+
+Groups are propagated to `classification_explanation.metrics_used` and `semantic_group_summaries`.
+
+### Coordinate/space assumptions
+
+- `footprint_geometry`: XY contour/mask geometry in calibrated metric space.
+- `surface_geometry` and `damage_metrics`: visible 2.5D cap points from `height_above_belt`.
+- `sphere_consistency`: visible-cap vs inferred sphere-cap coherence (occluded hemisphere is inferred).
+
+### Metric definitions
+
+- Circularity: `C = 4*pi*A / P^2`.
+- Radial boundary uniformity: radial mean/std/CV/max deviation from contour centroid.
+- Sphere fit: least-squares sphere on visible XYZ points (center/radius/RMSE/max).
+- Ellipsoid proxy fit: PCA axes/aspect/residual proxy.
+- Sphere-vs-ellipsoid gain: normalized residual improvement.
+- Radial height residual: visible heights vs expected spherical cap.
+- Surface completeness + volume coherence: occupancy/volume proxy vs expected sphere volume.
+- Damage proxies: roughness, flat-region area ratio, discontinuity/high-curvature ratios.
+
+### Classification and explainability
+
+- Heuristics consume grouped evidence without collapsing to a single monolithic score.
+- Explanations include per-group pass/fail summaries and per-metric contribution rules across footprint/surface/consistency/damage families.
+
+### Studio exposure
+
+- Inspector renders compact grouped summaries (Footprint, Surface, Sphere consistency, Damage).
+- Classification rule view renders semantic group summaries before detailed rule rows.
+
+### Limits
+
+- Ellipsoid fit is currently PCA-proxy based.
+- Visible-surface-only geometry limits certainty for hidden-side damage.
+- Damage proxies are geometric; RGB crack cues are future fusion inputs.
+
+### Future readiness
+
+Grouped metrics are modular and contract-safe for RGB+25D fusion, ML export, and dataset analytics.
+
+## Synthetic Geometry Validation Harness
+
+Additive validation framework for metric-family discrimination under controlled defect geometry.
+
+### Generator
+
+- `vision_3d_acquisition/synthetic/advanced_geometry_25d.py`
+- Object types:
+  - `good_ball`
+  - `worn_ellipsoid`
+  - `truncated_sphere`
+  - `chipped_sphere`
+  - `flattened_ball`
+  - `elongated_scrap`
+
+### Realism controls
+
+- gaussian height noise
+- missing/no-return regions
+- belt tilt
+- edge aliasing perturbation
+
+Runs are deterministic via explicit seeds.
+
+### Metadata contract
+
+Synthetic take metadata persists:
+
+- `synthetic_object_type`
+- `generation_parameters`
+- `expected_failure_modes`
+- `expected_metric_family_reactions`
+- acquisition-effects config
+
+Debug GT assets: `synthetic_gt_mask.png`, `synthetic_flat_regions_gt.png`.
+
+### Benchmark runner
+
+- `scripts/run_advanced_25d_geometry_validation.py`
+- Outputs:
+  - `data/reports/advanced_25d_metric_family_report.json`
+  - `data/reports/advanced_25d_metric_family_report.md`
+  - `data/reports/advanced_25d_geometry_validation.csv`
+  - `data/reports/advanced_25d_geometry_analysis.json`
+
+### Classifier-studio readiness
+
+Aggregate analytics export includes:
+
+- `feature_schema_version: "v1"`
+- grouped `feature_groups` (`footprint_geometry`, `surface_geometry`, `sphere_consistency`, `damage_metrics`)
+- lightweight `feature_metadata` (group, unit, `higher_is_worse`, semantic description)
+
+This supports future classifier-studio ingestion and explainability-first feature dashboards without binding to a specific model.
+
+### Aggregate sensitivity analytics
+
+The harness now computes:
+
+- per-object-type family score aggregates
+- family sensitivity matrix (`LOW/MEDIUM/HIGH` + numeric severities)
+- dominant/secondary failure families and ranking
+- expected-vs-observed dominant-family confusion summaries
+- `good_ball` baseline calibration stats (mean/std)
+- z-score feature activation summaries
+- global feature discriminativeness ranking.
+
+## Canonical FeatureDataset Layer
+
+First-pass canonical dataset abstraction now exists in:
+
+- `vision_3d_acquisition/ml/features/dataset.py`
+
+Core contracts:
+
+- `FeatureSchema`: versioned grouped feature definitions + metadata
+- `FeatureSample`: per-object semantic feature sample
+- `FeatureDataset`: dataset container with validation/stats/persistence/matrix extraction
+
+### Classifier-studio alignment
+
+Formal bridge is now:
+
+`25D semantic feature exports -> FeatureDataset -> Classifier Studio / experiments`
+
+This keeps classifier consumers decoupled from pipeline-stage/artifact internals.
+
+### Ingestion
+
+`FeatureDataset.from_advanced_validation_exports(...)` ingests:
+
+- `advanced_25d_geometry_validation.csv`
+- `advanced_25d_geometry_analysis.json`
+
+and reconstructs stable ordered vectors with preserved semantic groups.
+
+### Validation/statistics/utilities
+
+Added first-pass capabilities:
+
+- structured schema/sample validation (missing/unknown/invalid diagnostics)
+- per-feature and per-group statistics
+- feature-matrix and label extraction APIs
+- semantic group selection/exclusion utilities
+- lightweight normalization helpers (`zscore`, `minmax`)
+- JSON persistence/reload with schema-version + metadata preservation
+- split placeholders (`train`/`validation`/`test`) for future workflows.
+
+### Physical rationale
+
+Truncated-sphere cases demonstrate why visible-surface fit alone is insufficient: surface fit may remain partly acceptable while sphere-consistency and volume-deficit metrics fail, which is the desired physically grounded behavior.
+
+## Experiment-Readiness Layer
+
+Lightweight experiment layer now exists at:
+
+- `vision_3d_acquisition/ml/experiments/`
+
+Core contracts:
+
+- `DatasetSplitSet`
+- `ExperimentConfig`
+- `LabelTaxonomy`
+
+### Canonical boundary
+
+`FeatureDataset -> SplitSet -> ExperimentConfig -> Evaluator`
+
+This is the intended Classifier Studio integration surface and remains backend-agnostic.
+
+### Deterministic splits
+
+Strategies supported:
+
+- `random`
+- `stratified`
+- `by_synthetic_object_type`
+- `by_failure_family`
+
+Split manifests are persisted and reloadable (`split_manifest.json`) with deterministic ordering and seed linkage.
+
+### Compatibility checks
+
+Experiment compatibility validator checks schema versions, feature/group availability, normalization mode support, and label availability, returning structured diagnostics.
+
+### Label taxonomy
+
+Taxonomy utilities support aliases, group remapping, ignored labels, and binary-vs-multiclass mapping without mutating source datasets.
+
+### Baseline evaluation flow
+
+A lightweight `majority_label_baseline` evaluator is included to validate end-to-end experiment plumbing and artifact generation:
+
+- config + split + compatibility + normalization manifest
+- confusion/evaluation metrics
+- feature statistics
+
+Artifact layout:
+
+- `ml/experiments/experiment_<id>/config.json`
+- `ml/experiments/experiment_<id>/split_manifest.json`
+- `ml/experiments/experiment_<id>/compatibility.json`
+- `ml/experiments/experiment_<id>/normalization_manifest.json`
+- `ml/experiments/experiment_<id>/evaluation.json`
+- `ml/experiments/experiment_<id>/feature_stats.json`
+
+### Semantic ablations
+
+`ExperimentConfig.feature_selection` supports include/exclude groups/features for semantic-family ablation studies while preserving grouped feature semantics.
+
+## Feature Registry + Quality/Stability Analytics
+
+Feature-governance and feature-analytics layer now exists:
+
+- `vision_3d_acquisition/ml/features/registry.py`
+- `vision_3d_acquisition/ml/features/analytics.py`
+
+### FeatureRegistry
+
+Acts as canonical source for:
+
+- feature metadata
+- semantic grouping
+- schema/dataset compatibility checks
+- audience-specific visibility rules (`operations`, `studio`, `classifier_studio`)
+
+### Rich metadata semantics
+
+Feature metadata now includes:
+
+- display/explainability fields (`display_name`, `short_description`, `tooltip`)
+- numeric semantics (`unit`, `higher_is_worse`, `expected_range`)
+- warning guidance thresholds
+- normalization/visualization hints
+- UX visibility flags and display precision hints
+
+### Quality analytics
+
+Per-feature diagnostics include:
+
+- missing/invalid ratios
+- variance + entropy proxy
+- z-score and robust-z-score outlier detection
+- extreme-value and low-variance warnings
+
+Plus per-group quality summaries.
+
+### Stability analytics
+
+Adds:
+
+- `feature_stability_score`
+- `noise_sensitivity_score`
+- `perturbation_variance`
+
+with feature and group rankings.
+
+### Correlation and redundancy
+
+Exports correlation matrix, strongest high-correlation pairs, and redundancy warnings (especially within semantic families).
+
+### Readiness scoring
+
+Readiness combines missingness, validity, outliers, stability, variance informativeness, redundancy penalty, and metadata interpretability.
+
+Readiness levels:
+
+- `EXPERIMENTAL`
+- `GOOD`
+- `PRODUCTION_READY`
+
+### Drift diagnostics
+
+Lightweight baseline-snapshot comparisons provide mean/stddev shifts and drift scores (first-pass, deterministic, non-orchestrated).
+
+### Export outputs
+
+Analytics export files:
+
+- `feature_quality_report.json`
+- `feature_stability_report.json`
+- `feature_correlation_report.json`
+- `feature_readiness_report.json`
+- `feature_drift_report.json`
+- `feature_ux_summary.json`
+
+### UX audience semantics
+
+- Operations: semantic group health summaries only
+- Studio: grouped diagnostics + warnings
+- Classifier Studio: full feature analytics and metadata
+
+## Feature UX + Runtime Data-Contract Integration
+
+A compact UX/data-contract layer was added on top of feature governance to make runtime and studio payloads operationally consumable.
+
+### Canonical UX contracts
+
+Implemented in `vision_3d_acquisition/ml/features/ux_contracts.py`:
+
+- `FeatureGroupSummary`
+- `FeatureWarning`
+- `FeatureReadinessSummary`
+
+plus deterministic severity mapping (`LOW`, `MEDIUM`, `HIGH`) and audience filters.
+
+### Runtime/studio payload additions
+
+Per-object classification payload now carries:
+
+- `feature_group_summaries`
+- `feature_warnings`
+- `feature_readiness`
+
+Result contracts were extended so these fields persist through serialization.
+
+### Compact exports
+
+Classification stage now writes:
+
+- `feature_runtime_summary.json`
+- `feature_studio_summary.json`
+
+and links both through `files` and processing artifacts.
+
+### Visibility policy
+
+- Operations: compact semantic statuses + actionable warnings only.
+- Studio: grouped summary cards + readiness + warning evidence.
+- Classifier Studio: richer feature-engineering-oriented summaries (with future link to full analytics).
+
+Runtime payloads intentionally avoid dumping full correlation/stability/analytics matrices.
+
+### Architectural boundary
+
+Operational UX consumes semantic summaries.
+Studio consumes grouped engineering diagnostics.
+Classifier Studio consumes full feature analytics.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,21 @@ from vision_3d_acquisition.operations.classification_superclass import (
     map_label_to_superclass,
     select_dominant_classification,
 )
+from vision_3d_acquisition.classifiers.mining_ball_rules import (
+    DEFAULT_RULE_PARAMS,
+    predict_superclass_from_rules,
+    resolve_classifier_rule_set,
+)
+from vision_3d_acquisition.ml import MLService
+from vision_3d_acquisition.ml.features.extractor import features_from_object
+from vision_3d_acquisition.ml.features.schemas import feature_ordering_hash
+from vision_3d_acquisition.ml.features.ux_contracts import (
+    build_object_feature_ux_summary,
+    filter_for_classifier_studio,
+    filter_for_operations,
+    filter_for_studio,
+)
+from vision_3d_acquisition.ml.storage import MLStorage
 from vision_3d_acquisition.vision_core.heightmap import (
     HeightmapFrame,
     load_heightmap_npz,
@@ -2492,7 +2508,7 @@ class NormalizeHeightsToPlaneStage:
             ),
         }
         (output_dir / "normalized_heightmap_display.json").write_text(json.dumps(display_meta, indent=2), encoding="utf-8")
-        (output_dir / "normalized_height_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
+        (output_dir / "diagnostics_normalized_height_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
         norm_debug = {
             "semantic_source_id": "normalized_heightmap.npz:z_mm",
             "display_semantic": "height_above_plane_mm",
@@ -3026,6 +3042,22 @@ class RemoveBeltAndSegmentObjectsStage:
             source_artifact_ids=["height_segmentation", "cleaned_object_mask"],
             metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "semantic": "primary_human_view", "numeric_source_artifact": "normalized_heightmap.npz"}),
         )
+        # Backward-compatible alias kept for legacy consumers/tests that still
+        # look up the segmentation overlay under the old artifact id.
+        context.add_processing_artifact(
+            artifact_id="height_segmentation_overlay",
+            stage_id="remove_belt_segment_objects",
+            kind="overlay",
+            title="Height segmentation overlay (compat)",
+            path="connected_components_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            overlay_type="segmentation",
+            coordinate_space="image_pixel",
+            target_artifact_id="heightmap_preview",
+            source_artifact_ids=["height_segmentation", "cleaned_object_mask", "heightmap_preview"],
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "semantic": "compat_alias", "numeric_source_artifact": "normalized_heightmap.npz"}),
+        )
 
 
 @dataclass
@@ -3187,6 +3219,115 @@ class ComputeHeightMetricsStage:
             sphere_radius_mm = float(max(footprint_x, footprint_y, dim_z_height) / 2.0)
             sphere_diameter_mm = float(sphere_radius_mm * 2.0)
             truncation_ratio = float(max(0.0, 1.0 - (dim_z_height / max(1e-6, sphere_diameter_mm))))
+            contour_mm_metrics = _contour_metrics_in_metric_space(
+                comp["contour"].reshape(-1, 2).astype(float).tolist()
+                if comp.get("contour") is not None and len(comp.get("contour")) > 0
+                else None,
+                x_resolution_mm=float(frame.x_resolution_mm),
+                y_resolution_mm=float(frame.y_resolution_mm),
+                scale_x=1.0,
+                scale_y=1.0,
+            )
+            radial_uniformity = _radial_boundary_uniformity_from_contour_mm(contour_mm_metrics.get("contour_mm"))
+            pts_y, pts_x = np.where(mask)
+            points_xyz_mm = np.column_stack(
+                (
+                    frame.origin_x_mm + pts_x.astype(np.float64) * float(frame.x_resolution_mm),
+                    frame.origin_y_mm + pts_y.astype(np.float64) * float(frame.y_resolution_mm),
+                    np.maximum(values.astype(np.float64), 0.0),
+                )
+            )
+            sphere_fit = _fit_sphere_least_squares(points_xyz_mm)
+            ellipsoid_fit = _fit_ellipsoid_pca(points_xyz_mm)
+            sphere_rmse = float(sphere_fit.get("rmse_mm") or 0.0) if sphere_fit.get("valid") else None
+            ellipsoid_rmse = float(ellipsoid_fit.get("rmse") or 0.0) if ellipsoid_fit.get("valid") else None
+            sphere_vs_ellipsoid_gain = (
+                float(max(0.0, (sphere_rmse - ellipsoid_rmse) / max(sphere_rmse, 1e-9)))
+                if sphere_rmse is not None and ellipsoid_rmse is not None
+                else None
+            )
+            deformation_score = (
+                float(max(0.0, min(1.0, (sphere_vs_ellipsoid_gain or 0.0) * 0.7 + max(0.0, ((ellipsoid_fit.get("aspect_ratio") or 1.0) - 1.0)) * 0.3)))
+                if sphere_vs_ellipsoid_gain is not None and ellipsoid_fit.get("valid")
+                else None
+            )
+            radial_height_rmse_mm = None
+            radial_height_max_error_mm = None
+            if sphere_fit.get("valid"):
+                center = np.asarray(sphere_fit.get("center_mm"), dtype=np.float64)
+                radius = float(sphere_fit.get("radius_mm") or 0.0)
+                if radius > 0.0:
+                    dx = points_xyz_mm[:, 0] - center[0]
+                    dy = points_xyz_mm[:, 1] - center[1]
+                    rr = np.sqrt(dx * dx + dy * dy)
+                    inside = np.maximum(0.0, radius * radius - rr * rr)
+                    expected_z = center[2] + np.sqrt(inside)
+                    dz = points_xyz_mm[:, 2] - expected_z
+                    radial_height_rmse_mm = float(np.sqrt(np.mean(dz ** 2)))
+                    radial_height_max_error_mm = float(np.max(np.abs(dz)))
+            nonzero_values = np.maximum(values.astype(np.float64), 0.0)
+            filled_ratio = float(np.count_nonzero(nonzero_values > 0.05) / max(1, nonzero_values.size))
+            surface_completeness_ratio = filled_ratio
+            missing_surface_fraction = float(max(0.0, 1.0 - surface_completeness_ratio))
+            expected_sphere_volume_mm3 = float((4.0 / 3.0) * np.pi * (float(sphere_fit.get("radius_mm") or sphere_radius_mm) ** 3))
+            observed_volume_ratio = float(volume_proxy / max(expected_sphere_volume_mm3, 1e-9))
+            volume_deficit_ratio = float(max(0.0, 1.0 - observed_volume_ratio))
+            surface_roughness_mean = float(np.mean(np.abs(surface_residuals))) if surface_residuals.size else 0.0
+            surface_roughness_std = float(np.std(surface_residuals)) if surface_residuals.size else 0.0
+            surface_roughness_score = float(max(0.0, min(1.0, surface_roughness_mean / 8.0)))
+            # Flat region proxy: low local gradient zones inside the object mask.
+            grad_mag = np.sqrt(gx * gx + gy * gy)
+            flat_mask = inner_mask & (grad_mag < 0.08)
+            flat_region_ratio = float(np.count_nonzero(flat_mask) / max(1, np.count_nonzero(inner_mask)))
+            largest_flat_region_mm2 = 0.0
+            if np.count_nonzero(flat_mask):
+                nlab, _labels, stats, _ = cv2.connectedComponentsWithStats(flat_mask.astype(np.uint8), connectivity=8)
+                if nlab > 1:
+                    largest_flat_region_mm2 = float(np.max(stats[1:, cv2.CC_STAT_AREA]) * pixel_area)
+            lap = cv2.Laplacian(np.where(mask, normalized, 0.0).astype(np.float32), cv2.CV_32F)
+            lap_vals = np.abs(lap[inner_mask]) if np.count_nonzero(inner_mask) else np.asarray([], dtype=np.float32)
+            surface_discontinuity_score = float(np.mean(lap_vals)) if lap_vals.size else 0.0
+            high_curvature_ratio = float(np.count_nonzero(lap_vals > 0.2) / max(1, lap_vals.size)) if lap_vals.size else 0.0
+            circularity = _safe_float(contour_mm_metrics.get("circularity"))
+            circularity_score = float(max(0.0, min(1.0, circularity if circularity is not None else 0.0)))
+            footprint_geometry = {
+                "circularity": round(circularity, 6) if circularity is not None else None,
+                "circularity_score": round(circularity_score, 6),
+                **radial_uniformity,
+                "eccentricity": round(float(comp.get("eccentricity") or 0.0), 6),
+                "aspect_ratio": round(float((comp.get("major_axis_mm") or 0.0) / max(float(comp.get("minor_axis_mm") or 1e-9), 1e-9)), 6),
+                "ellipse_fit_quality": round(float(comp.get("roundness") or 0.0), 6),
+            }
+            surface_geometry = {
+                "sphere_fit_center_mm": sphere_fit.get("center_mm") if sphere_fit.get("valid") else None,
+                "sphere_fit_radius_mm": sphere_fit.get("radius_mm") if sphere_fit.get("valid") else None,
+                "sphere_fit_rmse_mm": sphere_fit.get("rmse_mm") if sphere_fit.get("valid") else None,
+                "sphere_fit_max_error_mm": sphere_fit.get("max_error_mm") if sphere_fit.get("valid") else None,
+                "sphere_fit_valid_point_count": sphere_fit.get("point_count") if sphere_fit.get("valid") else int(points_xyz_mm.shape[0]),
+                "ellipsoid_axes_mm": ellipsoid_fit.get("axes_mm") if ellipsoid_fit.get("valid") else None,
+                "ellipsoid_aspect_ratio": ellipsoid_fit.get("aspect_ratio") if ellipsoid_fit.get("valid") else None,
+                "ellipsoid_fit_rmse_mm": ellipsoid_fit.get("rmse") if ellipsoid_fit.get("valid") else None,
+                "sphere_vs_ellipsoid_gain": round(sphere_vs_ellipsoid_gain, 6) if sphere_vs_ellipsoid_gain is not None else None,
+                "deformation_score": round(deformation_score, 6) if deformation_score is not None else None,
+            }
+            sphere_consistency = {
+                "radial_height_rmse_mm": round(radial_height_rmse_mm, 6) if radial_height_rmse_mm is not None else None,
+                "radial_height_max_error_mm": round(radial_height_max_error_mm, 6) if radial_height_max_error_mm is not None else None,
+                "surface_completeness_ratio": round(surface_completeness_ratio, 6),
+                "missing_surface_fraction": round(missing_surface_fraction, 6),
+                "expected_sphere_volume_mm3": round(expected_sphere_volume_mm3, 4),
+                "observed_volume_ratio": round(observed_volume_ratio, 6),
+                "volume_deficit_ratio": round(volume_deficit_ratio, 6),
+            }
+            damage_metrics = {
+                "surface_roughness_mean": round(surface_roughness_mean, 6),
+                "surface_roughness_std": round(surface_roughness_std, 6),
+                "surface_roughness_score": round(surface_roughness_score, 6),
+                "flat_region_ratio": round(flat_region_ratio, 6),
+                "largest_flat_region_mm2": round(largest_flat_region_mm2, 4),
+                "surface_discontinuity_score": round(surface_discontinuity_score, 6),
+                "high_curvature_ratio": round(high_curvature_ratio, 6),
+            }
             object_row = {
                 "object_id": int(comp["object_id"]),
                 "class_name": "unknown",
@@ -3258,6 +3399,7 @@ class ComputeHeightMetricsStage:
                 },
                 "feature_height_asymmetry": round(asym, 4),
                 "feature_footprint_roundness": round(float(comp.get("roundness") or 0.0), 4),
+                "feature_circularity": round(float(circularity or 0.0), 6),
                 "footprint_area_mm2": round(float(comp.get("footprint_area_mm2") or 0.0), 4),
                 "bbox_px": [
                     int(comp["bbox"][0]),
@@ -3294,6 +3436,10 @@ class ComputeHeightMetricsStage:
                     "estimated_truncation_ratio": round(truncation_ratio, 4),
                     "fit_confidence": round(float(max(0.0, min(1.0, 1.0 - truncation_ratio))), 4),
                 },
+                "footprint_geometry": footprint_geometry,
+                "surface_geometry": surface_geometry,
+                "sphere_consistency": sphere_consistency,
+                "damage_metrics": damage_metrics,
             }
             objects.append(object_row)
             oid = object_row["object_id"]
@@ -3829,6 +3975,397 @@ def _axis_balance_3d(x_mm: float, y_mm: float, z_mm: float) -> float:
 
 
 @dataclass
+class ComputeMeasurementDiagnosticsStage:
+    name: str = "ComputeMeasurementDiagnostics"
+    category: str = "measurement"
+    required_modalities: tuple[CaptureModality, ...] = ("heightmap",)
+    produced_modalities: tuple[CaptureModality, ...] = ()
+    produced_artifacts: tuple[str, ...] = ("measurement_diagnostics", "feature_vector", "feature_provenance", "quality_flags")
+    stage_category: str | None = "measurement"
+
+    def run(self, context: PipelineContext) -> None:
+        frame: HeightmapFrame = context.require_artifact("heightmap_frame")
+        output_dir: Path = context.require_artifact("output_dir")
+        objects = context.get_artifact("objects", [])
+        segmentation_mask = np.asarray(context.get_artifact("segmentation_mask", np.zeros_like(frame.valid_mask, dtype=bool)), dtype=bool)
+        normalized = np.asarray(context.get_artifact("normalized_heightmap_mm"), dtype=np.float32)
+
+        valid_mask = np.asarray(frame.valid_mask, dtype=bool)
+        invalid_mask = ~valid_mask
+        total_px = int(valid_mask.size)
+        valid_px = int(np.count_nonzero(valid_mask))
+        invalid_px = max(0, total_px - valid_px)
+
+        invalid_u8 = invalid_mask.astype(np.uint8)
+        hole_count = 0
+        hole_area_ratio = 0.0
+        if invalid_px > 0:
+            cc_count, labels = cv2.connectedComponents(invalid_u8)
+            hole_count = max(0, int(cc_count) - 1)
+            if hole_count > 0:
+                areas = [int(np.count_nonzero(labels == idx)) for idx in range(1, cc_count)]
+                hole_area_ratio = float(sum(areas) / max(1, total_px))
+
+        foreground_px = int(np.count_nonzero(segmentation_mask))
+        foreground_ratio = float(foreground_px / max(1, total_px))
+        roi_occupancy_ratio = foreground_ratio
+
+        border = np.zeros_like(segmentation_mask, dtype=bool)
+        border[0, :] = True
+        border[-1, :] = True
+        border[:, 0] = True
+        border[:, -1] = True
+        border_touch_px = int(np.count_nonzero(segmentation_mask & border))
+        border_touch_ratio = float(border_touch_px / max(1, foreground_px))
+
+        bboxes = [item.get("bbox_px") for item in objects if isinstance(item, dict) and isinstance(item.get("bbox_px"), list) and len(item.get("bbox_px")) >= 4]
+        bbox_area_px = 0
+        bbox_width_px = 0.0
+        bbox_height_px = 0.0
+        if bboxes:
+            x0 = int(min(float(box[0]) for box in bboxes))
+            y0 = int(min(float(box[1]) for box in bboxes))
+            x1 = int(max(float(box[0]) + float(box[2]) for box in bboxes))
+            y1 = int(max(float(box[1]) + float(box[3]) for box in bboxes))
+            bbox_width_px = float(max(0, x1 - x0))
+            bbox_height_px = float(max(0, y1 - y0))
+            bbox_area_px = int(bbox_width_px * bbox_height_px)
+        bbox_crop_ratio = float(bbox_area_px / max(1, total_px))
+
+        residual_path = output_dir / "belt_plane_residuals.values.f32"
+        plane_residual = None
+        if residual_path.is_file():
+            try:
+                plane_residual = np.fromfile(residual_path, dtype=np.float32).reshape(frame.z_mm.shape)
+            except Exception:
+                plane_residual = None
+        if plane_residual is not None:
+            residual_values = plane_residual[np.isfinite(plane_residual)]
+        else:
+            residual_values = np.array([], dtype=np.float32)
+        residual_mean = float(np.mean(residual_values)) if residual_values.size else 0.0
+        residual_std = float(np.std(residual_values)) if residual_values.size else 0.0
+        residual_p95 = float(np.percentile(residual_values, 95)) if residual_values.size else 0.0
+
+        object_mask = segmentation_mask & valid_mask
+        object_heights = normalized[object_mask] if int(np.count_nonzero(object_mask)) > 0 else np.array([], dtype=np.float32)
+        height_min = float(np.min(object_heights)) if object_heights.size else 0.0
+        height_max = float(np.max(object_heights)) if object_heights.size else 0.0
+        height_mean = float(np.mean(object_heights)) if object_heights.size else 0.0
+        height_std = float(np.std(object_heights)) if object_heights.size else 0.0
+        height_p95 = float(np.percentile(object_heights, 95)) if object_heights.size else 0.0
+        height_p99 = float(np.percentile(object_heights, 99)) if object_heights.size else 0.0
+
+        primary = self._pick_primary_object(objects)
+        pixel_area = float(frame.pixel_area_mm2())
+        footprint_area_px = float(primary.get("point_count") or foreground_px or 0.0) if primary else float(foreground_px)
+        footprint_area_mm2 = float(primary.get("footprint_area_mm2") or (footprint_area_px * pixel_area)) if primary else float(footprint_area_px * pixel_area)
+        major = self._as_float(primary.get("major_axis_mm") if primary else None)
+        minor = self._as_float(primary.get("minor_axis_mm") if primary else None)
+        equiv_diam = float(np.sqrt((4.0 * footprint_area_mm2) / np.pi)) if footprint_area_mm2 > 0 else 0.0
+        eccentricity = self._as_float(primary.get("feature_eccentricity") if primary else None) or 0.0
+        roundness = self._as_float(primary.get("sphericity_score") if primary else None) or 0.0
+        flatness = self._as_float(primary.get("feature_flatness") if primary else None) or 0.0
+        asymmetry = self._as_float(primary.get("feature_height_asymmetry") if primary else None) or 0.0
+        volume_proxy = self._as_float(primary.get("feature_volume_proxy_mm3") if primary else None) or 0.0
+        footprint_group = primary.get("footprint_geometry") if isinstance(primary, dict) and isinstance(primary.get("footprint_geometry"), dict) else {}
+        surface_group = primary.get("surface_geometry") if isinstance(primary, dict) and isinstance(primary.get("surface_geometry"), dict) else {}
+        consistency_group = primary.get("sphere_consistency") if isinstance(primary, dict) and isinstance(primary.get("sphere_consistency"), dict) else {}
+        damage_group = primary.get("damage_metrics") if isinstance(primary, dict) and isinstance(primary.get("damage_metrics"), dict) else {}
+
+        perimeter_mm = self._as_float(primary.get("perimeter_mm") if primary else None)
+        compactness = 0.0
+        if perimeter_mm and perimeter_mm > 0:
+            compactness = float((4.0 * np.pi * footprint_area_mm2) / (perimeter_mm * perimeter_mm))
+        solidity = self._estimate_solidity(primary, frame=frame)
+        convex_volume_proxy = float(footprint_area_mm2 * max(height_p95, 0.0))
+
+        features = {
+            "valid_pixel_ratio": float(valid_px / max(1, total_px)),
+            "invalid_pixel_ratio": float(invalid_px / max(1, total_px)),
+            "invalid_hole_count": int(hole_count),
+            "invalid_hole_area_ratio": float(hole_area_ratio),
+            "border_touch_ratio": float(border_touch_ratio),
+            "segmentation_foreground_ratio": float(foreground_ratio),
+            "bbox_crop_ratio": float(bbox_crop_ratio),
+            "roi_occupancy_ratio": float(roi_occupancy_ratio),
+            "plane_residual_mean": float(residual_mean),
+            "plane_residual_std": float(residual_std),
+            "plane_residual_p95": float(residual_p95),
+            "height_min": float(height_min),
+            "height_max": float(height_max),
+            "height_mean": float(height_mean),
+            "height_std": float(height_std),
+            "height_p95": float(height_p95),
+            "height_p99": float(height_p99),
+            "bbox_width_px": float(bbox_width_px),
+            "bbox_height_px": float(bbox_height_px),
+            "footprint_area_px": float(footprint_area_px),
+            "footprint_area_mm2": float(footprint_area_mm2),
+            "equivalent_diameter_mm": float(equiv_diam),
+            "ellipse_major_axis_mm": float(major or 0.0),
+            "ellipse_minor_axis_mm": float(minor or 0.0),
+            "eccentricity": float(eccentricity),
+            "roundness": float(roundness),
+            "solidity": float(solidity),
+            "compactness": float(compactness),
+            "flatness": float(flatness),
+            "asymmetry": float(asymmetry),
+            "integrated_height_volume_proxy": float(volume_proxy),
+            "convex_volume_proxy": float(convex_volume_proxy),
+            "footprint_radial_cv": float(self._as_float(footprint_group.get("radial_cv")) or 0.0),
+            "surface_sphere_fit_rmse_mm": float(self._as_float(surface_group.get("sphere_fit_rmse_mm")) or 0.0),
+            "consistency_radial_height_rmse_mm": float(self._as_float(consistency_group.get("radial_height_rmse_mm")) or 0.0),
+            "damage_flat_region_ratio": float(self._as_float(damage_group.get("flat_region_ratio")) or 0.0),
+        }
+
+        feature_provenance = self._build_feature_provenance(features)
+        quality_flags = self._build_quality_flags(features)
+        feature_vector_payload = {"features": features}
+        diagnostics_payload = {
+            "feature_count": len(features),
+            "object_count": len(objects) if isinstance(objects, list) else 0,
+            "primary_object_id": int(primary.get("object_id")) if isinstance(primary, dict) and primary.get("object_id") is not None else None,
+            "quality_flag_count": len(quality_flags),
+            "confidence": None,
+            "expected_error": None,
+        }
+
+        contour_payload = self._build_contour_payload(objects)
+        hull_payload = self._build_hull_payload(objects)
+        ellipse_payload = self._build_ellipse_payload(objects)
+        axes_payload = self._build_axes_payload(objects)
+        radial_payload = self._build_radial_profile(normalized=normalized, mask=object_mask, frame=frame)
+        hist_payload = self._build_height_histogram(normalized=normalized, mask=object_mask)
+
+        (output_dir / "measurement_diagnostics.json").write_text(json.dumps(diagnostics_payload, indent=2), encoding="utf-8")
+        (output_dir / "feature_vector.json").write_text(json.dumps(feature_vector_payload, indent=2), encoding="utf-8")
+        (output_dir / "feature_provenance.json").write_text(json.dumps(feature_provenance, indent=2), encoding="utf-8")
+        (output_dir / "quality_flags.json").write_text(json.dumps({"flags": quality_flags}, indent=2), encoding="utf-8")
+        (output_dir / "contour.json").write_text(json.dumps(contour_payload, indent=2), encoding="utf-8")
+        (output_dir / "convex_hull.json").write_text(json.dumps(hull_payload, indent=2), encoding="utf-8")
+        (output_dir / "fitted_ellipse.json").write_text(json.dumps(ellipse_payload, indent=2), encoding="utf-8")
+        (output_dir / "principal_axes.json").write_text(json.dumps(axes_payload, indent=2), encoding="utf-8")
+        (output_dir / "radial_profile.json").write_text(json.dumps(radial_payload, indent=2), encoding="utf-8")
+        (output_dir / "diagnostics_normalized_height_histogram.json").write_text(json.dumps(hist_payload, indent=2), encoding="utf-8")
+
+        context.set_artifact("measurement_diagnostics", diagnostics_payload)
+        context.set_artifact("feature_vector", feature_vector_payload)
+        context.set_artifact("feature_provenance", feature_provenance)
+        context.set_artifact("quality_flags", {"flags": quality_flags})
+
+        files = dict(context.get_artifact("files", {}))
+        files.update(
+            {
+                "measurement_diagnostics": "measurement_diagnostics.json",
+                "feature_vector": "feature_vector.json",
+                "feature_provenance": "feature_provenance.json",
+                "quality_flags": "quality_flags.json",
+            }
+        )
+        context.set_artifact("files", files)
+
+        self._record_artifact(context, "measurement_diagnostics", "measurement_diagnostics.json", "Measurement diagnostics", "world_mm", ["measurement_object_1"], {"semantic_type": "diagnostics", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "feature_vector", "feature_vector.json", "Feature vector", "world_mm", ["measurement_diagnostics"], {"semantic_type": "feature_vector", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "feature_provenance", "feature_provenance.json", "Feature provenance", "world_mm", ["feature_vector"], {"semantic_type": "feature_provenance", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "quality_flags", "quality_flags.json", "Quality flags", "world_mm", ["feature_vector"], {"semantic_type": "quality_flags", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "contour", "contour.json", "Contour geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "convex_hull", "convex_hull.json", "Convex hull geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "fitted_ellipse", "fitted_ellipse.json", "Fitted ellipse geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "principal_axes", "principal_axes.json", "Principal axes geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+        self._record_artifact(context, "radial_profile", "radial_profile.json", "Radial profile", "world_mm", ["height_above_belt_raster"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+
+    def _record_artifact(
+        self,
+        context: PipelineContext,
+        artifact_id: str,
+        path: str,
+        title: str,
+        coordinate_space: str,
+        source_artifact_ids: list[str],
+        extra_meta: dict[str, Any],
+    ) -> None:
+        meta = _numeric_source_meta(
+            {
+                "source": "native_pipeline",
+                "producer": self.name,
+                "stage_id": "measurement_diagnostics",
+                "coordinate_space": coordinate_space,
+                "lineage": {"source_artifact_ids": source_artifact_ids},
+                **extra_meta,
+            }
+        )
+        context.add_processing_artifact(
+            artifact_id=artifact_id,
+            stage_id="measurement_diagnostics",
+            kind="json",
+            title=title,
+            path=path,
+            mime_type="application/json",
+            preview_available=True,
+            coordinate_space=coordinate_space,  # type: ignore[arg-type]
+            source_artifact_ids=source_artifact_ids,
+            metadata=meta,
+        )
+
+    def _build_feature_provenance(self, features: dict[str, Any]) -> dict[str, Any]:
+        provenance: dict[str, Any] = {}
+        for key, value in features.items():
+            stage = "measurement_diagnostics"
+            source_artifact = "measurement_diagnostics"
+            derived_from = ["height_segmentation", "height_above_belt_raster"]
+            if key.startswith("plane_residual"):
+                stage = "detect_belt_plane"
+                source_artifact = "belt_plane_residuals"
+                derived_from = ["belt_plane_residuals", "belt_plane"]
+            elif key in {"ellipse_major_axis_mm", "ellipse_minor_axis_mm", "eccentricity", "roundness"}:
+                stage = "measurement"
+                source_artifact = "measurement_object"
+                derived_from = ["connected_components", "height_segmentation"]
+            elif key in {"footprint_area_px", "footprint_area_mm2", "bbox_width_px", "bbox_height_px"}:
+                stage = "geometry"
+                source_artifact = "connected_components"
+                derived_from = ["height_segmentation"]
+            validity = "ok"
+            if key == "valid_pixel_ratio" and float(value) < 0.85:
+                validity = "warning"
+            if key == "invalid_pixel_ratio" and float(value) > 0.25:
+                validity = "invalid"
+            provenance[key] = {
+                "value": value,
+                "source_stage": stage,
+                "source_artifact_id": source_artifact,
+                "validity": validity,
+                "confidence": None,
+                "expected_error": None,
+                "derived_from": derived_from,
+            }
+        return provenance
+
+    def _build_quality_flags(self, features: dict[str, Any]) -> list[dict[str, Any]]:
+        flags: list[dict[str, Any]] = []
+        if float(features.get("valid_pixel_ratio", 0.0)) < 0.85:
+            flags.append({"code": "LOW_VALID_PIXEL_RATIO", "severity": "warning", "trigger": {"valid_pixel_ratio": features["valid_pixel_ratio"]}, "related_features": ["valid_pixel_ratio"]})
+        if float(features.get("invalid_pixel_ratio", 0.0)) > 0.2:
+            flags.append({"code": "HIGH_INVALID_REGION_RATIO", "severity": "warning", "trigger": {"invalid_pixel_ratio": features["invalid_pixel_ratio"]}, "related_features": ["invalid_pixel_ratio"]})
+        if float(features.get("border_touch_ratio", 0.0)) > 0.02:
+            flags.append({"code": "BORDER_TOUCH", "severity": "warning", "trigger": {"border_touch_ratio": features["border_touch_ratio"]}, "related_features": ["border_touch_ratio"]})
+        if float(features.get("plane_residual_std", 0.0)) > 2.0:
+            flags.append({"code": "HIGH_PLANE_RESIDUAL", "severity": "warning", "trigger": {"plane_residual_std": features["plane_residual_std"]}, "related_features": ["plane_residual_std"]})
+        if float(features.get("footprint_area_mm2", 0.0)) < 50.0:
+            flags.append({"code": "SMALL_OBJECT", "severity": "warning", "trigger": {"footprint_area_mm2": features["footprint_area_mm2"]}, "related_features": ["footprint_area_mm2"]})
+        if int(features.get("invalid_hole_count", 0)) > 10:
+            flags.append({"code": "SEGMENTATION_FRAGMENTED", "severity": "warning", "trigger": {"invalid_hole_count": features["invalid_hole_count"]}, "related_features": ["invalid_hole_count"]})
+        if float(features.get("height_p99", 0.0)) > (float(features.get("height_mean", 0.0)) * 3.0 + 1e-6):
+            flags.append({"code": "EXTREME_HEIGHT_OUTLIER", "severity": "warning", "trigger": {"height_p99": features["height_p99"], "height_mean": features["height_mean"]}, "related_features": ["height_p99", "height_mean"]})
+        return flags
+
+    def _pick_primary_object(self, objects: Any) -> dict[str, Any] | None:
+        if not isinstance(objects, list) or not objects:
+            return None
+        return max([item for item in objects if isinstance(item, dict)], key=lambda item: float(item.get("footprint_area_mm2") or 0.0), default=None)
+
+    def _build_contour_payload(self, objects: Any) -> dict[str, Any]:
+        rows = []
+        for item in objects if isinstance(objects, list) else []:
+            if not isinstance(item, dict):
+                continue
+            rows.append({"object_id": item.get("object_id"), "contour_px": item.get("contour_px")})
+        return {"coordinate_space": "projection_pixel", "objects": rows}
+
+    def _build_hull_payload(self, objects: Any) -> dict[str, Any]:
+        rows = []
+        for item in objects if isinstance(objects, list) else []:
+            if not isinstance(item, dict):
+                continue
+            contour = item.get("contour_px")
+            if not isinstance(contour, list) or len(contour) < 3:
+                continue
+            pts = np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2)
+            hull = cv2.convexHull(pts).reshape(-1, 2).tolist()
+            rows.append({"object_id": item.get("object_id"), "convex_hull_px": hull})
+        return {"coordinate_space": "projection_pixel", "objects": rows}
+
+    def _build_ellipse_payload(self, objects: Any) -> dict[str, Any]:
+        rows = []
+        for item in objects if isinstance(objects, list) else []:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "object_id": item.get("object_id"),
+                    "major_axis_mm": item.get("major_axis_mm"),
+                    "minor_axis_mm": item.get("minor_axis_mm"),
+                    "eccentricity": item.get("feature_eccentricity"),
+                    "roundness": item.get("sphericity_score"),
+                }
+            )
+        return {"coordinate_space": "world_mm", "objects": rows}
+
+    def _build_axes_payload(self, objects: Any) -> dict[str, Any]:
+        rows = []
+        for item in objects if isinstance(objects, list) else []:
+            if not isinstance(item, dict):
+                continue
+            bbox = item.get("bbox_px")
+            centroid = item.get("centroid_px")
+            if not (isinstance(bbox, list) and len(bbox) >= 4 and isinstance(centroid, list) and len(centroid) >= 2):
+                continue
+            rows.append(
+                {
+                    "object_id": item.get("object_id"),
+                    "centroid_px": centroid,
+                    "principal_axes_px": {"major": [bbox[2] / 2.0, 0.0], "minor": [0.0, bbox[3] / 2.0]},
+                }
+            )
+        return {"coordinate_space": "projection_pixel", "objects": rows}
+
+    def _build_radial_profile(self, *, normalized: np.ndarray, mask: np.ndarray, frame: HeightmapFrame) -> dict[str, Any]:
+        ys, xs = np.where(mask)
+        if xs.size == 0:
+            return {"coordinate_space": "world_mm", "bins": [], "values": []}
+        cx = float(np.mean(xs))
+        cy = float(np.mean(ys))
+        r_px = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+        values = normalized[ys, xs]
+        bins = np.linspace(0.0, float(np.max(r_px)) + 1e-6, num=16)
+        idx = np.digitize(r_px, bins, right=False)
+        profile = []
+        for ii in range(1, len(bins) + 1):
+            vals = values[idx == ii]
+            profile.append(float(np.mean(vals)) if vals.size else 0.0)
+        return {"coordinate_space": "world_mm", "radius_bins_px": [float(v) for v in bins.tolist()], "height_mean_by_radius": profile, "x_resolution_mm": float(frame.x_resolution_mm), "y_resolution_mm": float(frame.y_resolution_mm)}
+
+    def _build_height_histogram(self, *, normalized: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
+        values = normalized[mask]
+        if values.size == 0:
+            return {"coordinate_space": "world_mm", "bin_edges": [], "counts": []}
+        counts, edges = np.histogram(values, bins=20)
+        return {"coordinate_space": "world_mm", "bin_edges": [float(v) for v in edges.tolist()], "counts": [int(v) for v in counts.tolist()]}
+
+    def _estimate_solidity(self, primary: dict[str, Any] | None, *, frame: HeightmapFrame) -> float:
+        if not isinstance(primary, dict):
+            return 0.0
+        contour = primary.get("contour_px")
+        if not isinstance(contour, list) or len(contour) < 3:
+            return 0.0
+        pts = np.asarray(contour, dtype=np.float32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(pts)
+        hull_area_px = float(cv2.contourArea(hull))
+        area_mm2 = float(primary.get("footprint_area_mm2") or 0.0)
+        footprint_area_px = area_mm2 / max(frame.pixel_area_mm2(), 1e-9)
+        return float(footprint_area_px / hull_area_px) if hull_area_px > 0 else 0.0
+
+    def _as_float(self, value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+
+@dataclass
 class ClassifyMiningBall25DStage:
     name: str = "ClassifyMiningBall25D"
     category: str = "classification"
@@ -3836,6 +4373,8 @@ class ClassifyMiningBall25DStage:
     produced_modalities: tuple[CaptureModality, ...] = ()
     produced_artifacts: tuple[str, ...] = ("classification",)
     stage_category: str | None = "classification"
+    classifier_rules_path: str | None = None
+    classifier_rules_pipeline_path: str | None = None
 
     def run(self, context: PipelineContext) -> None:
         _assert_not_preview_semantic(context, stage_name=self.name)
@@ -3849,6 +4388,56 @@ class ClassifyMiningBall25DStage:
         numeric_source_artifact_id = str((semantic_raster or {}).get("artifact_id") or "height_above_belt_raster")
         if str(context.get_artifact("height_processing_semantic_field", "")) != "height_above_belt":
             raise ValueError("classification cannot use raw_sensor_z unless explicitly debug")
+        resolved_rules = resolve_classifier_rule_set(
+            runtime_override_path=self.classifier_rules_path,
+            pipeline_config_path=self.classifier_rules_pipeline_path,
+        )
+        rule_set_id = resolved_rules.rule_set_id
+        rule_set_path = resolved_rules.rule_set_path
+        rule_set_version = resolved_rules.rule_set_version
+        rule_set_source = resolved_rules.rule_set_source
+        rule_params = dict(resolved_rules.params or DEFAULT_RULE_PARAMS)
+        use_external_rules = rule_set_source != "builtin_default"
+        ml_service = None
+        active_deployment = None
+        deployment_model_id = None
+        deployment_id = None
+        deployment_diagnostic: str | None = None
+        runtime_resolution: dict[str, Any] = {}
+        fallback_used = False
+        fallback_reason: str | None = None
+        inference_backend = "heuristic"
+        inference_count = 0
+        inference_duration_ms = 0.0
+        incompatible_count = 0
+        inference_failure_count = 0
+        deployment_resolution_failures = 0
+        calibration_compatibility_failures = 0
+        schema_mismatch_failures = 0
+        try:
+            output_dir: Path = context.require_artifact("output_dir")
+            data_dir = output_dir.parents[1] if len(output_dir.parents) >= 2 else output_dir.parent
+            ml_service = MLService(data_dir)
+            pipeline_id = str(context.get_artifact("pipeline_id", "25d_ball_inspection") or "25d_ball_inspection")
+            runtime_resolution = ml_service.resolve_active_deployment(
+                pipeline_id=pipeline_id,
+                stage_id="classification",
+                pipeline_family="25d",
+            )
+            active_deployment = runtime_resolution.get("deployment") if isinstance(runtime_resolution, dict) else None
+            if active_deployment and (runtime_resolution.get("diagnostics") or {}).get("compatible"):
+                deployment_model_id = str(active_deployment.get("model_id") or "")
+                deployment_id = str(active_deployment.get("id") or "")
+                inference_backend = "ml_model"
+            else:
+                fallback_used = True
+                fallback_reason = "incompatible_or_missing_deployment"
+                incompatible_count += 1
+        except Exception as exc:
+            deployment_diagnostic = f"ml_runtime_unavailable: {exc}"
+            fallback_used = True
+            fallback_reason = "runtime_resolution_failed"
+            deployment_resolution_failures += 1
         objects = context.get_artifact("objects", [])
         ball_count = 0
         non_ball = 0
@@ -3858,16 +4447,65 @@ class ClassifyMiningBall25DStage:
                 item["metrics_coordinate_space"] = "raw_mm"
             if "correction_source" not in item:
                 item["correction_source"] = "none"
-            label, display_label, class_name, confidence = _classify_25d(item)
-            superclass = map_label_to_superclass(label)
-            label, display_label, class_name, confidence, superclass = apply_sphericity_3d_fallback_to_object(
-                item,
-                label=label,
-                display_label=display_label,
-                class_name=class_name,
-                confidence=confidence,
-                superclass=superclass,
-            )
+            ml_predicted = False
+            if ml_service is not None and deployment_model_id:
+                try:
+                    infer_t0 = datetime.now(UTC)
+                    feat_row = features_from_object(
+                        obj=item,
+                        take_id=str(context.get_artifact("take_id", "")),
+                        dataset_id=None,
+                        session_id=None,
+                        labels=[],
+                        validation_status=None,
+                    )
+                    calib_available = context.get_artifact("calibration") is not None
+                    runtime_input_check = ml_service.runtime.validate_runtime_inputs(
+                        model=(runtime_resolution.get("model") if isinstance(runtime_resolution, dict) else {}) or {},
+                        feature_row=feat_row,
+                        object_metrics=item,
+                        calibration_available=bool(calib_available),
+                    )
+                    if not runtime_input_check.get("compatible"):
+                        errs = [str(v) for v in runtime_input_check.get("errors", [])] if isinstance(runtime_input_check.get("errors"), list) else []
+                        if "mm_calibration_required" in errs:
+                            calibration_compatibility_failures += 1
+                        if "feature_missing" in errs or "feature_dtype_mismatch" in errs:
+                            schema_mismatch_failures += 1
+                        raise ValueError(f"runtime_input_incompatible: {runtime_input_check}")
+                    predicted, probs = ml_service.predict_row(model_id=deployment_model_id, row=feat_row)
+                    superclass = predicted
+                    label, display_label, class_name, confidence = _labels_for_superclass(superclass, confidence=max(probs.values()) if probs else 0.5)
+                    item["rule_path"] = "ml_deployment"
+                    item["confidence_proxy"] = confidence
+                    ml_predicted = True
+                    inference_count += 1
+                    inference_duration_ms += (datetime.now(UTC) - infer_t0).total_seconds() * 1000.0
+                except Exception as exc:
+                    deployment_diagnostic = f"ml_prediction_failed: {exc}"
+                    fallback_used = True
+                    fallback_reason = "inference_failure"
+                    incompatible_count += 1
+                    inference_failure_count += 1
+            if not ml_predicted and use_external_rules:
+                pred = predict_superclass_from_rules(item, rule_params)
+                superclass = pred.superclass
+                label, display_label, class_name, confidence = _labels_for_superclass(superclass, confidence=pred.confidence_proxy)
+                item["rule_path"] = pred.rule_path
+                item["confidence_proxy"] = pred.confidence_proxy
+            elif not ml_predicted:
+                label, display_label, class_name, confidence = _classify_25d(item)
+                superclass = map_label_to_superclass(label)
+                label, display_label, class_name, confidence, superclass = apply_sphericity_3d_fallback_to_object(
+                    item,
+                    label=label,
+                    display_label=display_label,
+                    class_name=class_name,
+                    confidence=confidence,
+                    superclass=superclass,
+                )
+                item["rule_path"] = "builtin_legacy"
+                item["confidence_proxy"] = confidence
             item["class_name"] = class_name
             item["confidence"] = confidence
             item["label"] = label
@@ -3879,6 +4517,29 @@ class ClassifyMiningBall25DStage:
                 "display_label": display_label,
                 "superclass": superclass,
                 "confidence": confidence,
+                "classifier_engine": "mining_steel_ball_classification_25d",
+                "model_id": deployment_model_id,
+                "model_version": ((runtime_resolution.get("model") or {}).get("version") if isinstance(runtime_resolution.get("model"), dict) else None),
+                "feature_schema_version": "1.0.0" if deployment_model_id else None,
+                "deployment_id": deployment_id,
+                "classifier_backend": inference_backend,
+                "split_strategy": ((runtime_resolution.get("model") or {}).get("artifact_paths") or {}).get("split_strategy") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "training_experiment_id": (runtime_resolution.get("model") or {}).get("training_experiment_id") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "inference_timestamp": datetime.now(UTC).isoformat(),
+                "deployment_status": (active_deployment or {}).get("status"),
+                "backend_name": ((runtime_resolution.get("model") or {}).get("backend") or {}).get("backend_name") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "backend_version": ((runtime_resolution.get("model") or {}).get("backend") or {}).get("backend_version") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "feature_schema_hash": feature_ordering_hash(),
+                "calibration_compatibility": ((runtime_resolution.get("diagnostics") or {}).get("checks") or {}).get("calibration") if isinstance(runtime_resolution, dict) else None,
+                "inference_duration_ms": inference_duration_ms,
+                "fallback_used": fallback_used,
+                "fallback_reason": fallback_reason,
+                "rule_set_id": rule_set_id,
+                "rule_set_path": rule_set_path,
+                "rule_set_version": rule_set_version,
+                "rule_set_source": rule_set_source,
+                "rule_path": item.get("rule_path"),
+                "confidence_proxy": item.get("confidence_proxy"),
             }
             diameter_metrics = _compose_diameter_metrics(item)
             item["diameter_ellipse_mm"] = diameter_metrics.get("diameter_ellipse_mm")
@@ -3910,6 +4571,10 @@ class ClassifyMiningBall25DStage:
             }
             explanation = _classification_explanation_for_object(item)
             item["classification_explanation"] = explanation
+            ux_summary = build_object_feature_ux_summary(item)
+            item["feature_group_summaries"] = ux_summary.get("feature_group_summaries") or []
+            item["feature_warnings"] = ux_summary.get("feature_warnings") or []
+            item["feature_readiness"] = ux_summary.get("feature_readiness") or {}
             item["classification_explanation_ref"] = {
                 "artifact_id": "classification_explanation",
                 "object_id": int(item.get("object_id", 0) or 0),
@@ -3935,6 +4600,18 @@ class ClassifyMiningBall25DStage:
                         "numeric_source_artifact": numeric_source_artifact_id,
                         "semantic_field": "height_above_belt",
                         "classification_explanation_artifact_id": "classification_explanation",
+                        "classifier_engine": "mining_steel_ball_classification_25d",
+                        "classifier_backend": inference_backend,
+                        "fallback_used": fallback_used,
+                        "fallback_reason": fallback_reason,
+                        "deployment_id": deployment_id,
+                        "model_id": deployment_model_id,
+                        "feature_schema_version": "1.0.0" if deployment_model_id else None,
+                        "rule_set_id": rule_set_id,
+                        "rule_set_path": rule_set_path,
+                        "rule_set_version": rule_set_version,
+                        "rule_set_source": rule_set_source,
+                        "rule_path": item.get("rule_path"),
                     }
                 ),
             )
@@ -3960,6 +4637,27 @@ class ClassifyMiningBall25DStage:
                 "superclass": canonical.get("superclass"),
                 "confidence": canonical.get("confidence"),
                 "object_count": object_count,
+                "classifier_engine": "mining_steel_ball_classification_25d",
+                "model_id": deployment_model_id,
+                "model_version": ((runtime_resolution.get("model") or {}).get("version") if isinstance(runtime_resolution.get("model"), dict) else None),
+                "feature_schema_version": "1.0.0" if deployment_model_id else None,
+                "deployment_id": deployment_id,
+                "classifier_backend": inference_backend,
+                "split_strategy": ((runtime_resolution.get("model") or {}).get("artifact_paths") or {}).get("split_strategy") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "training_experiment_id": (runtime_resolution.get("model") or {}).get("training_experiment_id") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "inference_timestamp": datetime.now(UTC).isoformat(),
+                "deployment_status": (active_deployment or {}).get("status"),
+                "backend_name": ((runtime_resolution.get("model") or {}).get("backend") or {}).get("backend_name") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "backend_version": ((runtime_resolution.get("model") or {}).get("backend") or {}).get("backend_version") if isinstance(runtime_resolution.get("model"), dict) else None,
+                "feature_schema_hash": feature_ordering_hash(),
+                "calibration_compatibility": ((runtime_resolution.get("diagnostics") or {}).get("checks") or {}).get("calibration") if isinstance(runtime_resolution, dict) else None,
+                "inference_duration_ms": inference_duration_ms,
+                "fallback_used": fallback_used,
+                "fallback_reason": fallback_reason,
+                "rule_set_id": rule_set_id,
+                "rule_set_path": rule_set_path,
+                "rule_set_version": rule_set_version,
+                "rule_set_source": rule_set_source,
                 "objects": [
                     {
                         "object_id": item.get("object_id"),
@@ -3967,6 +4665,8 @@ class ClassifyMiningBall25DStage:
                         "display_label": item.get("display_label"),
                         "superclass": item.get("superclass"),
                         "confidence": item.get("confidence"),
+                        "rule_path": item.get("rule_path"),
+                        "confidence_proxy": item.get("confidence_proxy"),
                     }
                     for item in objects
                 ],
@@ -3984,6 +4684,17 @@ class ClassifyMiningBall25DStage:
                     "superclass": canonical.get("superclass"),
                     "numeric_source_artifact": numeric_source_artifact_id,
                     "semantic_field": "height_above_belt",
+                    "classifier_engine": "mining_steel_ball_classification_25d",
+                    "classifier_backend": inference_backend,
+                    "fallback_used": fallback_used,
+                    "fallback_reason": fallback_reason,
+                    "model_id": deployment_model_id,
+                    "deployment_id": deployment_id,
+                    "deployment_diagnostic": deployment_diagnostic,
+                    "rule_set_id": rule_set_id,
+                    "rule_set_path": rule_set_path,
+                    "rule_set_version": rule_set_version,
+                    "rule_set_source": rule_set_source,
                 }
             ),
         )
@@ -4006,11 +4717,66 @@ class ClassifyMiningBall25DStage:
                 for row in explanations
             ],
         }
+        per_object_ux_payload = []
+        for item in objects:
+            ux_payload = {
+                "object_id": item.get("object_id"),
+                "feature_group_summaries": item.get("feature_group_summaries") or [],
+                "feature_warnings": item.get("feature_warnings") or [],
+                "feature_readiness": item.get("feature_readiness") or {},
+            }
+            per_object_ux_payload.append(
+                {
+                    "object_id": item.get("object_id"),
+                    "operations": filter_for_operations(ux_payload),
+                    "studio": filter_for_studio(ux_payload),
+                    "classifier_studio": filter_for_classifier_studio(ux_payload),
+                }
+            )
+        runtime_summary_payload = {
+            "stage": "classification",
+            "artifact_id": "feature_runtime_summary",
+            "scope": "per_object",
+            "objects": [{"object_id": row.get("object_id"), "operations": row.get("operations")} for row in per_object_ux_payload],
+        }
+        studio_summary_payload = {
+            "stage": "classification",
+            "artifact_id": "feature_studio_summary",
+            "scope": "per_object",
+            "objects": [
+                {
+                    "object_id": row.get("object_id"),
+                    "studio": row.get("studio"),
+                    "classifier_studio": row.get("classifier_studio"),
+                }
+                for row in per_object_ux_payload
+            ],
+        }
         (output_dir / "classification_explanation.json").write_text(json.dumps(explanation_payload, indent=2), encoding="utf-8")
         (output_dir / "metric_explanation.json").write_text(json.dumps(metric_payload, indent=2), encoding="utf-8")
+        (output_dir / "feature_runtime_summary.json").write_text(json.dumps(runtime_summary_payload, indent=2), encoding="utf-8")
+        (output_dir / "feature_studio_summary.json").write_text(json.dumps(studio_summary_payload, indent=2), encoding="utf-8")
+        runtime_diag_payload = {
+            "stage": "classification",
+            "artifact_id": "classification_runtime_diagnostics",
+            "deployment_resolution": runtime_resolution,
+            "compatibility_checks": (runtime_resolution.get("diagnostics") if isinstance(runtime_resolution, dict) else {}),
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "deployment_diagnostic": deployment_diagnostic,
+            "feature_schema_used": "1.0.0",
+            "feature_schema_hash": feature_ordering_hash(),
+            "inference_backend_used": inference_backend,
+            "inference_duration_ms": inference_duration_ms,
+            "execution_timing": {"status": "captured_by_stage_profiler"},
+        }
+        (output_dir / "classification_runtime_diagnostics.json").write_text(json.dumps(runtime_diag_payload, indent=2), encoding="utf-8")
         files = dict(context.get_artifact("files", {}))
         files["classification_explanation"] = "classification_explanation.json"
         files["metric_explanation"] = "metric_explanation.json"
+        files["classification_runtime_diagnostics"] = "classification_runtime_diagnostics.json"
+        files["feature_runtime_summary"] = "feature_runtime_summary.json"
+        files["feature_studio_summary"] = "feature_studio_summary.json"
         context.set_artifact("files", files)
         context.add_processing_artifact(
             artifact_id="classification_explanation",
@@ -4032,6 +4798,96 @@ class ClassifyMiningBall25DStage:
                 }
             ),
         )
+        context.add_processing_artifact(
+            artifact_id="classification_runtime_diagnostics",
+            stage_id="classification",
+            kind="json",
+            title="Classification runtime diagnostics",
+            path="classification_runtime_diagnostics.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "semantic_type": "classification_runtime_diagnostics",
+                    "fallback_used": fallback_used,
+                    "fallback_reason": fallback_reason,
+                    "deployment_id": deployment_id,
+                }
+            ),
+        )
+        context.add_processing_artifact(
+            artifact_id="feature_runtime_summary",
+            stage_id="classification",
+            kind="json",
+            title="Feature runtime summary",
+            path="feature_runtime_summary.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "semantic_type": "feature_runtime_summary",
+                    "audience": "operations",
+                    "object_count": len(objects),
+                }
+            ),
+        )
+        context.add_processing_artifact(
+            artifact_id="feature_studio_summary",
+            stage_id="classification",
+            kind="json",
+            title="Feature studio summary",
+            path="feature_studio_summary.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta(
+                {
+                    "source": "native_pipeline",
+                    "producer": self.name,
+                    "semantic_type": "feature_studio_summary",
+                    "audience": "studio_classifier_studio",
+                    "object_count": len(objects),
+                }
+            ),
+        )
+        try:
+            stats_storage = MLStorage(data_dir)
+            day_key = datetime.now(UTC).strftime("%Y%m%d")
+            stats_rel = f"runtime_stats/{day_key}.json"
+            stats_path = stats_storage.root / stats_rel
+            if stats_path.is_file():
+                stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            else:
+                stats = {
+                    "inference_count": 0,
+                    "inference_success_count": 0,
+                    "inference_failure_count": 0,
+                    "fallback_count": 0,
+                    "incompatible_deployment_count": 0,
+                    "heuristic_usage_count": 0,
+                    "deployment_resolution_failures": 0,
+                    "calibration_compatibility_failures": 0,
+                    "schema_mismatch_failures": 0,
+                    "inference_time_total_ms": 0.0,
+                }
+            stats["inference_count"] = int(stats.get("inference_count", 0)) + int(inference_count)
+            stats["inference_success_count"] = int(stats.get("inference_success_count", 0)) + int(max(0, inference_count - inference_failure_count))
+            stats["inference_failure_count"] = int(stats.get("inference_failure_count", 0)) + int(inference_failure_count)
+            stats["fallback_count"] = int(stats.get("fallback_count", 0)) + int(1 if fallback_used else 0)
+            stats["incompatible_deployment_count"] = int(stats.get("incompatible_deployment_count", 0)) + int(incompatible_count)
+            stats["heuristic_usage_count"] = int(stats.get("heuristic_usage_count", 0)) + int(1 if inference_backend == "heuristic" else 0)
+            stats["deployment_resolution_failures"] = int(stats.get("deployment_resolution_failures", 0)) + int(deployment_resolution_failures)
+            stats["calibration_compatibility_failures"] = int(stats.get("calibration_compatibility_failures", 0)) + int(calibration_compatibility_failures)
+            stats["schema_mismatch_failures"] = int(stats.get("schema_mismatch_failures", 0)) + int(schema_mismatch_failures)
+            stats["inference_time_total_ms"] = float(stats.get("inference_time_total_ms", 0.0)) + float(inference_duration_ms)
+            total_inf = max(1, int(stats.get("inference_count", 0)))
+            stats["average_inference_time_ms"] = float(stats["inference_time_total_ms"]) / float(total_inf)
+            stats_storage.write_artifact(stats_rel, stats)
+        except Exception:
+            pass
         context.add_processing_artifact(
             artifact_id="metric_explanation",
             stage_id="classification",
@@ -5785,6 +6641,103 @@ def _contour_metrics_in_metric_space(
     }
 
 
+def _radial_boundary_uniformity_from_contour_mm(contour_mm: list[list[float]] | None) -> dict[str, Any]:
+    if not isinstance(contour_mm, list) or len(contour_mm) < 8:
+        return {
+            "radial_mean": None,
+            "radial_std": None,
+            "radial_cv": None,
+            "radial_max_deviation": None,
+        }
+    pts = np.asarray(contour_mm, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return {
+            "radial_mean": None,
+            "radial_std": None,
+            "radial_cv": None,
+            "radial_max_deviation": None,
+        }
+    center = np.mean(pts[:, :2], axis=0)
+    radii = np.sqrt(np.sum((pts[:, :2] - center) ** 2, axis=1))
+    if radii.size <= 0:
+        return {
+            "radial_mean": None,
+            "radial_std": None,
+            "radial_cv": None,
+            "radial_max_deviation": None,
+        }
+    radial_mean = float(np.mean(radii))
+    radial_std = float(np.std(radii))
+    radial_cv = float(radial_std / max(radial_mean, 1e-9))
+    radial_max_deviation = float(np.max(np.abs(radii - radial_mean)))
+    return {
+        "radial_mean": round(radial_mean, 4),
+        "radial_std": round(radial_std, 4),
+        "radial_cv": round(radial_cv, 6),
+        "radial_max_deviation": round(radial_max_deviation, 4),
+    }
+
+
+def _fit_sphere_least_squares(points_xyz_mm: np.ndarray) -> dict[str, Any]:
+    if points_xyz_mm.ndim != 2 or points_xyz_mm.shape[1] != 3 or points_xyz_mm.shape[0] < 8:
+        return {"valid": False}
+    xyz = np.asarray(points_xyz_mm, dtype=np.float64)
+    x = xyz[:, 0]
+    y = xyz[:, 1]
+    z = xyz[:, 2]
+    a = np.column_stack((2.0 * x, 2.0 * y, 2.0 * z, np.ones_like(x)))
+    b = x * x + y * y + z * z
+    try:
+        sol, *_ = np.linalg.lstsq(a, b, rcond=None)
+    except Exception:
+        return {"valid": False}
+    cx, cy, cz, c0 = [float(v) for v in sol.tolist()]
+    radius_sq = cx * cx + cy * cy + cz * cz + c0
+    if radius_sq <= 0.0:
+        return {"valid": False}
+    radius = float(np.sqrt(radius_sq))
+    dist = np.sqrt(np.sum((xyz - np.asarray([cx, cy, cz], dtype=np.float64)) ** 2, axis=1))
+    residual = dist - radius
+    return {
+        "valid": True,
+        "center_mm": [round(cx, 4), round(cy, 4), round(cz, 4)],
+        "radius_mm": round(radius, 4),
+        "rmse_mm": round(float(np.sqrt(np.mean(residual ** 2))), 4),
+        "max_error_mm": round(float(np.max(np.abs(residual))), 4),
+        "mean_residual_mm": round(float(np.mean(residual)), 4),
+        "point_count": int(xyz.shape[0]),
+        "residuals_mm": residual,
+    }
+
+
+def _fit_ellipsoid_pca(points_xyz_mm: np.ndarray) -> dict[str, Any]:
+    if points_xyz_mm.ndim != 2 or points_xyz_mm.shape[1] != 3 or points_xyz_mm.shape[0] < 8:
+        return {"valid": False}
+    xyz = np.asarray(points_xyz_mm, dtype=np.float64)
+    center = np.mean(xyz, axis=0)
+    centered = xyz - center
+    cov = np.cov(centered.T)
+    evals, evecs = np.linalg.eigh(cov)
+    evals = np.maximum(evals, 1e-12)
+    order = np.argsort(evals)[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+    # Gaussian-to-surface proxy scaling factor; used as a stable geometric proxy.
+    axes = np.sqrt(evals) * 2.0
+    u = centered @ evecs
+    n = (u[:, 0] / max(float(axes[0]), 1e-9)) ** 2 + (u[:, 1] / max(float(axes[1]), 1e-9)) ** 2 + (u[:, 2] / max(float(axes[2]), 1e-9)) ** 2
+    residual = np.abs(n - 1.0)
+    ar = float(max(axes) / max(min(axes), 1e-9))
+    return {
+        "valid": True,
+        "center_mm": [round(float(center[0]), 4), round(float(center[1]), 4), round(float(center[2]), 4)],
+        "axes_mm": [round(float(axes[0]), 4), round(float(axes[1]), 4), round(float(axes[2]), 4)],
+        "aspect_ratio": round(ar, 6),
+        "rmse": round(float(np.sqrt(np.mean(residual ** 2))), 6),
+        "point_count": int(xyz.shape[0]),
+    }
+
+
 def _roi_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
     roi = metadata.get("roi_25d")
     return roi if isinstance(roi, dict) else None
@@ -5838,17 +6791,46 @@ def _classify_25d(item: dict[str, Any]) -> tuple[str, str, str, float]:
     flat = float(item.get("feature_flatness") or 0.0)
     rough = float(item.get("feature_edge_roughness") or 0.0)
     vol = float(item.get("feature_volume_proxy_mm3") or 0.0)
+    footprint = item.get("footprint_geometry") if isinstance(item.get("footprint_geometry"), dict) else {}
+    surface = item.get("surface_geometry") if isinstance(item.get("surface_geometry"), dict) else {}
+    consistency = item.get("sphere_consistency") if isinstance(item.get("sphere_consistency"), dict) else {}
+    damage = item.get("damage_metrics") if isinstance(item.get("damage_metrics"), dict) else {}
+    radial_cv = float(footprint.get("radial_cv") or 0.0)
+    sphere_rmse = float(surface.get("sphere_fit_rmse_mm") or 0.0)
+    radial_h_rmse = float(consistency.get("radial_height_rmse_mm") or 0.0)
+    completeness = float(consistency.get("surface_completeness_ratio") or 0.0)
+    flat_ratio = float(damage.get("flat_region_ratio") or 0.0)
+    discontinuity = float(damage.get("surface_discontinuity_score") or 0.0)
     # Eccentricity gates relaxed: cv2.fitEllipse on noisy anisotropic contours
     # routinely produces 0.4-0.5 even for visibly round balls. The bbox/3D
     # sphericity signals are the trustworthy ones for the ball verdict; we keep
     # ecc only as a soft guard against severe elongation.
-    if 8.0 <= max_h <= 95.0 and sph3d >= 0.8 and ecc < 0.65 and flat > 0.15 and rough < 8.0:
+    if (
+        8.0 <= max_h <= 95.0
+        and sph3d >= 0.8
+        and ecc < 0.65
+        and flat > 0.15
+        and rough < 8.0
+        and radial_cv < 0.14
+        and sphere_rmse < 8.0
+        and radial_h_rmse < 8.0
+        and completeness > 0.55
+    ):
         return "bola_buena", "Bola buena", "ball", 0.82
-    if ecc >= 0.85 or flat < -0.2 or rough > 12.0:
+    if ecc >= 0.85 or flat < -0.2 or rough > 12.0 or flat_ratio > 0.65 or discontinuity > 1.25:
         return "bola_deformada", "Scrap de Bola - Bola deformada", "non_ball", 0.78
     if max_h < 6.0 or p95_h < 4.0 or vol < 4000.0:
         return "planchuela", "Chatarra - Planchuelas", "non_ball", 0.72
     return "bola_con_chip", "Scrap de Bola - Bola con chip", "non_ball", 0.66
+
+
+def _labels_for_superclass(superclass: str, *, confidence: float | None = None) -> tuple[str, str, str, float]:
+    conf = float(confidence if confidence is not None else 0.66)
+    if superclass == "BALL_GOOD":
+        return "bola_buena", "Bola buena", "ball", conf
+    if superclass == "SCRAP_METAL":
+        return "chatarra", "Chatarra - Chatarra", "non_ball", conf
+    return "bola_con_chip", "Scrap de Bola - Bola con chip", "non_ball", conf
 
 
 def _metric(item: dict[str, Any], key: str) -> float | None:
@@ -5860,6 +6842,18 @@ def _metric(item: dict[str, Any], key: str) -> float | None:
         return _safe_float(((item.get("height_above_belt_mm") or {}).get("p95_height_mm")) if isinstance(item.get("height_above_belt_mm"), dict) else None)
     if key == "mean_height_mm":
         return _safe_float(((item.get("height_above_belt_mm") or {}).get("mean_height_mm")) if isinstance(item.get("height_above_belt_mm"), dict) else None)
+    if key in {"radial_cv", "circularity", "circularity_score"}:
+        group = item.get("footprint_geometry") if isinstance(item.get("footprint_geometry"), dict) else {}
+        return _safe_float(group.get(key))
+    if key in {"sphere_fit_rmse_mm", "sphere_fit_max_error_mm", "sphere_vs_ellipsoid_gain", "deformation_score"}:
+        group = item.get("surface_geometry") if isinstance(item.get("surface_geometry"), dict) else {}
+        return _safe_float(group.get(key))
+    if key in {"radial_height_rmse_mm", "radial_height_max_error_mm", "surface_completeness_ratio", "observed_volume_ratio", "volume_deficit_ratio"}:
+        group = item.get("sphere_consistency") if isinstance(item.get("sphere_consistency"), dict) else {}
+        return _safe_float(group.get(key))
+    if key in {"surface_roughness_mean", "surface_roughness_std", "surface_roughness_score", "flat_region_ratio", "surface_discontinuity_score", "high_curvature_ratio"}:
+        group = item.get("damage_metrics") if isinstance(item.get("damage_metrics"), dict) else {}
+        return _safe_float(group.get(key))
     return _safe_float(item.get(key))
 
 
@@ -6024,6 +7018,15 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
     invariant_warnings = item.get("geometry_invariant_warnings") if isinstance(item.get("geometry_invariant_warnings"), list) else []
     footprint_area = _metric(item, "footprint_area_mm2")
     trunc = _safe_float(((item.get("sphere_fit_diagnostics") or {}).get("estimated_truncation_ratio")) if isinstance(item.get("sphere_fit_diagnostics"), dict) else None)
+    footprint_group = item.get("footprint_geometry") if isinstance(item.get("footprint_geometry"), dict) else {}
+    surface_group = item.get("surface_geometry") if isinstance(item.get("surface_geometry"), dict) else {}
+    consistency_group = item.get("sphere_consistency") if isinstance(item.get("sphere_consistency"), dict) else {}
+    damage_group = item.get("damage_metrics") if isinstance(item.get("damage_metrics"), dict) else {}
+    radial_cv = _safe_float(footprint_group.get("radial_cv"))
+    sphere_fit_rmse = _safe_float(surface_group.get("sphere_fit_rmse_mm"))
+    radial_height_rmse = _safe_float(consistency_group.get("radial_height_rmse_mm"))
+    volume_deficit = _safe_float(consistency_group.get("volume_deficit_ratio"))
+    flat_region_ratio = _safe_float(damage_group.get("flat_region_ratio"))
     fit_rmse = _metric(item, "fit_rmse_mm")
     scale = (item.get("scale_correction_applied") or {}) if isinstance(item.get("scale_correction_applied"), dict) else {}
     scale_x = _safe_float(scale.get("x"))
@@ -6298,6 +7301,70 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
             and roundness is not None and roundness >= 0.75
             and ecc is not None and ecc < 0.65
         )
+    if radial_cv is not None:
+        rules.append(
+            _rule(
+                rule_id="footprint.radial_uniformity",
+                label="Radial boundary uniformity",
+                description="Contour radial CV should remain low for coherent spheres.",
+                metric_key="radial_cv",
+                value=radial_cv,
+                comparator="<=",
+                expected={"max": 0.14},
+                passed=radial_cv <= 0.14,
+                severity="warning",
+                contribution="positive" if radial_cv <= 0.14 else "negative",
+                message="Boundary radial uniformity is coherent." if radial_cv <= 0.14 else "Boundary irregularity suggests chips/fracture.",
+            )
+        )
+    if sphere_fit_rmse is not None:
+        rules.append(
+            _rule(
+                rule_id="surface.sphere_fit_rmse",
+                label="Sphere fit RMSE",
+                description="Visible surface points should fit a sphere with low residuals.",
+                metric_key="sphere_fit_rmse_mm",
+                value=sphere_fit_rmse,
+                comparator="<=",
+                expected={"max": 8.0},
+                passed=sphere_fit_rmse <= 8.0,
+                severity="warning",
+                contribution="positive" if sphere_fit_rmse <= 8.0 else "negative",
+                message="Sphere fit residual is within range." if sphere_fit_rmse <= 8.0 else "Sphere fit residual indicates deformation/damage.",
+            )
+        )
+    if radial_height_rmse is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.radial_height_rmse",
+                label="Radial height coherence",
+                description="Observed cap profile should match spherical-cap model.",
+                metric_key="radial_height_rmse_mm",
+                value=radial_height_rmse,
+                comparator="<=",
+                expected={"max": 8.0},
+                passed=radial_height_rmse <= 8.0,
+                severity="warning",
+                contribution="positive" if radial_height_rmse <= 8.0 else "negative",
+                message="Height profile is sphere-consistent." if radial_height_rmse <= 8.0 else "Height profile mismatch suggests truncation/flattening.",
+            )
+        )
+    if flat_region_ratio is not None:
+        rules.append(
+            _rule(
+                rule_id="damage.flat_region",
+                label="Flat region ratio",
+                description="Large planar patches indicate impact flats or fractured truncation.",
+                metric_key="flat_region_ratio",
+                value=flat_region_ratio,
+                comparator="<=",
+                expected={"max": 0.65},
+                passed=flat_region_ratio <= 0.65,
+                severity="warning",
+                contribution="neutral" if flat_region_ratio <= 0.65 else "negative",
+                message="Flat-region evidence is limited." if flat_region_ratio <= 0.65 else "Flat-region coverage is high and supports damage.",
+            )
+        )
         rules.append(
             _rule(
                 rule_id="shape.deformation_score",
@@ -6408,7 +7475,38 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
         "geometry_invariant_warnings": invariant_warnings,
         "fit_rmse_mm": fit_rmse,
         "estimated_truncation_ratio": trunc,
+        "radial_cv": radial_cv,
+        "sphere_fit_rmse_mm": sphere_fit_rmse,
+        "radial_height_rmse_mm": radial_height_rmse,
+        "volume_deficit_ratio": volume_deficit,
+        "flat_region_ratio": flat_region_ratio,
+        "footprint_geometry": footprint_group,
+        "surface_geometry": surface_group,
+        "sphere_consistency": consistency_group,
+        "damage_metrics": damage_group,
         **diameter,
+    }
+    group_summaries = {
+        "footprint_geometry": {
+            "pass": bool(radial_cv is None or radial_cv <= 0.14),
+            "primary_metric": "radial_cv",
+            "value": radial_cv,
+        },
+        "surface_geometry": {
+            "pass": bool(sphere_fit_rmse is None or sphere_fit_rmse <= 8.0),
+            "primary_metric": "sphere_fit_rmse_mm",
+            "value": sphere_fit_rmse,
+        },
+        "sphere_consistency": {
+            "pass": bool(radial_height_rmse is None or radial_height_rmse <= 8.0),
+            "primary_metric": "radial_height_rmse_mm",
+            "value": radial_height_rmse,
+        },
+        "damage_metrics": {
+            "pass": bool(flat_region_ratio is None or flat_region_ratio <= 0.65),
+            "primary_metric": "flat_region_ratio",
+            "value": flat_region_ratio,
+        },
     }
 
     metric_trace = _build_metric_trace_for_object(item, rules)
@@ -6434,6 +7532,7 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
         "correction_scales": item.get("scale_correction_applied"),
         "decision_summary": decision_summary,
         "metrics_used": metrics_used,
+        "semantic_group_summaries": group_summaries,
         "metric_trace": metric_trace,
         "rules": rules,
     }

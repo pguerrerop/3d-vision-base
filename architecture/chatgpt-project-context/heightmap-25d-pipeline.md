@@ -573,3 +573,477 @@ Rules:
 - frontend resolution priority: explicit `color_mapping` block → render context (`render_vmin/vmax`, `colormap_id`) → display metadata (`color_scale_min/max`, `color_map`) → legacy fallback (warning).
 - `HeightLegend` renders the colorbar gradient from the same named LUT (`turbo`/`viridis`/`magma`/`gray`) the image renderer uses; no hard-coded CSS gradients.
 - hover sampling and reconstruction diffs use the same `colorMap` name + `colorScaleMin/Max`, so scalar→RGB and RGB→t inferences are LUT-consistent.
+
+## Advanced Geometric Ball-Quality Semantics (v2 additive)
+
+The `measurement` + `classification` stages now expose physically-grounded, semantically grouped ball-quality metrics while preserving legacy flat fields.
+
+### Semantic metric groups
+
+Per-object payloads now include:
+
+- `footprint_geometry`
+- `surface_geometry`
+- `sphere_consistency`
+- `damage_metrics`
+
+These are additive and mirrored into `classification_explanation.metrics_used` and `semantic_group_summaries`.
+
+### Coordinate/space assumptions
+
+- `footprint_geometry` operates on XY contour/mask geometry in metric space (mm via calibrated resolutions).
+- `surface_geometry` and `damage_metrics` operate on visible 2.5D cap points (`height_above_belt`) mapped to metric XYZ.
+- `sphere_consistency` compares visible heights against fitted sphere-cap expectations; hidden hemisphere is inferred, never directly observed.
+
+### Key metric definitions
+
+- Circularity: `C = 4*pi*A / P^2` (`A`: contour area in mm², `P`: perimeter in mm).
+- Radial boundary uniformity: radial mean/std/CV/max deviation from contour centroid.
+- Sphere fit: least-squares fit over visible XYZ points; emits center/radius/RMSE/max error.
+- Ellipsoid proxy fit: PCA-based axes/aspect + residual proxy for deformation separation.
+- Sphere-vs-ellipsoid gain: normalized RMSE improvement from sphere to ellipsoid proxy.
+- Radial height residual: RMSE/max error between observed visible cap and expected spherical cap.
+- Surface completeness: fraction of visible object support with non-trivial above-belt occupancy.
+- Volume coherence: observed volume proxy vs expected sphere volume from fitted radius.
+- Damage proxies: roughness (residual stats), flat-region ratio/largest patch, discontinuity and high-curvature ratios.
+
+### Classification/explanation integration
+
+- Heuristic classification now consumes legacy signals plus grouped evidence (`radial_cv`, sphere-fit residual, radial-height residual, completeness, flat/discontinuity evidence).
+- Explanations now include:
+  - group-level pass/fail summaries (`semantic_group_summaries`)
+  - per-metric contribution rules spanning footprint/surface/consistency/damage families
+  - preserved legacy rule compatibility.
+
+### Studio integration
+
+- Inspector now renders compact grouped summaries for:
+  - Footprint geometry
+  - Surface geometry
+  - Sphere consistency
+  - Damage metrics
+- Classification rule view renders semantic group pass/fail summaries above per-rule tables.
+
+### Limits and caveats
+
+- Ellipsoid fitting is currently a robust PCA proxy, not a full nonlinear algebraic ellipsoid fit.
+- Sphere/consistency metrics use only visible cap geometry; occluded/base-side damage is inferred probabilistically.
+- Flat/discontinuity metrics are local geometric proxies and should be combined with future RGB crack cues.
+
+### Future-readiness hooks
+
+- Grouped metrics are isolated for multimodal fusion, ML feature export, calibration, and dataset analytics without refactoring stage contracts.
+
+## Synthetic Geometry Validation Harness
+
+An additive synthetic validation framework now exists to stress-test metric-family discrimination under controlled physical defect modes.
+
+### Generator scope
+
+- Module: `vision_3d_acquisition/synthetic/advanced_geometry_25d.py`
+- Supported synthetic object types:
+  - `good_ball`
+  - `worn_ellipsoid`
+  - `truncated_sphere`
+  - `chipped_sphere`
+  - `flattened_ball`
+  - `elongated_scrap`
+
+### Acquisition realism controls
+
+Per sample, configurable:
+
+- gaussian height noise
+- missing/no-return regions
+- belt-plane tilt
+- edge aliasing perturbation
+
+All runs are seed-driven and deterministic.
+
+### Persisted synthetic metadata contract
+
+Each generated take metadata includes:
+
+- `synthetic_object_type`
+- `generation_parameters`
+- `expected_failure_modes`
+- `expected_metric_family_reactions`
+- acquisition-effects configuration
+
+Ground-truth debug assets are also persisted in take folders (`synthetic_gt_mask.png`, `synthetic_flat_regions_gt.png`).
+
+### Discrimination benchmark runner
+
+- Script: `scripts/run_advanced_25d_geometry_validation.py`
+- Generates parameterized synthetic takes, runs the existing `mining_steel_ball_classification_25d` pipeline, and writes:
+  - JSON report (`data/reports/advanced_25d_metric_family_report.json`)
+  - Markdown summary (`data/reports/advanced_25d_metric_family_report.md`)
+  - CSV feature dataset (`data/reports/advanced_25d_geometry_validation.csv`)
+  - Aggregate analytics JSON (`data/reports/advanced_25d_geometry_analysis.json`)
+
+### Classifier-studio feature export alignment
+
+The aggregate analytics JSON now includes a lightweight classifier-ready schema:
+
+- `feature_schema_version: "v1"`
+- `feature_groups` grouped as:
+  - `footprint_geometry`
+  - `surface_geometry`
+  - `sphere_consistency`
+  - `damage_metrics`
+- `feature_metadata` per feature:
+  - semantic group
+  - units
+  - directionality (`higher_is_worse`)
+  - short semantic description
+
+This keeps exports classifier-agnostic while enabling future feature selection, normalization and explainability dashboards.
+
+### Family-sensitivity analytics
+
+The harness now computes:
+
+- aggregate per-object-type family severity scores
+- family sensitivity matrix (`LOW/MEDIUM/HIGH` + numeric scores)
+- dominant and secondary failure families
+- family severity ranking
+- confusion-style expected-vs-observed dominant family validation
+- baseline calibration from `good_ball` samples (`mean/std`)
+- z-score-based feature activation summaries
+- global feature discriminativeness ranking (between-type separation proxy)
+
+## Canonical FeatureDataset Layer (Classifier-Studio Bridge)
+
+A first-pass canonical dataset layer now formalizes semantic feature exports into a classifier-agnostic contract:
+
+- implementation module: `vision_3d_acquisition/ml/features/dataset.py`
+- core entities:
+  - `FeatureSchema` (versioned feature contract + grouped semantics + metadata)
+  - `FeatureSample` (single object/sample with grouped vectors + labels + provenance metadata)
+  - `FeatureDataset` (dataset container, validation, stats, persistence, matrix/label extraction)
+
+### Architectural boundary
+
+This creates an explicit separation:
+
+- pipelines compute semantic 25D features and analytics exports
+- Classifier Studio (future) consumes canonical `FeatureDataset` objects
+
+Studio/experiments no longer need direct knowledge of pipeline stages/artifact internals.
+
+### Ingestion contracts
+
+`FeatureDataset.from_advanced_validation_exports(...)` ingests:
+
+- `advanced_25d_geometry_validation.csv`
+- `advanced_25d_geometry_analysis.json`
+
+and reconstructs:
+
+- stable ordered feature vectors (schema-driven)
+- semantic group hierarchy (`footprint_geometry`, `surface_geometry`, `sphere_consistency`, `damage_metrics`)
+- synthetic metadata (`synthetic_object_type`, expected failure/reaction semantics)
+
+### Validation and diagnostics
+
+Dataset/schema validation reports structured warnings/errors for:
+
+- missing required features
+- unknown feature groups
+- incompatible/invalid numeric fields
+- missing labels
+
+### Feature-matrix and metadata APIs
+
+First-pass APIs include:
+
+- `get_feature_matrix(...)`
+- `get_feature_names(...)`
+- `get_feature_groups(...)`
+- `get_labels(...)`
+- `select_feature_groups(...)`
+- `exclude_features(...)`
+
+These preserve semantic grouping while enabling classifier-ready numeric extraction.
+
+### Statistics and normalization (lightweight)
+
+`FeatureDataset` exposes:
+
+- per-feature stats (mean/std/min/max/missing)
+- per-group aggregate stats (feature count, aggregate variance, activation distribution)
+- optional normalization helpers (`zscore`, `minmax`)
+
+### Persistence
+
+Lightweight JSON persistence is supported:
+
+- `save_json(...)`
+- `load_json(...)`
+
+with schema version, metadata, samples, and split placeholders preserved.
+
+### Split readiness
+
+Dataset contract now includes future-ready split placeholders:
+
+`{"train": [], "validation": [], "test": []}`
+
+This is additive and intentionally minimal for upcoming experiment/split management passes.
+
+## Experiment-Readiness Layer (Lightweight)
+
+A first-pass experiment-readiness package now sits above `FeatureDataset`:
+
+- package: `vision_3d_acquisition/ml/experiments/`
+- contracts:
+  - `DatasetSplitSet`
+  - `ExperimentConfig`
+  - `LabelTaxonomy`
+- utilities:
+  - deterministic split generation/persistence
+  - dataset/config compatibility validation
+  - lightweight baseline evaluation flow
+
+### Canonical orchestration boundary
+
+The intended flow is now explicit:
+
+`FeatureDataset -> DatasetSplitSet -> ExperimentConfig -> Evaluator`
+
+This remains classifier-agnostic and lightweight while enabling future Classifier Studio experiment workflows.
+
+### Deterministic split strategies
+
+Supported split strategies:
+
+- `random`
+- `stratified`
+- `by_synthetic_object_type`
+- `by_failure_family`
+
+Split manifests are persisted as `split_manifest.json` with seed, strategy, and deterministic sample-id ordering.
+
+### Compatibility validation
+
+`validate_experiment_compatibility(...)` checks:
+
+- dataset/config id consistency
+- feature schema version compatibility
+- feature-group and feature-selection validity
+- normalization mode support
+- label presence / dataset validation status
+
+and emits structured diagnostics (errors/warnings + summary).
+
+### Label taxonomy and mapping
+
+`LabelTaxonomy` supports:
+
+- aliases
+- group remapping
+- ignored labels
+- binary or multiclass target modes
+
+without mutating source datasets.
+
+### Baseline evaluator
+
+A lightweight baseline evaluator (`majority_label_baseline`) is implemented to validate end-to-end experiment plumbing:
+
+- reads selected features + split manifests
+- applies taxonomy mapping
+- writes confusion/metrics artifacts
+- persists experiment metadata under:
+  - `ml/experiments/experiment_<id>/config.json`
+  - `ml/experiments/experiment_<id>/split_manifest.json`
+  - `ml/experiments/experiment_<id>/compatibility.json`
+  - `ml/experiments/experiment_<id>/normalization_manifest.json`
+  - `ml/experiments/experiment_<id>/evaluation.json`
+  - `ml/experiments/experiment_<id>/feature_stats.json`
+
+### Ablation and semantic-group experimentation
+
+`ExperimentConfig.feature_selection` now supports:
+
+- include/exclude groups
+- include/exclude explicit features
+
+to enable semantic-family ablations (e.g., consistency-only, no-damage, all-groups) with reproducible evaluation outputs.
+
+## Canonical Feature Registry + Quality Analytics Layer
+
+A feature-centric governance/analytics layer now extends `FeatureDataset`:
+
+- registry: `vision_3d_acquisition/ml/features/registry.py`
+- analytics: `vision_3d_acquisition/ml/features/analytics.py`
+
+### FeatureRegistry responsibilities
+
+- canonical feature metadata authority
+- schema/group validation
+- dataset compatibility checks
+- audience-specific visibility (`operations`, `studio`, `classifier_studio`)
+
+### Rich feature metadata contract
+
+Feature metadata now supports:
+
+- semantic identity: `name`, `group`, `display_name`
+- interpretability: `description`, `short_description`, `tooltip`
+- numeric semantics: `unit`, `higher_is_worse`, `expected_range`
+- warning guidance: `recommended_warning_threshold`, `recommended_critical_threshold`
+- normalization hint + visualization hints
+- UX visibility and display hints
+
+### Feature quality diagnostics
+
+Quality report computes per-feature:
+
+- missing/invalid ratios (null/NaN/inf coverage)
+- variance and entropy proxy
+- z-score + robust-z-score outlier ratios
+- extreme value counts
+- low-variance warnings
+
+and per-group quality summaries.
+
+### Stability analytics
+
+Stability report computes:
+
+- `feature_stability_score`
+- `noise_sensitivity_score`
+- `perturbation_variance`
+
+using grouped synthetic sample behavior (cross-sample perturbation proxy) and produces stability rankings.
+
+### Correlation and redundancy
+
+Correlation report includes:
+
+- pairwise correlation matrix
+- high-correlation pair detection
+- within-group redundancy warnings
+
+for feature-selection and explainability workflows.
+
+### Readiness scoring
+
+Per-feature readiness combines:
+
+- missingness
+- invalidity
+- outliers
+- stability
+- variance informativeness
+- redundancy penalty
+- metadata interpretability
+
+Outputs:
+
+- `readiness_score`
+- `readiness_level` (`EXPERIMENTAL`, `GOOD`, `PRODUCTION_READY`)
+
+plus group-level readiness summaries.
+
+### Drift diagnostics (lightweight)
+
+A baseline-snapshot comparison utility provides:
+
+- mean shift
+- stddev shift
+- aggregate drift score
+
+This is a deterministic, non-orchestrated first pass for feature drift awareness.
+
+### Analytics exports
+
+The feature analytics layer can export:
+
+- `feature_quality_report.json`
+- `feature_stability_report.json`
+- `feature_correlation_report.json`
+- `feature_readiness_report.json`
+- `feature_drift_report.json`
+- `feature_ux_summary.json`
+
+### UX visibility semantics
+
+Visibility stays audience-aware:
+
+- Operations: grouped semantic health summaries only
+- Studio: grouped diagnostics and warnings
+- Classifier Studio: full feature analytics (readiness/correlation/distributions/metadata)
+
+This preserves explainability while avoiding operator-facing metric clutter.
+
+### Why sphere-consistency matters
+
+Visible cap fit alone can remain deceptively good for truncated objects. The synthetic truncated-sphere mode validates that sphere-consistency/volume-deficit metrics fail even when some visible-surface fit metrics still appear acceptable, improving physical interpretability and reducing false "good ball" confidence.
+
+## Feature UX + Runtime Data-Contract Integration
+
+A compact UX/data-contract pass now bridges feature governance into runtime payloads without exposing heavy analytics internals.
+
+### Canonical UX contracts
+
+Module: `vision_3d_acquisition/ml/features/ux_contracts.py`
+
+Defines compact, deterministic contracts:
+
+- `FeatureGroupSummary`: group status, severity score, readiness, key evidence, top warnings
+- `FeatureWarning`: canonical warning with severity/message/group and audience visibility
+- `FeatureReadinessSummary`: overall readiness + per-group readiness
+
+Severity mapping is deterministic and stable:
+
+- `LOW`: `[0.0, 0.3)`
+- `MEDIUM`: `[0.3, 0.7)`
+- `HIGH`: `[0.7, 1.0]`
+
+### Runtime payload integration
+
+`ClassifyMiningBall25DStage` now attaches per-object compact UX fields:
+
+- `feature_group_summaries`
+- `feature_warnings`
+- `feature_readiness`
+
+These fields survive result serialization through `DetectedObject` contract additions.
+
+### Compact audience-specific exports
+
+Classification stage now emits compact UX artifacts:
+
+- `feature_runtime_summary.json` (operations-facing)
+- `feature_studio_summary.json` (studio/classifier-studio facing)
+
+and publishes them via `files` references and processing artifacts.
+
+### Visibility boundaries
+
+Filtering utilities now enforce audience scope:
+
+- `filter_for_operations(...)`: semantic health + actionable warnings only
+- `filter_for_studio(...)`: grouped summaries, readiness, studio-visible warnings
+- `filter_for_classifier_studio(...)`: grouped summaries/readiness/warnings for feature-engineering UX
+
+No heavy correlation/stability matrices are injected into runtime object payloads.
+
+### Operational UX contract
+
+Operations receives compact semantic states (example mapping):
+
+- `surface_coherence`
+- `damage_evidence`
+- `sphere_consistency`
+- `footprint_shape`
+
+### Contract boundary statement
+
+- Operational UX consumes semantic summaries.
+- Studio consumes grouped engineering diagnostics.
+- Classifier Studio consumes full feature analytics.
+
+This preserves explainability while preventing engineering-noise overload in runtime/operator flows.

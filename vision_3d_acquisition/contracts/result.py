@@ -63,6 +63,13 @@ class DetectedObject(BaseModel):
     feature_local_curvature_proxy: float | None = None
     feature_height_asymmetry: float | None = None
     feature_footprint_roundness: float | None = None
+    footprint_geometry: dict[str, Any] | None = None
+    surface_geometry: dict[str, Any] | None = None
+    sphere_consistency: dict[str, Any] | None = None
+    damage_metrics: dict[str, Any] | None = None
+    feature_group_summaries: list[dict[str, Any]] = Field(default_factory=list)
+    feature_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    feature_readiness: dict[str, Any] = Field(default_factory=dict)
     artifact_ids: list[str] = Field(default_factory=list)
 
 
@@ -172,6 +179,12 @@ class ResultFiles(BaseModel):
     debug_filtered_foreground: str | None = None
     debug_rejected_points: str | None = None
     debug_clusters_filtered: str | None = None
+    measurement_diagnostics: str | None = None
+    feature_vector: str | None = None
+    feature_provenance: str | None = None
+    quality_flags: str | None = None
+    feature_runtime_summary: str | None = None
+    feature_studio_summary: str | None = None
 
 
 class PointCloudStats(BaseModel):
