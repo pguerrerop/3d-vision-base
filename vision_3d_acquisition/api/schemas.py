@@ -80,13 +80,19 @@ class TakeSummary(BaseModel):
     validation_status: str | None = None
     expected_class: str | None = None
     expected_diameter_mm: float | None = None
+    physical_object_id: str | None = None
     thumbnail_path: str | None = None
     dataset_id: str | None = None
     dataset_name: str | None = None
     experiment_session_id: str | None = None
     experiment_session_name: str | None = None
+    experiment_session_type: str | None = None
     latest_run_status: str | None = None
     archived: bool = False
+    categories: list[str] = Field(default_factory=list)
+    reference_type: str | None = None
+    is_reference: bool = False
+    is_golden_sample: bool = False
     acquisition_processing_status: dict[str, Any] | None = None
 
 
@@ -114,6 +120,18 @@ class TakeDetail(BaseModel):
     acquisition_processing_status: dict[str, Any] | None = None
 
 
+class TakeSummaryPage(BaseModel):
+    items: list[TakeSummary] = Field(default_factory=list)
+    limit: int
+    offset: int
+    has_more: bool
+    next_offset: int | None = None
+    filtered_count: int = 0
+    total_count: int = 0
+    summary_counts: dict[str, Any] = Field(default_factory=dict)
+    profile: dict[str, Any] | None = None
+
+
 class DatasetSummary(BaseModel):
     id: str
     name: str
@@ -134,6 +152,9 @@ class DatasetSessionSummary(BaseModel):
     sensor_metadata: dict[str, Any] = Field(default_factory=dict)
     conveyor_metadata: dict[str, Any] = Field(default_factory=dict)
     lighting_metadata: dict[str, Any] = Field(default_factory=dict)
+    environment_metadata: dict[str, Any] = Field(default_factory=dict)
+    session_type: str = "engineering"
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str | None = None
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None

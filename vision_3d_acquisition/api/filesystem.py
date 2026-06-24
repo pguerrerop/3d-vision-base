@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +136,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     experiment_session_id = take_management.get("session_id")
     dataset_name = None
     experiment_session_name = None
+    experiment_session_type = None
     if isinstance(dataset_id, str) and dataset_id:
         dataset = dataset_service.get_dataset(dataset_id)
         if isinstance(dataset, dict):
@@ -143,6 +145,7 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         session = dataset_service.get_session(dataset_id, experiment_session_id)
         if isinstance(session, dict):
             experiment_session_name = str(session.get("name") or experiment_session_id)
+            experiment_session_type = str(session.get("session_type") or "engineering")
     latest_run_status = None
     process_entries = process_entries_for_take(settings.data_dir, take_id)
     if process_entries:
@@ -185,13 +188,19 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
         validation_status=str(take_management.get("validation_status") or "unreviewed"),
         expected_class=(str(take_management.get("expected_class")) if take_management.get("expected_class") is not None else None),
         expected_diameter_mm=float(take_management["expected_diameter_mm"]) if isinstance(take_management.get("expected_diameter_mm"), (int, float)) else None,
+        physical_object_id=(str(take_management.get("physical_object_id")) if take_management.get("physical_object_id") is not None else None),
         thumbnail_path=_take_thumbnail_path(take_id, settings, metadata, result),
         dataset_id=(str(dataset_id) if dataset_id else None),
         dataset_name=dataset_name,
         experiment_session_id=(str(experiment_session_id) if experiment_session_id else None),
         experiment_session_name=experiment_session_name,
+        experiment_session_type=experiment_session_type,
         latest_run_status=latest_run_status,
         archived=bool(take_management.get("archived")),
+        categories=[str(item) for item in (take_management.get("categories") or []) if str(item)],
+        reference_type=(str(take_management.get("reference_type")) if take_management.get("reference_type") is not None else None),
+        is_reference=bool(take_management.get("is_reference")),
+        is_golden_sample=bool(take_management.get("is_golden_sample")),
         acquisition_processing_status=acquisition_processing,
     )
 
@@ -205,6 +214,12 @@ def list_takes(
     semantic_label: str | None = None,
     superclass_label: str | None = None,
     search: str | None = None,
+    physical_object_id: str | None = None,
+    session_type: str | None = None,
+    category: str | None = None,
+    reference_type: str | None = None,
+    is_reference: bool | None = None,
+    is_golden_sample: bool | None = None,
     include_archived: bool = False,
 ) -> list[TakeSummary]:
     takes = [get_take_summary(settings, take_id) for take_id in list_take_ids(settings)]
@@ -223,6 +238,22 @@ def list_takes(
     if search:
         q = search.lower()
         takes = [take for take in takes if q in take.take_id.lower() or q in (take.friendly_name or "").lower()]
+    if physical_object_id:
+        q = physical_object_id.lower().strip()
+        takes = [take for take in takes if (take.physical_object_id or "").lower() == q]
+    if session_type:
+        q = session_type.lower().strip()
+        takes = [take for take in takes if (take.experiment_session_type or "").lower() == q]
+    if category:
+        q = category.lower().strip()
+        takes = [take for take in takes if q in {item.lower() for item in (take.categories or [])}]
+    if reference_type:
+        q = reference_type.lower().strip()
+        takes = [take for take in takes if (take.reference_type or "").lower() == q]
+    if is_reference is not None:
+        takes = [take for take in takes if bool(take.is_reference) is bool(is_reference)]
+    if is_golden_sample is not None:
+        takes = [take for take in takes if bool(take.is_golden_sample) is bool(is_golden_sample)]
     if not include_archived:
         dataset_service = DatasetService(settings.data_dir)
         visible: list[TakeSummary] = []
@@ -233,6 +264,233 @@ def list_takes(
             visible.append(take)
         takes = visible
     return sorted(takes, key=lambda item: item.created_at or item.take_id, reverse=True)
+
+
+def list_takes_paged(
+    settings: ApiSettings,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    session_id: str | None = None,
+    dataset_id: str | None = None,
+    validation_status: str | None = None,
+    tag: str | None = None,
+    semantic_label: str | None = None,
+    superclass_label: str | None = None,
+    search: str | None = None,
+    created_from: str | None = None,
+    created_to: str | None = None,
+    expected_class: str | None = None,
+    split: str | None = None,
+    calibration_linkage_only: bool = False,
+    physical_object_id: str | None = None,
+    session_type: str | None = None,
+    category: str | None = None,
+    reference_type: str | None = None,
+    is_reference: bool | None = None,
+    is_golden_sample: bool | None = None,
+    include_archived: bool = False,
+    profile: bool = False,
+) -> dict[str, Any]:
+    total_started_at = time.perf_counter()
+    resolved_limit = max(1, min(int(limit), 200))
+    resolved_offset = max(0, int(offset))
+    dataset_service = DatasetService(settings.data_dir)
+    session_type_cache: dict[tuple[str, str], str] = {}
+
+    created_from_iso = (created_from or "").strip()
+    created_to_iso = (created_to or "").strip()
+
+    def _match_common_filters(
+        take_id: str,
+        metadata: dict[str, Any],
+        take_meta: dict[str, Any],
+        *,
+        include_dataset_session_filters: bool,
+    ) -> bool:
+        take_dataset_id = str(take_meta.get("dataset_id") or "")
+        take_session_id = str(take_meta.get("session_id") or metadata.get("session_id") or "")
+        take_session_type = ""
+        if take_dataset_id and take_session_id:
+            key = (take_dataset_id, take_session_id)
+            if key not in session_type_cache:
+                session_payload = dataset_service.get_session(take_dataset_id, take_session_id)
+                session_type_cache[key] = str((session_payload or {}).get("session_type") or "")
+            take_session_type = session_type_cache[key]
+
+        if include_dataset_session_filters:
+            if session_id and take_session_id != session_id:
+                return False
+            if dataset_id and take_dataset_id != dataset_id:
+                return False
+
+        if validation_status and str(take_meta.get("validation_status") or "unreviewed").lower() != validation_status.lower():
+            return False
+        if tag and tag.lower() not in {str(item).lower() for item in (take_meta.get("tags") or [])}:
+            return False
+        if semantic_label and semantic_label.lower() not in {str(item).lower() for item in (take_meta.get("semantic_labels") or [])}:
+            return False
+        if superclass_label and superclass_label.lower() not in {str(item).lower() for item in (take_meta.get("superclass_labels") or [])}:
+            return False
+        if physical_object_id and str(take_meta.get("physical_object_id") or "").lower().strip() != physical_object_id.lower().strip():
+            return False
+        if session_type and take_session_type.lower() != session_type.lower().strip():
+            return False
+        if category and category.lower().strip() not in {str(item).lower() for item in (take_meta.get("categories") or [])}:
+            return False
+        if reference_type and str(take_meta.get("reference_type") or "").lower().strip() != reference_type.lower().strip():
+            return False
+        if is_reference is not None and bool(take_meta.get("is_reference")) is not bool(is_reference):
+            return False
+        if is_golden_sample is not None and bool(take_meta.get("is_golden_sample")) is not bool(is_golden_sample):
+            return False
+        if search:
+            q = search.lower()
+            friendly = str(take_meta.get("friendly_name") or "")
+            if q not in take_id.lower() and q not in friendly.lower():
+                return False
+        if expected_class:
+            q = expected_class.lower().strip()
+            value = str(take_meta.get("expected_class") or "").lower()
+            if q not in value:
+                return False
+        if split:
+            q = split.lower().strip()
+            split_value = str(take_meta.get("split") or "").lower().strip()
+            if split_value != q:
+                return False
+        if calibration_linkage_only:
+            calibration_id = str((take_meta.get("calibration_id") or metadata.get("calibration_id") or "")).strip()
+            if not calibration_id:
+                return False
+
+        created_at = str(metadata.get("created_at") or take_meta.get("created_at") or "")
+        if created_from_iso and created_at and created_at[:10] < created_from_iso:
+            return False
+        if created_to_iso and created_at and created_at[:10] > created_to_iso:
+            return False
+        if (created_from_iso or created_to_iso) and not created_at:
+            return False
+        return True
+
+    candidates: list[tuple[str, str]] = []
+    total_count = 0
+    summary_counts = {
+        "validation": {
+            "validated": 0,
+            "unreviewed": 0,
+            "rejected": 0,
+            "needs_review": 0,
+            "golden_sample": 0,
+            "benchmark_approved": 0,
+        },
+        "missing_labels": 0,
+        "missing_split": 0,
+        "missing_calibration": 0,
+        "processing_failed": 0,
+        "processing_incomplete": 0,
+        "no_objects_detected": 0,
+    }
+    list_take_ids_started_at = time.perf_counter()
+    take_ids = list_take_ids(settings)
+    list_take_ids_ms = (time.perf_counter() - list_take_ids_started_at) * 1000.0
+
+    scan_started_at = time.perf_counter()
+    for take_id in take_ids:
+        metadata = read_json(settings.incoming_dir / take_id / "metadata.json") or {}
+        take_meta = dataset_service.load_take_metadata(take_id=take_id, source_metadata=metadata)
+
+        if not include_archived and bool(take_meta.get("archived")):
+            continue
+
+        if dataset_id and str(take_meta.get("dataset_id") or "") != dataset_id:
+            continue
+
+        total_count += 1
+
+        if not _match_common_filters(take_id, metadata, take_meta, include_dataset_session_filters=True):
+            continue
+
+        validation_state = str(take_meta.get("validation_status") or "unreviewed").lower().strip()
+        validation_map = {
+            "valid": "validated",
+            "validated": "validated",
+            "invalid": "rejected",
+            "rejected": "rejected",
+            "needs_review": "needs_review",
+            "golden_sample": "golden_sample",
+            "benchmark_approved": "benchmark_approved",
+            "unreviewed": "unreviewed",
+        }
+        key = validation_map.get(validation_state, "unreviewed")
+        summary_counts["validation"][key] = int(summary_counts["validation"][key]) + 1
+
+        expected_class_value = str(take_meta.get("expected_class") or "").strip()
+        if not expected_class_value:
+            summary_counts["missing_labels"] = int(summary_counts["missing_labels"]) + 1
+
+        split_value = str(take_meta.get("split") or "").strip()
+        if not split_value:
+            summary_counts["missing_split"] = int(summary_counts["missing_split"]) + 1
+
+        calibration_value = str((take_meta.get("calibration_id") or metadata.get("calibration_id") or "")).strip()
+        if not calibration_value:
+            summary_counts["missing_calibration"] = int(summary_counts["missing_calibration"]) + 1
+
+        latest_status = str(take_meta.get("latest_run_status") or "").lower().strip()
+        if latest_status == "failed":
+            summary_counts["processing_failed"] = int(summary_counts["processing_failed"]) + 1
+        if latest_status not in {"success", "completed", "done"}:
+            summary_counts["processing_incomplete"] = int(summary_counts["processing_incomplete"]) + 1
+
+        obj_count = take_meta.get("object_count")
+        if isinstance(obj_count, (int, float)) and int(obj_count) <= 0:
+            summary_counts["no_objects_detected"] = int(summary_counts["no_objects_detected"]) + 1
+
+        created_at = str(metadata.get("created_at") or take_meta.get("created_at") or "")
+        candidates.append((created_at, take_id))
+    scan_and_filter_ms = (time.perf_counter() - scan_started_at) * 1000.0
+
+    sort_started_at = time.perf_counter()
+    candidates.sort(key=lambda item: item[0] or item[1], reverse=True)
+    sort_candidates_ms = (time.perf_counter() - sort_started_at) * 1000.0
+    page_take_ids = [take_id for _created_at, take_id in candidates[resolved_offset : resolved_offset + resolved_limit]]
+
+    hydrate_started_at = time.perf_counter()
+    page_items = [get_take_summary(settings, take_id) for take_id in page_take_ids]
+    hydrate_page_items_ms = (time.perf_counter() - hydrate_started_at) * 1000.0
+    next_offset = resolved_offset + len(page_items)
+    has_more = next_offset < len(candidates)
+    payload = {
+        "items": page_items,
+        "limit": resolved_limit,
+        "offset": resolved_offset,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+        "filtered_count": len(candidates),
+        "total_count": total_count,
+        "summary_counts": summary_counts,
+    }
+    if profile:
+        payload["profile"] = {
+            "enabled": True,
+            "limit": resolved_limit,
+            "offset": resolved_offset,
+            "counters": {
+                "scanned_take_ids": len(take_ids),
+                "candidate_count": len(candidates),
+                "page_item_count": len(page_items),
+                "total_count": total_count,
+            },
+            "phase_ms": {
+                "list_take_ids": round(list_take_ids_ms, 2),
+                "scan_and_filter": round(scan_and_filter_ms, 2),
+                "sort_candidates": round(sort_candidates_ms, 2),
+                "hydrate_page_items": round(hydrate_page_items_ms, 2),
+                "total": round((time.perf_counter() - total_started_at) * 1000.0, 2),
+            },
+        }
+    return payload
 
 
 def latest_take(settings: ApiSettings) -> TakeSummary | None:

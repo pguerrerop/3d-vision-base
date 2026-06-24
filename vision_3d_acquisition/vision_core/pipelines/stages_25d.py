@@ -24,6 +24,7 @@ from vision_3d_acquisition.ml import MLService
 from vision_3d_acquisition.ml.features.extractor import features_from_object
 from vision_3d_acquisition.ml.features.schemas import feature_ordering_hash
 from vision_3d_acquisition.ml.features.ux_contracts import (
+    aggregate_operations_summary,
     build_object_feature_ux_summary,
     filter_for_classifier_studio,
     filter_for_operations,
@@ -4129,6 +4130,9 @@ class ComputeMeasurementDiagnosticsStage:
             "quality_flag_count": len(quality_flags),
             "confidence": None,
             "expected_error": None,
+            "feature_group_summaries": (primary.get("feature_group_summaries") if isinstance(primary, dict) else []) or [],
+            "feature_warnings": (primary.get("feature_warnings") if isinstance(primary, dict) else []) or [],
+            "feature_readiness": (primary.get("feature_readiness") if isinstance(primary, dict) else {}) or {},
         }
 
         contour_payload = self._build_contour_payload(objects)
@@ -4618,6 +4622,25 @@ class ClassifyMiningBall25DStage:
         object_count = len(objects)
         decision = "accept" if object_count > 0 and non_ball == 0 else "review"
         canonical = select_dominant_classification({"objects": objects})
+        object_feature_payloads = [
+            {
+                "feature_group_summaries": item.get("feature_group_summaries") or [],
+                "feature_warnings": item.get("feature_warnings") or [],
+                "feature_readiness": item.get("feature_readiness") or {},
+            }
+            for item in objects
+            if isinstance(item, dict)
+        ]
+        summary_feature_runtime = aggregate_operations_summary(object_feature_payloads)
+        summary_feature_readiness = {
+            "overall_readiness": "UNKNOWN" if not object_feature_payloads else (
+                "EXPERIMENTAL"
+                if any(str((payload.get("feature_readiness") or {}).get("overall_readiness") or "") == "EXPERIMENTAL" for payload in object_feature_payloads)
+                else "GOOD"
+                if any(str((payload.get("feature_readiness") or {}).get("overall_readiness") or "") == "GOOD" for payload in object_feature_payloads)
+                else "PRODUCTION_READY"
+            ),
+        }
         context.set_artifact(
             "summary",
             {
@@ -4628,6 +4651,8 @@ class ClassifyMiningBall25DStage:
                 "confidence": canonical.get("confidence"),
                 "label": canonical.get("label"),
                 "superclass": canonical.get("superclass"),
+                "feature_runtime_summary": summary_feature_runtime,
+                "feature_readiness": summary_feature_readiness,
             },
         )
         context.set_artifact(
@@ -4703,7 +4728,17 @@ class ClassifyMiningBall25DStage:
             "stage": "classification",
             "artifact_id": "classification_explanation",
             "scope": "global",
-            "objects": explanations,
+            "feature_runtime_summary": summary_feature_runtime,
+            "feature_readiness": summary_feature_readiness,
+            "objects": [
+                {
+                    **row,
+                    "feature_group_summaries": next((item.get("feature_group_summaries") for item in objects if int(item.get("object_id", 0) or 0) == int(row.get("object_id", 0) or 0)), []),
+                    "feature_warnings": next((item.get("feature_warnings") for item in objects if int(item.get("object_id", 0) or 0) == int(row.get("object_id", 0) or 0)), []),
+                    "feature_readiness": next((item.get("feature_readiness") for item in objects if int(item.get("object_id", 0) or 0) == int(row.get("object_id", 0) or 0)), {}),
+                }
+                for row in explanations
+            ],
         }
         metric_payload = {
             "stage": "classification",
@@ -4737,12 +4772,14 @@ class ClassifyMiningBall25DStage:
             "stage": "classification",
             "artifact_id": "feature_runtime_summary",
             "scope": "per_object",
+            "summary": summary_feature_runtime,
             "objects": [{"object_id": row.get("object_id"), "operations": row.get("operations")} for row in per_object_ux_payload],
         }
         studio_summary_payload = {
             "stage": "classification",
             "artifact_id": "feature_studio_summary",
             "scope": "per_object",
+            "feature_readiness": summary_feature_readiness,
             "objects": [
                 {
                     "object_id": row.get("object_id"),

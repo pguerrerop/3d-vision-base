@@ -108,6 +108,8 @@ def test_25d_result_payload_contains_expected_fields(tmp_path: Path) -> None:
     assert isinstance(summary.get("object_count"), int)
     assert isinstance(summary.get("superclass"), str)
     assert isinstance(summary.get("label"), str)
+    assert isinstance(summary.get("feature_runtime_summary"), dict)
+    assert isinstance(summary.get("feature_readiness"), dict)
     assert isinstance(classification.get("superclass"), str)
     assert isinstance(classification.get("label"), str)
     pipeline_info = payload.get("processing_pipeline", {}) or {}
@@ -305,7 +307,14 @@ def test_classification_explanation_artifact_is_emitted(tmp_path: Path) -> None:
     assert explanation.get("artifact_id") == "classification_explanation"
     assert explanation.get("stage") == "classification"
     assert explanation.get("scope") == "global"
+    assert isinstance(explanation.get("feature_runtime_summary"), dict)
+    assert isinstance(explanation.get("feature_readiness"), dict)
     assert isinstance(explanation.get("objects"), list)
+    if explanation.get("objects"):
+        first = explanation["objects"][0]
+        assert isinstance(first.get("feature_group_summaries"), list)
+        assert isinstance(first.get("feature_warnings"), list)
+        assert isinstance(first.get("feature_readiness"), dict)
     assert (payload.get("files") or {}).get("classification_explanation") == "classification_explanation.json"
     assert "metric_explanation" in by_id
     metric_art = by_id["metric_explanation"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from vision_3d_acquisition.ml.features.ux_contracts import (
     SEVERITY_BOUNDS,
+    aggregate_operations_summary,
     build_object_feature_ux_summary,
     filter_for_classifier_studio,
     filter_for_operations,
@@ -53,3 +54,21 @@ def test_visibility_filters_are_audience_aware() -> None:
     assert len(ops["warnings"]) == 1
     assert len(studio["feature_warnings"]) == 1
     assert len(cls["feature_warnings"]) == 1
+
+
+def test_aggregate_operations_summary_uses_worst_group_status() -> None:
+    payloads = [
+        {
+            "feature_group_summaries": [{"group": "surface_geometry", "status": "GOOD"}],
+            "feature_warnings": [],
+            "feature_readiness": {"overall_readiness": "PRODUCTION_READY"},
+        },
+        {
+            "feature_group_summaries": [{"group": "surface_geometry", "status": "CRITICAL"}],
+            "feature_warnings": [{"severity": "HIGH", "message": "surface issue", "ux_visibility": ["operations"]}],
+            "feature_readiness": {"overall_readiness": "EXPERIMENTAL"},
+        },
+    ]
+    aggregated = aggregate_operations_summary(payloads)
+    assert aggregated["operational_summary"]["surface_coherence"] == "CRITICAL"
+    assert len(aggregated["warnings"]) == 1

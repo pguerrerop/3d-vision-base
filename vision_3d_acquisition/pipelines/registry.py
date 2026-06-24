@@ -200,6 +200,13 @@ PIPELINES: list[dict[str, Any]] = [
         "id": "mining_steel_ball_classification_25d",
         "name": "mining_steel_ball_classification_25d",
         "display_name": "Mining Steel Ball Classification (Native 2.5D)",
+        "classifier": {
+            "engine": "mining_steel_ball_classification_25d_rules",
+            "rule_set": {
+                "id": "builtin_default",
+                "path": None,
+            },
+        },
         "pipeline_family": "25d",
         "execution_backend": "native",
         "supported_modalities": ["heightmap", "reflectance", "rgb"],
@@ -217,11 +224,12 @@ PIPELINES: list[dict[str, Any]] = [
             _stage(stage_id="remove_belt_segment_objects", display_name="Remove reference + segment objects", description="Suppresses reference-surface pixels and isolates object components above object_min_height_mm.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["image", "overlay", "json"], object_outputs=True, supports_real_time=True, dependencies=["normalize_heights_to_plane"]),
             _stage(stage_id="geometry", display_name="Footprint geometry", description="Connected components, contour/hull/ellipse and footprint metrics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "json", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["remove_belt_segment_objects"]),
             _stage(stage_id="measurement", display_name="Height + volume metrics", description="Height statistics, volume proxy, and deformation feature extraction.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "metric", "json"], object_outputs=True, supports_real_time=True, dependencies=["geometry"]),
-            _stage(stage_id="classification", display_name="Mining-ball classification", description="Initial 2.5D heuristic classifier with class-group semantics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "json", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["measurement"]),
+            _stage(stage_id="measurement_diagnostics", display_name="Measurement diagnostics", description="Quality metrics, feature vector, provenance, and quality flags.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["json", "table", "metric"], object_outputs=True, supports_real_time=True, dependencies=["measurement"]),
+            _stage(stage_id="classification", display_name="Mining-ball classification", description="Initial 2.5D heuristic classifier with class-group semantics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "json", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["measurement_diagnostics"]),
             _stage(stage_id="overlay", display_name="Overlay rendering", description="Height colormap, segmentation, measurement and plane-debug overlays.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["image", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["classification"]),
         ],
         "composition": {
-            "execution_order": ["input", "detect_belt_plane", "normalize_heights_to_plane", "remove_belt_segment_objects", "geometry", "measurement", "classification", "overlay"],
+            "execution_order": ["input", "detect_belt_plane", "normalize_heights_to_plane", "remove_belt_segment_objects", "geometry", "measurement", "measurement_diagnostics", "classification", "overlay"],
             "artifact_flow": {
                 "input": ["heightmap", "reflectance"],
                 "detect_belt_plane": ["raw_heightmap_preview", "valid_mask", "background_candidate_mask", "plane_inlier_mask", "belt_plane_residuals", "plane_fit_debug", "background_selection_debug"],
@@ -229,6 +237,7 @@ PIPELINES: list[dict[str, Any]] = [
                 "remove_belt_segment_objects": ["below_reference_mask", "above_threshold_mask", "normalized_height_threshold_mask", "cleaned_object_mask", "connected_components_overlay", "segmentation_debug"],
                 "geometry": ["footprint geometry"],
                 "measurement": ["height metrics", "volume proxy", "deformation features"],
+                "measurement_diagnostics": ["measurement_diagnostics", "feature_vector", "feature_provenance", "quality_flags", "intermediate geometry artifacts"],
                 "classification": ["class labels", "object-level classification artifacts"],
                 "overlay": ["height_overlay", "segmentation_overlay", "measurement_overlay", "classification_overlay"],
             },

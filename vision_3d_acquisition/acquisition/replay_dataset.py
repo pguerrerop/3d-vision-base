@@ -60,19 +60,29 @@ class ReplayableAcquisitionService:
         dataset_id: str,
         session_id: str,
         metadata: dict[str, Any] | None = None,
+        persist_on_restart: bool = False,
+        replay_mode: str = "routing_override",
+        auto_start_on_startup: bool = False,
+        replay_source: str = "offline_dataset_replay",
     ) -> dict[str, Any]:
+        current = self.session_state() or {}
         payload = {
             "dataset_id": dataset_id,
             "session_id": session_id,
             "started_at": _now_iso(),
             "status": "active",
             "metadata": metadata or {},
+            "created_by": str((metadata or {}).get("created_by") or current.get("created_by") or "runtime_ui"),
+            "persist_on_restart": bool(persist_on_restart),
+            "auto_start_on_startup": bool(auto_start_on_startup),
+            "replay_mode": str(replay_mode or "routing_override"),
+            "replay_source": str(replay_source or "offline_dataset_replay"),
         }
         _write_json(self.active_session_path, payload)
         return payload
 
     def stop_session(self) -> dict[str, Any] | None:
-        current = self.active_session()
+        current = self.session_state()
         if current is None:
             return None
         current["status"] = "stopped"
@@ -80,17 +90,88 @@ class ReplayableAcquisitionService:
         _write_json(self.active_session_path, current)
         return current
 
-    def active_session(self) -> dict[str, Any] | None:
+    def pause_session(self) -> dict[str, Any] | None:
+        current = self.session_state()
+        if current is None:
+            return None
+        current["status"] = "paused"
+        current["paused_at"] = _now_iso()
+        _write_json(self.active_session_path, current)
+        return current
+
+    def clear_session(self) -> bool:
+        if not self.active_session_path.is_file():
+            return False
+        self.active_session_path.unlink(missing_ok=True)
+        return True
+
+    def session_state(self) -> dict[str, Any] | None:
         payload = _read_json(self.active_session_path)
         if not payload:
-            return None
-        if str(payload.get("status") or "") != "active":
             return None
         dataset_id = str(payload.get("dataset_id") or "")
         session_id = str(payload.get("session_id") or "")
         if not dataset_id or not session_id:
             return None
-        if self.dataset_service.get_session(dataset_id, session_id) is None:
+        status = str(payload.get("status") or "inactive")
+        exists = self.dataset_service.get_session(dataset_id, session_id) is not None
+        return {
+            **payload,
+            "active": status == "active",
+            "historical": status in {"stopped", "paused"},
+            "dataset_exists": exists,
+            "session_exists": exists,
+        }
+
+    def update_session_config(
+        self,
+        *,
+        dataset_id: str | None = None,
+        session_id: str | None = None,
+        persist_on_restart: bool | None = None,
+        auto_start_on_startup: bool | None = None,
+        replay_mode: str | None = None,
+        replay_source: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = self.session_state() or {
+            "dataset_id": "",
+            "session_id": "",
+            "status": "stopped",
+            "metadata": {},
+            "created_by": "runtime_ui",
+            "started_at": None,
+            "persist_on_restart": False,
+            "auto_start_on_startup": False,
+            "replay_mode": "routing_override",
+            "replay_source": "offline_dataset_replay",
+        }
+        next_dataset = str(dataset_id if dataset_id is not None else current.get("dataset_id") or "")
+        next_session = str(session_id if session_id is not None else current.get("session_id") or "")
+        if next_dataset and next_session and self.dataset_service.get_session(next_dataset, next_session) is None:
+            raise ValueError(f"Unknown dataset session: {next_dataset}/{next_session}")
+        current["dataset_id"] = next_dataset
+        current["session_id"] = next_session
+        if persist_on_restart is not None:
+            current["persist_on_restart"] = bool(persist_on_restart)
+        if auto_start_on_startup is not None:
+            current["auto_start_on_startup"] = bool(auto_start_on_startup)
+        if replay_mode is not None:
+            current["replay_mode"] = str(replay_mode)
+        if replay_source is not None:
+            current["replay_source"] = str(replay_source)
+        if metadata is not None:
+            current["metadata"] = metadata
+        _write_json(self.active_session_path, current)
+        return self.session_state() or current
+
+    def active_session(self) -> dict[str, Any] | None:
+        payload = self.session_state()
+        if not payload:
+            return None
+        if str(payload.get("status") or "") != "active":
+            return None
+        if not bool(payload.get("dataset_exists")) or not bool(payload.get("session_exists")):
             return None
         return payload
 

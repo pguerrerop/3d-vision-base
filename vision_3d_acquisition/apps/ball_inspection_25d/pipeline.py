@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from vision_3d_acquisition.contracts.result import ProcessingPipelineInfo, ProcessingProfiling
-from vision_3d_acquisition.pipelines.registry import default_pipeline_info
+from vision_3d_acquisition.pipelines.registry import default_pipeline_info, get_pipeline
 from vision_3d_acquisition.poc.summary import build_calibration_diagnostics, build_poc_run_summary
 from vision_3d_acquisition.vision_core.acquisition.sources import FileSource
 from vision_3d_acquisition.vision_core.pipelines import PipelineContext, PipelineRunner
@@ -20,6 +20,7 @@ from vision_3d_acquisition.vision_core.pipelines.stages_25d import (
     ApplyCalibration25DStage,
     ClassifyMiningBall25DStage,
     ComputeHeightMetricsStage,
+    ComputeMeasurementDiagnosticsStage,
     DetectBeltPlaneStage,
     ExtractConnectedComponentsStage,
     FitObjectGeometryStage,
@@ -61,10 +62,18 @@ def run_ball_inspection_25d_flow(
     segment_params = dict(stage_params.get("remove_belt_segment_objects") or {})
     normalize_params = dict(stage_params.get("normalize_heights_to_plane") or {})
     known_object_params = dict(stage_params.get("known_object_25d") or {})
+    classify_params = dict(stage_params.get("classify_25d") or {})
+    pipeline_cfg = get_pipeline("mining_steel_ball_classification_25d") or {}
+    classifier_cfg = pipeline_cfg.get("classifier") if isinstance(pipeline_cfg.get("classifier"), dict) else {}
+    pipeline_rule_set = classifier_cfg.get("rule_set") if isinstance(classifier_cfg.get("rule_set"), dict) else {}
+    pipeline_rules_path = pipeline_rule_set.get("path")
+    if pipeline_rules_path and "classifier_rules_pipeline_path" not in classify_params:
+        classify_params["classifier_rules_pipeline_path"] = str(pipeline_rules_path)
     context.set_artifact("stage_params.detect_belt_plane", detect_params)
     context.set_artifact("stage_params.remove_belt_segment_objects", segment_params)
     context.set_artifact("stage_params.normalize_heights_to_plane", normalize_params)
     context.set_artifact("stage_params.known_object_25d", known_object_params)
+    context.set_artifact("stage_params.classify_25d", classify_params)
     runner = PipelineRunner(
         stages=[
             LoadCaptureStage(source=source, take_id=take_id, output_root=output_root),
@@ -77,7 +86,8 @@ def run_ball_inspection_25d_flow(
             FitObjectGeometryStage(),
             ComputeHeightMetricsStage(),
             ValidateKnownObjectScale25DStage(),
-            ClassifyMiningBall25DStage(),
+            ComputeMeasurementDiagnosticsStage(),
+            ClassifyMiningBall25DStage(**_stage_kwargs(ClassifyMiningBall25DStage, classify_params)),
             Generate25DOverlaysStage(),
             SerializeProcessingResultStage(),
         ]

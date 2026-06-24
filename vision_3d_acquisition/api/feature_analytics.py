@@ -261,6 +261,7 @@ def build_feature_records(
                     "take_id": take_id,
                     "dataset_id": dataset_id,
                     "session_id": session_id,
+                    "physical_object_id": str(take_management.get("physical_object_id") or "") or None,
                     "pipeline_id": pipeline_id,
                     "run_id": run_id,
                     "stage_id": "measurement",
@@ -320,7 +321,12 @@ def build_distributions(
         value = _to_float((record.get("features") or {}).get(feature_key))
         if value is None:
             continue
-        key = str(((record.get("labels") or ["UNKNOWN"])[0])) if group_by == "label" else str(record.get("superclass") or "UNKNOWN")
+        if group_by == "label":
+            key = str(((record.get("labels") or ["UNKNOWN"])[0]))
+        elif group_by == "physical_object_id":
+            key = str(record.get("physical_object_id") or "UNASSIGNED_OBJECT")
+        else:
+            key = str(record.get("superclass") or "UNKNOWN")
         grouped.setdefault(key, []).append(value)
 
     all_values = [value for values in grouped.values() for value in values]

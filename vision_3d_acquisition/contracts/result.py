@@ -32,6 +32,8 @@ class ResultSummary(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     label: str | None = None
     superclass: str | None = None
+    feature_runtime_summary: dict[str, Any] = Field(default_factory=dict)
+    feature_readiness: dict[str, Any] = Field(default_factory=dict)
 
 
 class DetectedObject(BaseModel):
