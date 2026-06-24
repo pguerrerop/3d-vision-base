@@ -1,0 +1,8 @@
+{
+  "name": "sensor-studio-dev-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:services": "node scripts/dev-services.mjs"
+  }
+}

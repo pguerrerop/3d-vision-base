@@ -1,0 +1,29 @@
+{
+  "classifier_id": "mining_steel_ball_classification_25d_rules",
+  "version": "tuned_20260529T201108Z",
+  "target_superclasses": [
+    "BALL_GOOD",
+    "BALL_SCRAP",
+    "SCRAP_METAL"
+  ],
+  "optimized_metric": "macro_f1",
+  "params": {
+    "good_min_height_mm": 8.0,
+    "good_max_height_mm": 95.0,
+    "good_min_sphericity": 0.8,
+    "good_max_eccentricity": 0.65,
+    "good_min_flatness": 0.15,
+    "good_max_edge_roughness": 8.0,
+    "deformed_min_eccentricity": 0.85,
+    "deformed_max_flatness": -0.2,
+    "deformed_min_edge_roughness": 12.0,
+    "ball_scrap_min_sphericity": 0.45,
+    "scrap_max_sphericity": 0.3,
+    "scrap_max_height_mm": 6.0,
+    "scrap_max_p95_height_mm": 4.0,
+    "scrap_max_volume_proxy_mm3": 4000.0,
+    "scrap_min_flatness": -0.35,
+    "fallback_scrap_max_sphericity": 0.3,
+    "fallback_ball_scrap_max_sphericity": 0.75
+  }
+}

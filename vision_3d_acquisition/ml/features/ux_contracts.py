@@ -83,9 +83,25 @@ def build_object_feature_ux_summary(obj: dict[str, Any]) -> dict[str, Any]:
     }
     warnings: list[FeatureWarning] = []
     if _num(sc.get("radial_height_rmse_mm")) > 8.0:
-        warnings.append(FeatureWarning("radial_height_rmse_mm", "HIGH", "Strong sphere-consistency mismatch detected", "sphere_consistency"))
+        warnings.append(
+            FeatureWarning(
+                "radial_height_rmse_mm",
+                "HIGH",
+                "Strong sphere-consistency mismatch detected",
+                "sphere_consistency",
+                ux_visibility=["operations", "studio", "classifier_studio"],
+            )
+        )
     if _num(dm.get("surface_discontinuity_score")) > 0.7:
-        warnings.append(FeatureWarning("surface_discontinuity_score", "HIGH", "Strong surface discontinuity detected", "damage_metrics"))
+        warnings.append(
+            FeatureWarning(
+                "surface_discontinuity_score",
+                "HIGH",
+                "Strong surface discontinuity detected",
+                "damage_metrics",
+                ux_visibility=["operations", "studio", "classifier_studio"],
+            )
+        )
     if _num(fp.get("radial_cv")) > 0.18:
         warnings.append(FeatureWarning("radial_cv", "MEDIUM", "Boundary irregularity detected", "footprint_geometry"))
     if _num(sg.get("sphere_fit_rmse_mm")) > 4.0:
@@ -135,6 +151,24 @@ def filter_for_operations(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(w, dict) and "operations" in (w.get("ux_visibility") or []):
             warnings.append({"severity": w.get("severity"), "message": w.get("message")})
     return {"operational_summary": summary, "warnings": warnings}
+
+
+def aggregate_operations_summary(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    status_rank = {"UNKNOWN": 0, "GOOD": 1, "WARNING": 2, "CRITICAL": 3, "EXPERIMENTAL": 4}
+    worst_by_key: dict[str, str] = {}
+    warnings: list[dict[str, Any]] = []
+    for payload in payloads:
+        current = filter_for_operations(payload)
+        summary = current.get("operational_summary") if isinstance(current.get("operational_summary"), dict) else {}
+        for key, value in summary.items():
+            label = str(value or "UNKNOWN")
+            existing = str(worst_by_key.get(str(key)) or "UNKNOWN")
+            if status_rank.get(label, 0) >= status_rank.get(existing, 0):
+                worst_by_key[str(key)] = label
+        for warning in current.get("warnings") or []:
+            if isinstance(warning, dict):
+                warnings.append(warning)
+    return {"operational_summary": worst_by_key, "warnings": warnings[:8]}
 
 
 def filter_for_studio(payload: dict[str, Any]) -> dict[str, Any]:
