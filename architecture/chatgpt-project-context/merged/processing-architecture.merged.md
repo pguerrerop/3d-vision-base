@@ -1352,3 +1352,19 @@ Added compositional backend modules and endpoints for ingestion runs.
 - optional metadata application
 
 This architecture preserves immutable acquisition semantics and keeps ingestion UX decoupled from runtime/training execution concerns.
+
+## ML Set Summary / Governance Aggregation
+
+- Added `ml_set_summary.py` as a compositional aggregation layer over existing ML-set memberships and DatasetService metadata.
+- Summary/export endpoints provide lightweight governance views for the ML Set detail drawer:
+  - summary
+  - class distribution
+  - split summary
+  - warnings
+  - representative samples
+- deterministic export routing
+
+## Physical Object Registry Architecture
+
+- Added additive semantic registry and lightweight endpoints for object listing, detail, take linkage, repeatability summary, and reconciliation sync.
+- Runtime pipelines remain decoupled; Physical Objects live in the semantic layer and are linked through sidecar metadata.

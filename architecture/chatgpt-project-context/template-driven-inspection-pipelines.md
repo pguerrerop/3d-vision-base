@@ -201,3 +201,13 @@ Mining balls ML-set roadmap now follows a wizard-first workflow:
 3. Deterministic immutable ML-set artifact materialization.
 
 This keeps template-driven inspection pipelines decoupled from ingestion UX while improving semantic traceability, reproducibility, and future active-learning readiness.
+
+## ML Set Governance Surface
+
+- Mining-balls and future template-driven data workflows now have an ML-set inspection surface oriented around readiness, balance, split safety, and provenance.
+- This keeps template-driven pipelines connected to reproducible semantic subsets without collapsing pipeline execution and ML governance into one view.
+
+## Object-Centric Semantic Governance
+
+- Template-driven ingestion and ML workflows now have a first-class `PhysicalObject` layer.
+- This allows operator rows, repeatability analysis, and leakage-safe splits to converge on one semantic grouping concept without changing runtime pipeline contracts.

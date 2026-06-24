@@ -118,3 +118,195 @@ Operations cards remain lightweight, but semantic contracts are now explicit:
 - semantic lineage metadata (`derived_from`, `transform`) is preserved in processing artifacts so replay/debug tools can reconstruct geometry provenance without filename heuristics.
 
 This keeps Operations additive while preserving a single geometry truth across Studio and runtime views.
+
+## Unified Sensor Studio CLI (wrapper only)
+
+A unified wrapper CLI now centralizes common runtime/demo operations without changing pipeline logic.
+
+Script:
+- `scripts/sensor_studio_cli.py`
+
+Top-level structure:
+- `sensor-studio 25d ...`
+- `sensor-studio studio ...`
+- `sensor-studio acquisition ...`
+
+Primary 25D operations:
+
+```bash
+python scripts/sensor_studio_cli.py --data-dir data 25d create-synthetic --session-id synthetic_25d_demo
+python scripts/sensor_studio_cli.py --data-dir data 25d demo
+python scripts/sensor_studio_cli.py --data-dir data 25d process --take-id <take_id>
+python scripts/sensor_studio_cli.py --data-dir data 25d validate-api --take-id <take_id>
+python scripts/sensor_studio_cli.py --data-dir data 25d inspect-result --take-id <take_id>
+python scripts/sensor_studio_cli.py --data-dir data 25d clean --take-id <take_id>
+python scripts/sensor_studio_cli.py --data-dir data 25d interactive
+```
+
+Support commands:
+
+```bash
+python scripts/sensor_studio_cli.py --data-dir data studio serve
+python scripts/sensor_studio_cli.py --data-dir data acquisition list-takes --limit 20
+python scripts/sensor_studio_cli.py --data-dir data acquisition latest
+```
+
+Notes:
+- `25d process` and `25d validate-api` require `--take-id`.
+- `25d clean` requires either `--take-id` or `--session-id`.
+- Existing scripts remain valid; this CLI delegates to the same runtime/application functions.
+
+## Repeatability Analysis Extension (Additive)
+
+To evolve from single-take inspection toward measurement characterization, an offline analysis layer is introduced:
+
+- `python scripts/analyze_feature_repeatability.py`
+
+Capabilities:
+- groups repeated takes by `physical_object_id`
+- aggregates scalar features from persisted processing results
+- computes stability metrics (`mean`, `std`, `cv`, `min/max`, `outlier_count`, `missing_data_ratio`)
+- produces feature-level variability ranking and instability flags
+- computes orientation-sensitivity heuristic classes:
+  - `low_sensitivity`
+  - `medium_sensitivity`
+  - `high_sensitivity`
+- emits correlation summaries against acquisition-quality signals when present
+
+Output artifacts:
+- JSON summary + CSV tables under `data/runtime/analysis/repeatability_<timestamp>/`
+
+Architecture constraints preserved:
+- no change to existing processing pipeline contracts
+- no mutation of raw acquisitions
+- no mutation of session/grouping semantics
+- no runtime hidden state; outputs are explicit filesystem artifacts
+
+## 25D Measurement Diagnostics Stage (Additive)
+
+New additive stage:
+
+- `ComputeMeasurementDiagnostics`
+- placement: after measurement/geometry correction and before classification
+- pipeline semantics preserved; prior outputs are unchanged
+
+Persisted artifacts (canonical, stage-owned):
+
+- `measurement_diagnostics.json`
+- `feature_vector.json`
+- `feature_provenance.json`
+- `quality_flags.json`
+- `contour.json`
+- `convex_hull.json`
+- `fitted_ellipse.json`
+- `principal_axes.json`
+- `radial_profile.json`
+- `normalized_height_histogram.json`
+
+Contract expectations:
+
+- artifacts are registered in processing artifacts with:
+  - `artifact_id`
+  - `stage_id=measurement_diagnostics`
+  - `kind=json`
+  - coordinate-space and lineage metadata
+- no replacement of existing artifact ids
+- no mutation of classification flow
+
+Feature provenance model:
+
+- each feature stores:
+  - `value`
+  - `source_stage`
+  - `source_artifact_id`
+  - `validity` (`ok|warning|invalid|unavailable`)
+  - optional future placeholders: `confidence`, `expected_error`
+  - `derived_from`
+
+Quality flags:
+
+- rule-based additive warnings:
+  - `LOW_VALID_PIXEL_RATIO`
+  - `HIGH_INVALID_REGION_RATIO`
+  - `BORDER_TOUCH`
+  - `HIGH_PLANE_RESIDUAL`
+  - `SMALL_OBJECT`
+  - `SEGMENTATION_FRAGMENTED`
+  - `EXTREME_HEIGHT_OUTLIER`
+- each includes severity, trigger values, and related feature references
+
+## Rule Tuning Workflow (Pre-demo)
+
+Additive operational script:
+
+- `python scripts/tune_25d_rules.py`
+
+Inputs:
+- exported 25D feature CSV (preferred)
+- optional dataset/ml-set metadata for reporting/discovery
+
+Outputs:
+- tuned threshold config (`best_rules.json`)
+- confusion matrix and per-class metrics
+- per-take predictions with rule-path traces
+
+This is intentionally not model training; it tunes explainable rule parameters only.
+
+## Classifier Engine vs Rule Set
+
+The runtime now explicitly separates:
+
+- classifier engine: `mining_steel_ball_classification_25d`
+- rule set: threshold/config payload applied by that engine
+
+Default behavior:
+
+- if no rule config is provided, built-in rules remain active (backward compatible)
+
+Optional behavior:
+
+- if `classifier_rules_path` is provided, classification stage loads params from external JSON and applies the same deterministic evaluator structure
+
+Expected config location:
+
+- `configs/classifiers/*.json`
+
+This enables client/demo/site-specific variants without changing pipeline topology.
+
+## Classification Provenance
+
+Classification outputs now carry rule-set provenance fields:
+
+- `classifier_engine`
+- `rule_set_id`
+- `rule_set_path`
+- `rule_set_version`
+- `rule_set_source`
+- `rule_path`
+- `confidence_proxy`
+
+Resolution precedence is deterministic:
+
+- runtime override path
+- pipeline-config rule-set path
+- `SENSOR_STUDIO_DEFAULT_RULE_SET` env default
+- built-in default
+
+Purpose:
+
+- reproducible comparisons
+- regression analysis
+- auditable client reporting
+
+## Offline Rule Evaluation
+
+New script:
+
+- `python scripts/evaluate_25d_rules.py`
+
+Capabilities:
+
+- evaluate one rule config against exported feature CSV
+- optional comparison between two configs (`--compare-rules-config`)
+- object-safe evaluation via `physical_object_id` grouping/splits
+- outputs: report, confusion matrix, per-class metrics, predictions, misclassified rows, disagreements

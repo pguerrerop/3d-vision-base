@@ -5,7 +5,7 @@
 Add a first-class experiment layer on top of existing take/run processing:
 
 - `Dataset` (project/campaign)
-- `Take Session` (acquisition/setup condition)
+- `Experiment Session` (canonical engineering/reprocessing scope)
 - `Take metadata` (labels, notes, expected values, validation state)
 
 Raw take data and processing outputs remain unchanged.
@@ -39,11 +39,19 @@ Existing paths are preserved:
 
 - `id`, `name`, `description`, `created_at`, `tags`, `notes`
 
-### Dataset session
+### Dataset session / Experiment session
 
 - `id`, `dataset_id`, `name`, `description`, `calibration_id`
 - `sensor_metadata`, `conveyor_metadata`, `lighting_metadata`
 - `created_at`, `tags`, `notes`
+
+Studio terminology note:
+
+- `Dataset session` is the persisted storage name.
+- `Experiment session` is the preferred Studio-facing name.
+- This is the canonical scope for replay, calibration context, and bulk reprocessing.
+
+Separate from this, the legacy acquisition/runtime `session_id` attached to raw captures remains available as a low-level operational grouping for ingestion and replay internals.
 
 ### Take metadata
 
@@ -90,8 +98,8 @@ Processing Lab sidebar now supports:
 Studio and Datasets now have explicit ownership boundaries:
 
 - Studio (engineering/process-debugging workspace):
-  - acquisition-linked take selection
-  - lightweight operational filtering (dataset/session/search/modality/status)
+  - experiment-session-centric take selection
+  - lightweight operational filtering (dataset/experiment-session/search/modality/status)
   - stage-by-stage processing inspection
   - rerun/debug execution flows
 - Datasets (semantic curation/ML preparation workspace):
@@ -109,6 +117,7 @@ Rationale:
 Final UX boundary notes:
 
 - Studio may expose navigation-time dataset/session scoping for processing selection.
+- Studio should treat experiment sessions as the default replay/reprocessing scope and keep acquisition/runtime grouping as an advanced operational control.
 - Studio should not foreground curation administration (label edits, validation review flows, semantic bulk ops).
 - Datasets remains the primary workspace for metadata authoring, annotation governance, and ML-set preparation.
 
@@ -1858,3 +1867,30 @@ Added a reusable two-layer architecture:
 ### Manifest authority
 
 Canonical manifest under `data/ml_ingestion_runs/<run_id>/canonical_manifest/` is the authoritative semantic artifact consumed by deterministic materialization.
+
+## ML Set Detail Drawer Architecture
+
+- ML Sets now open an `EntityDetailDrawer`-based governance surface rather than remaining a simple row/member list.
+- The drawer exposes provenance, readiness, class balance, representative samples, split integrity, session coverage, task derivation, compatibility, and exportability.
+
+### Dataset vs ML Set boundary
+
+- Dataset = acquisition/semantic organization surface.
+- ML Set = curated subset for reproducible ML workflows.
+
+### Integrity semantics
+
+- Split safety is evaluated by `physical_object_id`.
+- Leakage warnings surface when one object group appears across multiple splits.
+- Membership definition remains inspectable via membership mode + filter snapshot + semantics metadata.
+
+## Physical Object Semantic Layer
+
+- Added first-class `PhysicalObject` registry-backed dataset entities distinct from takes, detected objects, and ML-set memberships.
+- Datasets now expose a `Physical Objects` tab and detail drawer for object-centric semantic inspection.
+- Ingestion reconciliation syncs operator-row groupings into the physical-object registry automatically.
+
+### Role in governance
+
+- Physical Objects are the canonical ML split unit.
+- They also ground repeatability analysis and future cross-session semantic tracking.

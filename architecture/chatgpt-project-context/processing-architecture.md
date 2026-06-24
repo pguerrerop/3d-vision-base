@@ -1373,3 +1373,44 @@ Added compositional API endpoints for run lifecycle:
 - Canonical manifest generation and ML set materialization are separated.
 - Materialized artifacts include `ml_set.json`, `label_manifest.csv`, `split_manifest.csv`, distributions, and `validation_report.json`.
 - Processing/studio runtime architecture remains unchanged; this path is semantic governance + data curation.
+
+## ML Set Summary / Governance Aggregation
+
+- Added compositional ML-set aggregation service: `vision_3d_acquisition/ml/ml_set_summary.py`.
+- The service derives lightweight governance summaries from existing ML-set memberships plus DatasetService/take summaries; it does not introduce a parallel ML-set store.
+
+### ML set endpoints
+
+- `GET /api/ml-sets/{id}/summary`
+- `GET /api/ml-sets/{id}/class-distribution`
+- `GET /api/ml-sets/{id}/split-summary`
+- `GET /api/ml-sets/{id}/warnings`
+- `GET /api/ml-sets/{id}/representative-samples`
+- `GET /api/ml-sets/{id}/export?kind=...`
+
+### Summary contract intent
+
+- identity/provenance
+- readiness metrics
+- class/superclass/split distributions
+- session coverage
+- split-integrity diagnostics
+- derived task metadata
+- training compatibility
+- deterministic export routing
+
+## Physical Object Registry Architecture
+
+- Added additive semantic registry module: `vision_3d_acquisition/datasets/physical_objects.py`.
+- New API endpoints:
+  - `GET /api/physical-objects`
+  - `GET /api/physical-objects/{id}`
+  - `GET /api/physical-objects/{id}/takes`
+  - `GET /api/physical-objects/{id}/repeatability`
+  - `POST /api/physical-objects/reconcile`
+
+### Architectural boundary
+
+- Runtime processing remains unaware of Physical Objects by default.
+- Physical-object linkage is optional semantic metadata applied after acquisition/reconciliation.
+- Repeatability and ML split integrity can consume `physical_object_id` without coupling pipelines to that concept.

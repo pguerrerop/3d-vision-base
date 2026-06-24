@@ -7,6 +7,7 @@ __pycache__/
 frontend/.env
 frontend/dist/
 frontend/node_modules/
+tmp/
 
 # Runtime queue and generated artifacts
 data/

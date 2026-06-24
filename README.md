@@ -303,3 +303,14 @@ Studio now uses a canonical processing artifact contract (`result.artifacts`) as
 Processing units are now formally registered with metadata (`stage_id`, version, modality requirements, produced artifact kinds, dependencies, realtime support, optional/conditional flags). Pipeline definitions include a composition block describing execution order and artifact flow.
 
 Point-cloud artifacts (`kind: "point_cloud"`) include forward-compatible metadata for future 3D viewers (coordinate frame, units, point counts, projection references). 3D rendering is still intentionally deferred.
+
+## ML Validation Workflow
+
+- One-command happy-path smoke test: `make ml-smoke-test`
+- One-command fallback validation: `make ml-smoke-test-fallback`
+- ML pytest suite: `python -m pytest -q tests/ml/`
+
+Expected output:
+- `SMOKE TEST PASSED` for happy-path and fallback modes.
+- Persisted smoke-test result: `data/ml/smoke_test_results/latest.json`
+- Runtime observability updates: `data/ml/runtime_stats/YYYYMMDD.json`

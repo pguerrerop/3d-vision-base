@@ -288,15 +288,15 @@ The final pass keeps behavior unchanged while reducing cognitive load:
 
 - batch actions are present but collapsed/de-emphasized (`Batch` disclosure)
 - session labels are explicit and non-ambiguous:
-  - `Dataset session`
-  - `Acquisition session`
+  - `Experiment session` (canonical Studio replay/reprocessing scope)
+  - `Runtime acquisition group` (advanced operational grouping)
 - capture is secondary via collapsed treatment and lightweight affordance
 - selected-take context is compact orientation (not a secondary inspector)
 - Datasets handoff copy is concise and low-weight
 
 Navigation hierarchy in Studio sidebar is now:
 
-1. scope selectors (dataset/session)
+1. scope selectors (dataset/experiment session, with runtime grouping tucked under advanced)
 2. lightweight search + operational filters
 3. take browsing/selection
 4. optional batch/capture disclosures

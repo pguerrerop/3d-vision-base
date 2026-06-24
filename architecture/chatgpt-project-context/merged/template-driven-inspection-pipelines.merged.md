@@ -101,3 +101,11 @@ Mining balls ML-set generation now uses a reusable ingestion wizard for semantic
 - Human review remains explicit for unresolved/ambiguous rows.
 - Canonical manifest becomes the cross-workflow semantic contract.
 - Deterministic artifact generation remains reproducible and immutable-reference based.
+
+## ML Set Governance Surface
+
+- Template-driven inspection workflows now connect to an ML-set governance drawer focused on readiness, balance, reproducibility, and split safety.
+
+## Object-Centric Semantic Governance
+
+- Template-driven workflows now align with a reusable `PhysicalObject` semantic layer for operator reconciliation, repeatability grouping, and object-safe ML splitting.
