@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import {
   api,
+  type DatasetSessionSummary,
   type DatasetSummary,
   type FeatureAnalyticsDistributionResponse,
   type FeatureAnalyticsObject,
@@ -36,6 +37,38 @@ const DEFAULT_FILTERS: FilterState = {
 
 const COLORS = ["#1d4ed8", "#dc2626", "#0f766e", "#9333ea", "#f97316", "#374151"];
 const DEFAULT_CHART_WIDTH_PX = 860;
+
+function sessionTypeLabel(value: DatasetSessionSummary["session_type"] | string | null | undefined): string {
+  if (!value) return "Dataset session";
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "engineering") return "Engineering";
+  if (normalized === "curated") return "Curated";
+  if (normalized === "benchmark") return "Benchmark";
+  if (normalized === "operational") return "Operational";
+  return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : "Dataset session";
+}
+
+function compactDate(value: string | null | undefined): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(0, 10);
+}
+
+function sessionOptionLabel(session: DatasetSessionSummary): string {
+  const parts = [
+    sessionTypeLabel(session.session_type),
+    compactDate(session.created_at),
+    typeof session.take_count === "number" ? `${session.take_count} takes` : "",
+  ].filter(Boolean);
+  return parts.length ? `${session.name} - ${parts.join(" - ")}` : session.name;
+}
+
+function groupVisualStyle(group: string, index: number): { color: string; className: string } {
+  const normalized = group.trim().toUpperCase();
+  if (normalized === "UNKNOWN") return { color: "#94a3b8", className: "is-uncertain" };
+  return { color: COLORS[index % COLORS.length], className: "" };
+}
 
 function compactNumber(value: number): string {
   if (!Number.isFinite(value)) return "-";
@@ -74,6 +107,7 @@ function toQuery(filters: FilterState): Record<string, string> {
 
 export default function FeatureAnalyticsPage() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
+  const [datasetSessions, setDatasetSessions] = useState<DatasetSessionSummary[]>([]);
   const [pipelines, setPipelines] = useState<PipelineInfo[]>([]);
   const [features, setFeatures] = useState<Array<{ feature_key: string; display_name: string; semantic_group: string; unit?: string | null; description?: string | null; source_stage?: string | null }>>([]);
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
@@ -105,6 +139,26 @@ export default function FeatureAnalyticsPage() {
         setPipelines([]);
       });
   }, []);
+
+  useEffect(() => {
+    if (!filters.dataset) {
+      setDatasetSessions([]);
+      setFilters((prev) => (prev.session ? { ...prev, session: "" } : prev));
+      return;
+    }
+    void api.datasetSessions(filters.dataset)
+      .then((items) => {
+        setDatasetSessions(items);
+        setFilters((prev) => {
+          if (!prev.session) return prev;
+          const exists = items.some((item) => item.id === prev.session);
+          return exists ? prev : { ...prev, session: "" };
+        });
+      })
+      .catch(() => {
+        setDatasetSessions([]);
+      });
+  }, [filters.dataset]);
 
   useEffect(() => {
     setLoading(true);
@@ -164,22 +218,33 @@ export default function FeatureAnalyticsPage() {
     if (!distribution?.range?.edges?.length) return [];
     return adaptiveTickIndexes(distribution.range.edges, binCount);
   }, [distribution, binCount]);
+  const selectedSessionMeta = useMemo(
+    () => datasetSessions.find((item) => item.id === filters.session) ?? null,
+    [datasetSessions, filters.session],
+  );
 
   return (
     <main className="page feature-analytics-page">
       <section className="feature-analytics-layout">
         <aside className="feature-analytics-sidebar">
           <h2>Filters</h2>
-          <label>Dataset<select value={filters.dataset} onChange={(event) => setFilters((prev) => ({ ...prev, dataset: event.target.value }))}><option value="">All</option>{datasets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-          <label>Session<input value={filters.session} onChange={(event) => setFilters((prev) => ({ ...prev, session: event.target.value }))} placeholder="session_id" /></label>
-          <label>Labels<input value={filters.labels} onChange={(event) => setFilters((prev) => ({ ...prev, labels: event.target.value }))} placeholder="comma-separated" /></label>
-          <label>Superclass<input value={filters.superclass} onChange={(event) => setFilters((prev) => ({ ...prev, superclass: event.target.value }))} placeholder="BALL_GOOD,..." /></label>
-          <label>Validation<input value={filters.validationStatus} onChange={(event) => setFilters((prev) => ({ ...prev, validationStatus: event.target.value }))} placeholder="approved/unreviewed" /></label>
-          <label>Split<input value={filters.split} onChange={(event) => setFilters((prev) => ({ ...prev, split: event.target.value }))} placeholder="train/test" /></label>
-          <label>Pipeline<select value={filters.pipeline} onChange={(event) => setFilters((prev) => ({ ...prev, pipeline: event.target.value }))}><option value="">All</option>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.display_name}</option>)}</select></label>
-          <label>Calibration<input value={filters.calibration} onChange={(event) => setFilters((prev) => ({ ...prev, calibration: event.target.value }))} placeholder="calibration id" /></label>
-          <label>Date from<input type="date" value={filters.dateFrom} onChange={(event) => setFilters((prev) => ({ ...prev, dateFrom: event.target.value }))} /></label>
-          <label>Date to<input type="date" value={filters.dateTo} onChange={(event) => setFilters((prev) => ({ ...prev, dateTo: event.target.value }))} /></label>
+          <div className="feature-filter-section">
+            <h3>Basic</h3>
+            <label>Dataset<select value={filters.dataset} onChange={(event) => setFilters((prev) => ({ ...prev, dataset: event.target.value }))}><option value="">All datasets</option>{datasets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+            <label>Session<select value={filters.session} onChange={(event) => setFilters((prev) => ({ ...prev, session: event.target.value }))} disabled={!filters.dataset && datasetSessions.length === 0}><option value="">{filters.dataset ? "All sessions" : "All sessions"}</option>{datasetSessions.map((item) => <option key={item.id} value={item.id}>{sessionOptionLabel(item)}</option>)}</select></label>
+            {selectedSessionMeta ? <p className="feature-session-meta">{sessionTypeLabel(selectedSessionMeta.session_type)}{selectedSessionMeta.calibration_id ? ` • calib ${selectedSessionMeta.calibration_id}` : ""}</p> : null}
+            <label>Labels<input value={filters.labels} onChange={(event) => setFilters((prev) => ({ ...prev, labels: event.target.value }))} placeholder="comma-separated" /></label>
+            <label>Superclass<input value={filters.superclass} onChange={(event) => setFilters((prev) => ({ ...prev, superclass: event.target.value }))} placeholder="BALL_GOOD,..." /></label>
+          </div>
+          <div className="feature-filter-section feature-filter-section-advanced">
+            <h3>Advanced</h3>
+            <label>Validation<input value={filters.validationStatus} onChange={(event) => setFilters((prev) => ({ ...prev, validationStatus: event.target.value }))} placeholder="approved/unreviewed" /></label>
+            <label>Split<input value={filters.split} onChange={(event) => setFilters((prev) => ({ ...prev, split: event.target.value }))} placeholder="train/test" /></label>
+            <label>Pipeline<select value={filters.pipeline} onChange={(event) => setFilters((prev) => ({ ...prev, pipeline: event.target.value }))}><option value="">All pipelines</option>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.display_name}</option>)}</select></label>
+            <label>Calibration<input value={filters.calibration} onChange={(event) => setFilters((prev) => ({ ...prev, calibration: event.target.value }))} placeholder="calibration id" /></label>
+            <label>Date from<input type="date" value={filters.dateFrom} onChange={(event) => setFilters((prev) => ({ ...prev, dateFrom: event.target.value }))} /></label>
+            <label>Date to<input type="date" value={filters.dateTo} onChange={(event) => setFilters((prev) => ({ ...prev, dateTo: event.target.value }))} /></label>
+          </div>
         </aside>
 
         <section className="feature-analytics-main">
@@ -196,27 +261,34 @@ export default function FeatureAnalyticsPage() {
             {!loading && error ? <div className="empty-state"><strong>{error}</strong></div> : null}
             {!loading && !error && distribution?.groups.length ? (
               <div>
-                <div className="feature-legend">{distribution.groups.map((group, idx) => <span key={group.group}><i style={{ backgroundColor: COLORS[idx % COLORS.length] }} />{group.group}</span>)}</div>
+                <div className="feature-legend">{distribution.groups.map((group, idx) => {
+                  const visual = groupVisualStyle(group.group, idx);
+                  return <span key={group.group} className={visual.className}><i style={{ backgroundColor: visual.color }} />{group.group}</span>;
+                })}</div>
                 <div className="feature-histogram-grid">
                   {distribution.groups.map((group, groupIdx) => (
-                    <div key={group.group} className="feature-histogram-row">
-                      {group.bins.map((value, idx) => {
+                    <div key={group.group} className="feature-histogram-band">
+                      <div className={`feature-band-label ${groupVisualStyle(group.group, groupIdx).className}`}>{group.group}</div>
+                      <div className={`feature-histogram-row ${groupVisualStyle(group.group, groupIdx).className}`}>
+                        {group.bins.map((value, idx) => {
                         const edgeStart = distribution.range?.edges[idx] ?? 0;
                         const edgeEnd = distribution.range?.edges[idx + 1] ?? edgeStart;
                         const density = group.count > 0 ? Number(value) / group.count : 0;
                         const pct = maxY ? (Number(value) / maxY) * 100 : 0;
+                        const visual = groupVisualStyle(group.group, groupIdx);
                         return (
                           <button
                             type="button"
                             key={`${group.group}_${idx}`}
-                            className="feature-bin"
+                            className={`feature-bin ${visual.className}`}
                             title={`${group.group} | ${compactNumber(edgeStart)} - ${compactNumber(edgeEnd)} | count ${compactNumber(Number(value))}${mode === "density" ? ` | density ${compactNumber(Number(value))}` : ` | density ${compactNumber(density)}`}`}
                             onClick={() => setSelectedRange({ min: edgeStart, max: edgeEnd })}
                           >
-                            <span style={{ height: `${Math.max(2, pct)}%`, backgroundColor: COLORS[groupIdx % COLORS.length] }} />
+                            <span style={{ height: `${Math.max(2, pct)}%`, backgroundColor: visual.color }} />
                           </button>
                         );
-                      })}
+                        })}
+                      </div>
                     </div>
                   ))}
                 </div>

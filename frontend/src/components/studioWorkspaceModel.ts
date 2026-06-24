@@ -47,6 +47,9 @@ export function artifactsForStage(detail: TakeDetail | null, stageId: string): S
   } else if (canonical === "measurement") {
     aliases.add("ellipse_fitting");
     aliases.add("metrics");
+  } else if (canonical === "measurement_diagnostics") {
+    aliases.add("measurement_diagnostics");
+    aliases.add("diagnostics");
   } else if (canonical === "classification") {
     aliases.add("classification");
     aliases.add("overlay");
@@ -77,6 +80,7 @@ function canonicalStageIdLocal(stageId: string): string {
   const raw = `${stageId ?? ""}`.toLowerCase();
   if (raw.includes("fitobjectgeometry") || raw.includes("footprint") || raw === "geometry") return "fit_object_geometry";
   if (raw.includes("computeheightmetrics") || raw === "measurement") return "compute_height_metrics";
+  if (raw.includes("computemeasurementdiagnostics") || raw.includes("measurement_diagnostics")) return "measurement_diagnostics";
   if (raw.includes("detectbeltplane") || raw.includes("estimatebeltplane") || raw.includes("belt_plane")) return "detect_belt_plane";
   if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized_height")) return "normalize_heights_to_plane";
   if (raw.includes("removebeltandsegmentobjects") || raw.includes("height_segmentation")) return "remove_belt_segment_objects";

@@ -77,7 +77,11 @@ export type StageViewTabId =
   | "segmentation"
   | "measurements_25d"
   | "classification_25d"
-  | "overlays_25d";
+  | "overlays_25d"
+  | "diagnostics"
+  | "feature_vector"
+  | "quality_flags"
+  | "provenance";
 
 export function tabForStage(stageId: string): StudioWorkspaceTab {
   if (stageId.includes("segment")) return "segmentation";

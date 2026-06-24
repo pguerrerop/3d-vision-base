@@ -190,11 +190,17 @@ export default function OperatorInspectionPage() {
               className={`take-row operator-recent-row ${index === 0 ? "operator-recent-row-latest" : ""}`}
             >
               <div className={`operator-superclass-center ${superclassTone}`}>{superclassEs}</div>
-              <div className="take-row-main">
+              <div className="take-row-main operator-meta-col">
                 <strong>{card.take_id}</strong>
                 <small>Status: {prettyStatus(card.status)}</small>
-                <small>Superclass: {superclassEs} ({superclass}) | Label: {card.label || "-"}</small>
-                <small>Confidence: {formatConfidence(card.confidence)} | Objects: {card.object_count ?? 0}</small>
+                <small>Acquired: {formatTimestamp(card.acquired_at)}</small>
+                <small>Processed: {formatTimestamp(card.processed_at)}</small>
+                {card.error && <small>Error: {card.error}</small>}
+              </div>
+              <div className="operator-class-col">
+                <strong>{card.label || superclassEs}</strong>
+                <small>{formatConfidence(card.confidence)} confidence · {card.object_count ?? 0} object{(card.object_count ?? 0) === 1 ? "" : "s"}</small>
+                <small>{superclass} · {card.label || "-"}</small>
                 {showClassificationVariables && (
                   <small>
                     Vars: max_h={formatVariable(card.classification_variables?.max_height_mm, 2)}mm | p95_h=
@@ -207,8 +213,6 @@ export default function OperatorInspectionPage() {
                     {formatVariable(card.classification_variables?.volume_proxy_mm3, 1)}mm3
                   </small>
                 )}
-                <small>Acquired: {formatTimestamp(card.acquired_at)} | Processed: {formatTimestamp(card.processed_at)}</small>
-                {card.error && <small>Error: {card.error}</small>}
               </div>
               <div className="take-row-meta">
                 {image ? (

@@ -7,6 +7,7 @@ import {
   type DatasetSummary,
   type PipelineInfo,
   type PipelineInstance,
+  type ProcessingJobRecord,
   type ProcessTemplate,
   type RuntimeState,
   type SegmentationPreviewResponse,
@@ -167,6 +168,9 @@ export default function ProcessingLabPage() {
   const [latestPublishedResult, setLatestPublishedResult] = useState<InspectionPublishedResult | null>(null);
   const [processBindings, setProcessBindings] = useState<ProcessBinding[]>([]);
   const [bindingPurpose, setBindingPurpose] = useState<"acquisition_inspection" | "fusion">("acquisition_inspection");
+  const [processingJobs, setProcessingJobs] = useState<ProcessingJobRecord[]>([]);
+  const [processingJobCounts, setProcessingJobCounts] = useState<Record<string, number>>({});
+  const [processingJobsLoading, setProcessingJobsLoading] = useState(false);
   const [pipelineActionBusy, setPipelineActionBusy] = useState(false);
   const [pipelineActionMessage, setPipelineActionMessage] = useState<string | null>(null);
   const [roiEditModeActive, setRoiEditModeActive] = useState(false);
@@ -238,6 +242,7 @@ export default function ProcessingLabPage() {
       nextWorkers,
       nextBindings,
       nextLatestPublished,
+      nextJobs,
     ] = await Promise.all([
       api.sessions(),
       api.pipelines(),
@@ -248,6 +253,7 @@ export default function ProcessingLabPage() {
       api.runtimeWorkers().catch(() => ({ workers: [] })),
       api.processBindings().catch(() => [] as ProcessBinding[]),
       api.latestPublishedInspectionResult().catch(() => null as InspectionPublishedResult | null),
+      api.processingJobs().catch(() => ({ jobs: [], counts: {} })),
     ]);
     const nextDatasetSessions = selectedDataset ? await api.datasetSessions(selectedDataset) : [];
     setSessions(nextSessions);
@@ -260,6 +266,8 @@ export default function ProcessingLabPage() {
     setRuntimeWorkers(nextWorkers.workers ?? []);
     setProcessBindings(nextBindings);
     setLatestPublishedResult(nextLatestPublished);
+    setProcessingJobs(nextJobs.jobs ?? []);
+    setProcessingJobCounts(nextJobs.counts ?? {});
     setSelectedPipelineInstanceId((current) => current || nextInstances[0]?.id || "");
     setSelectedPipelineId((current) => current || nextPipelines[0]?.id || "3d_ball_inspection");
     await loadTakePage(0, false);
@@ -268,6 +276,31 @@ export default function ProcessingLabPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshJobs = async () => {
+      setProcessingJobsLoading(true);
+      try {
+        const nextJobs = await api.processingJobs();
+        if (cancelled) return;
+        setProcessingJobs(nextJobs.jobs ?? []);
+        setProcessingJobCounts(nextJobs.counts ?? {});
+      } catch {
+        if (cancelled) return;
+      } finally {
+        if (!cancelled) setProcessingJobsLoading(false);
+      }
+    };
+    void refreshJobs();
+    const interval = window.setInterval(() => {
+      void refreshJobs();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const loadMoreTakes = useCallback(async () => {
     if (!takesHasMore || takesLoadingMore) return;
@@ -759,14 +792,7 @@ export default function ProcessingLabPage() {
     return () => window.clearTimeout(timer);
   }, [ellipsePreviewEnabled, ellipsePreviewDirty, ellipsePreviewParams, detail?.take_id, selectedPipeline?.id, canonicalSelectedStageId]);
   const filteredTakes = takes.filter((take) => {
-    if (selectedExperimentSession && take.experiment_session_id !== selectedExperimentSession) return false;
-    if (modalityFilter !== "all" && !(take.modalities ?? []).includes(modalityFilter)) return false;
-    const statusForFamily = (take.processing_by_family ?? []).find((item) => item.family === activePipelineFamily);
-    const processedForFamily = Boolean(statusForFamily?.hasCompletedOutput);
-    if (takeFilter === "processed" && !processedForFamily) return false;
-    if (takeFilter === "unprocessed" && processedForFamily) return false;
-    if (takeFilter === "warnings" && !(take.warning_count ?? 0)) return false;
-    return true;
+    return takeMatchesStudioFilters(take);
   });
   const selectedDatasetInfo = useMemo(
     () => datasets.find((item) => item.id === selectedDataset) ?? null,
@@ -785,12 +811,12 @@ export default function ProcessingLabPage() {
     [takes, selectedTakeId],
   );
   const selectedContextDatasetName = selectedTakeSummary?.dataset_name || selectedDatasetInfo?.name || (selectedDataset || "All datasets");
-  const selectedContextSessionName = selectedTakeSummary?.experiment_session_name || selectedDatasetSessionInfo?.name || (selectedExperimentSession || "All sessions");
+  const selectedContextSessionName = selectedTakeSummary?.experiment_session_name || selectedDatasetSessionInfo?.name || (selectedExperimentSession || "All experiment sessions");
   const selectedContextSessionType = String(selectedTakeSummary?.experiment_session_type || selectedDatasetSessionInfo?.session_type || "engineering");
   const activeFilterChips = useMemo(() => {
     const chips: string[] = [];
     if (selectedDataset) chips.push(`dataset:${selectedDataset}`);
-    if (selectedExperimentSession) chips.push(`dataset_session:${selectedExperimentSession}`);
+    if (selectedExperimentSession) chips.push(`experiment_session:${selectedExperimentSession}`);
     if (selectedSession) chips.push(`acquisition_session:${selectedSession}`);
     if (takeSearch) chips.push(`search:${takeSearch}`);
     if (showArchived) chips.push("show_archived");
@@ -1260,42 +1286,195 @@ export default function ProcessingLabPage() {
     });
   }
 
+  function takeMatchesStudioFilters(take: TakeSummary): boolean {
+    if (selectedExperimentSession && take.experiment_session_id !== selectedExperimentSession) return false;
+    if (modalityFilter !== "all" && !(take.modalities ?? []).includes(modalityFilter)) return false;
+    const statusForFamily = (take.processing_by_family ?? []).find((item) => item.family === activePipelineFamily);
+    const processedForFamily = Boolean(statusForFamily?.hasCompletedOutput);
+    if (takeFilter === "processed" && !processedForFamily) return false;
+    if (takeFilter === "unprocessed" && processedForFamily) return false;
+    if (takeFilter === "warnings" && !(take.warning_count ?? 0)) return false;
+    return true;
+  }
+
+  async function resolveCurrentFilterTakeIds(): Promise<string[]> {
+    const ids: string[] = [];
+    let offset = 0;
+    while (true) {
+      const page = await api.pagedTakes({
+        ...takePageParams,
+        limit: 200,
+        offset,
+      });
+      const matching = (page.items ?? []).filter((item) => takeMatchesStudioFilters(item));
+      ids.push(...matching.map((item) => item.take_id));
+      if (!page.has_more) break;
+      offset = page.next_offset ?? (offset + (page.items?.length ?? 0));
+    }
+    return Array.from(new Set(ids));
+  }
+
+  async function submitProcessingJob(payload: Parameters<typeof api.createProcessingJob>[0]) {
+    setPipelineActionBusy(true);
+    setPipelineActionMessage("Creating processing job...");
+    try {
+      const created = await api.createProcessingJob(payload);
+      setPipelineActionMessage(`Processing job ${created.job.id} queued.`);
+      await load();
+      return created.job;
+    } catch (err) {
+      setPipelineActionMessage(`Processing job failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      return null;
+    } finally {
+      setPipelineActionBusy(false);
+    }
+  }
+
+  async function cancelProcessingJob(jobId: string) {
+    setPipelineActionBusy(true);
+    setPipelineActionMessage(`Cancelling processing job ${jobId}...`);
+    try {
+      await api.cancelProcessingJob(jobId);
+      await load();
+      setPipelineActionMessage(`Processing job ${jobId} cancelled.`);
+    } catch (err) {
+      setPipelineActionMessage(`Cancel failed: ${err instanceof Error ? err.message : "unknown error"}`);
+    } finally {
+      setPipelineActionBusy(false);
+    }
+  }
+
   async function reprocessSelectedTakes() {
     if (!selectedPipeline || selectedTakeIds.size === 0) return;
     const takeIds = Array.from(selectedTakeIds);
     const stageParams = build25dStageParams();
-    const maxConcurrent = 3;
-    let completed = 0;
-    let failed = 0;
-    setPipelineActionBusy(true);
-    setPipelineActionMessage(`Reprocessing ${takeIds.length} takes...`);
     setResultStale(true);
+    await submitProcessingJob({
+      take_ids: takeIds,
+      pipeline_id: selectedPipeline.id,
+      reprocess_mode: "full",
+      skip_completed: false,
+      force: false,
+      selected_stage: selectedStage?.id ?? null,
+      classifier_rules_path: selectedPipeline.id === "mining_steel_ball_classification_25d"
+        ? (stageParams?.classify_25d as Record<string, unknown> | undefined)?.classifier_rules_path as string | undefined
+        : undefined,
+      filters_snapshot: {
+        dataset_id: selectedDataset || null,
+        dataset_session_id: selectedExperimentSession || null,
+        acquisition_session_id: selectedSession || null,
+        search: takeSearch || null,
+        show_archived: showArchived,
+        modality: modalityFilter,
+        take_filter: takeFilter,
+      },
+      created_by: "studio",
+      options: {
+        stage_params: stageParams,
+      },
+    });
+    setResultStale(false);
+  }
+
+  async function reprocessFilteredTakes(mode: "failed_only" | "missing_outputs") {
+    if (!selectedPipeline) return;
+    const takeIds = await resolveCurrentFilterTakeIds();
+    if (!takeIds.length) return;
+    const stageParams = build25dStageParams();
+    await submitProcessingJob({
+      take_ids: takeIds,
+      pipeline_id: selectedPipeline.id,
+      reprocess_mode: mode,
+      skip_completed: false,
+      force: false,
+      selected_stage: selectedStage?.id ?? null,
+      classifier_rules_path: selectedPipeline.id === "mining_steel_ball_classification_25d"
+        ? (stageParams?.classify_25d as Record<string, unknown> | undefined)?.classifier_rules_path as string | undefined
+        : undefined,
+      filters_snapshot: {
+        dataset_id: selectedDataset || null,
+        dataset_session_id: selectedExperimentSession || null,
+        acquisition_session_id: selectedSession || null,
+        search: takeSearch || null,
+        show_archived: showArchived,
+        modality: modalityFilter,
+        take_filter: takeFilter,
+      },
+      created_by: "studio",
+      options: {
+        stage_params: stageParams,
+      },
+    });
+  }
+
+  async function reprocessCurrentExperimentSession() {
+    if (!selectedPipeline || !selectedExperimentSession) return;
+    const stageParams = build25dStageParams();
+    await submitProcessingJob({
+      dataset_session_id: selectedExperimentSession,
+      pipeline_id: selectedPipeline.id,
+      reprocess_mode: "full",
+      skip_completed: false,
+      force: false,
+      selected_stage: selectedStage?.id ?? null,
+      classifier_rules_path: selectedPipeline.id === "mining_steel_ball_classification_25d"
+        ? (stageParams?.classify_25d as Record<string, unknown> | undefined)?.classifier_rules_path as string | undefined
+        : undefined,
+      filters_snapshot: {
+        dataset_id: selectedDataset || null,
+        dataset_session_id: selectedExperimentSession || null,
+        acquisition_session_id: selectedSession || null,
+        search: takeSearch || null,
+        show_archived: showArchived,
+      },
+      created_by: "studio",
+      options: {
+        stage_params: stageParams,
+      },
+    });
+  }
+
+  async function reprocessCurrentDataset() {
+    if (!selectedPipeline || !selectedDataset) return;
+    const stageParams = build25dStageParams();
+    await submitProcessingJob({
+      dataset_id: selectedDataset,
+      pipeline_id: selectedPipeline.id,
+      reprocess_mode: "full",
+      skip_completed: false,
+      force: false,
+      selected_stage: selectedStage?.id ?? null,
+      classifier_rules_path: selectedPipeline.id === "mining_steel_ball_classification_25d"
+        ? (stageParams?.classify_25d as Record<string, unknown> | undefined)?.classifier_rules_path as string | undefined
+        : undefined,
+      filters_snapshot: {
+        dataset_id: selectedDataset || null,
+        dataset_session_id: selectedExperimentSession || null,
+        acquisition_session_id: selectedSession || null,
+        search: takeSearch || null,
+        show_archived: showArchived,
+      },
+      created_by: "studio",
+      options: {
+        stage_params: stageParams,
+      },
+    });
+  }
+
+  async function clearSelectedOutputFiles() {
+    if (!selectedTakeIds.size) return;
+    setPipelineActionBusy(true);
+    setPipelineActionMessage(`Clearing outputs for ${selectedTakeIds.size} takes...`);
     try {
-      for (let i = 0; i < takeIds.length; i += maxConcurrent) {
-        const batch = takeIds.slice(i, i + maxConcurrent);
-        const results = await Promise.allSettled(
-          batch.map((takeId) => processTakeWithSelectedPipeline(takeId, true, stageParams))
-        );
-        completed += results.filter((item) => item.status === "fulfilled").length;
-        failed += results.filter((item) => item.status === "rejected").length;
-        setPipelineActionMessage(
-          `Reprocessing takes... ${completed + failed}/${takeIds.length} (ok: ${completed}, failed: ${failed})`
-        );
+      for (const takeId of selectedTakeIds) {
+        await api.clearTakeOutputs(takeId);
       }
       await load();
-      if (detail?.take_id) {
-        setDetail(await api.take(detail.take_id));
-      }
-      setPipelineActionMessage(
-        failed > 0
-          ? `Bulk reprocess finished with ${failed} failures (${completed} succeeded).`
-          : `Bulk reprocess completed for ${completed} takes.`
-      );
+      setPipelineActionMessage(`Cleared outputs for ${selectedTakeIds.size} takes.`);
     } catch (err) {
-      setPipelineActionMessage(`Bulk reprocess failed: ${err instanceof Error ? err.message : "unknown error"}`);
+      setPipelineActionMessage(`Clear outputs failed: ${err instanceof Error ? err.message : "unknown error"}`);
     } finally {
       setPipelineActionBusy(false);
-      setResultStale(false);
     }
   }
 
@@ -1629,6 +1808,35 @@ export default function ProcessingLabPage() {
     return worker.state;
   }
 
+  function formatProcessingJobScope(job: ProcessingJobRecord): string {
+    const filters = job.filters_summary ?? {};
+    const summaryLabel = typeof job.summary?.scope_label === "string" ? job.summary.scope_label : null;
+    if (summaryLabel) return summaryLabel;
+    if (job.scope_type === "dataset_session") {
+      return `Experiment session ${String(filters.dataset_session_id ?? filters.session_id ?? job.summary?.dataset_session_id ?? "selected")}`;
+    }
+    if (job.scope_type === "acquisition_session") {
+      return `Runtime acquisition group ${String(filters.acquisition_session_id ?? job.summary?.acquisition_session_id ?? "selected")}`;
+    }
+    if (job.scope_type === "dataset") {
+      return `Dataset ${String(filters.dataset_id ?? job.summary?.dataset_id ?? "selected")}`;
+    }
+    if (job.scope_type === "take_selection") {
+      return "Selected takes";
+    }
+    return "Filtered takes";
+  }
+
+  const activeProcessingJobs = processingJobs.filter((job) => job.status === "queued" || job.status === "running");
+  const processingJobStatusCounts = {
+    queued: processingJobCounts.queued ?? processingJobs.filter((job) => job.status === "queued").length,
+    running: processingJobCounts.running ?? processingJobs.filter((job) => job.status === "running").length,
+    completed: processingJobCounts.completed ?? processingJobs.filter((job) => job.status === "completed").length,
+    failed: processingJobCounts.failed ?? processingJobs.filter((job) => job.status === "failed").length,
+    cancelled: processingJobCounts.cancelled ?? processingJobs.filter((job) => job.status === "cancelled").length,
+    partial: processingJobCounts.partial ?? processingJobs.filter((job) => job.status === "partial").length,
+  };
+
   return (
     <main className="studio-workspace">
       <aside className="studio-sidebar">
@@ -1672,25 +1880,38 @@ export default function ProcessingLabPage() {
               <option key={dataset.id} value={dataset.id}>{dataset.name}</option>
             ))}
           </select>
+          <div className="studio-inline-action-row">
+            <button type="button" disabled={pipelineActionBusy || !selectedPipeline || !selectedDataset} onClick={() => void reprocessCurrentDataset()}>Reprocess dataset</button>
+          </div>
         </label>
         <label className="field-label">
-          Dataset session
+          Experiment session
           <select value={selectedExperimentSession} onChange={(event) => setSelectedExperimentSession(event.target.value)} disabled={!selectedDataset}>
-            <option value="">All dataset sessions</option>
+            <option value="">All experiment sessions</option>
             {datasetSessions.map((session) => (
               <option key={session.id} value={session.id}>{session.name}</option>
             ))}
           </select>
+          <small className="field-help">Engineering/acquisition context grouping used for replay, calibration, and processing workflows.</small>
+          <div className="studio-inline-action-row">
+            <button type="button" disabled={pipelineActionBusy || !selectedPipeline || !selectedExperimentSession} onClick={() => void reprocessCurrentExperimentSession()}>Reprocess session</button>
+          </div>
         </label>
-        <label className="field-label">
-          Acquisition session
-          <select value={selectedSession} onChange={(event) => setSelectedSession(event.target.value)}>
-            <option value="">All sessions</option>
-            {sessions.map((session) => (
-              <option key={session.session_id} value={session.session_id}>{session.session_id}</option>
-            ))}
-          </select>
-        </label>
+        <details className="studio-runtime-grouping">
+          <summary>Advanced runtime grouping</summary>
+          <div className="studio-runtime-grouping-body">
+            <small className="field-help">Low-level runtime/replay grouping primarily used for ingestion and operational replay workflows.</small>
+            <label className="field-label">
+              Runtime acquisition group
+              <select value={selectedSession} onChange={(event) => setSelectedSession(event.target.value)}>
+                <option value="">All runtime groups</option>
+                {sessions.map((session) => (
+                  <option key={session.session_id} value={session.session_id}>{session.session_id}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </details>
         <details className="studio-pipeline-card studio-capture-card">
           <summary>Capture take</summary>
           {!selectedDataset && <small>Select a dataset/session to enable capture.</small>}
@@ -1774,6 +1995,27 @@ export default function ProcessingLabPage() {
               onClick={() => void reprocessSelectedTakes()}
             >
               Reprocess selected
+            </button>
+            <button
+              type="button"
+              disabled={pipelineActionBusy || !selectedPipeline || takesLoading}
+              onClick={() => void reprocessFilteredTakes("failed_only")}
+            >
+              Reprocess failed
+            </button>
+            <button
+              type="button"
+              disabled={pipelineActionBusy || !selectedPipeline || takesLoading}
+              onClick={() => void reprocessFilteredTakes("missing_outputs")}
+            >
+              Reprocess missing outputs
+            </button>
+            <button
+              type="button"
+              disabled={pipelineActionBusy || bulkSelectionCount === 0}
+              onClick={() => void clearSelectedOutputFiles()}
+            >
+              Clear outputs
             </button>
             <button
               type="button"
@@ -2521,6 +2763,59 @@ export default function ProcessingLabPage() {
         }}
         onUpsertObjectAnnotation={(payload) => void upsertObjectAnnotation(payload)}
       />
+      <details className="studio-processing-job-monitor" open>
+        <summary>
+          Processing jobs
+          <span className="studio-processing-job-monitor-counts">
+            {processingJobStatusCounts.running} running · {processingJobStatusCounts.queued} queued · {processingJobStatusCounts.completed} completed · {processingJobStatusCounts.failed + processingJobStatusCounts.partial} issues
+          </span>
+        </summary>
+        <div className="studio-processing-job-monitor-body">
+          {processingJobsLoading && !processingJobs.length && <small>Loading jobs…</small>}
+          {!processingJobs.length && !processingJobsLoading && <small>No processing jobs yet.</small>}
+          {activeProcessingJobs.length > 0 && (
+            <div className="studio-processing-job-monitor-section">
+              <strong>Active</strong>
+              {activeProcessingJobs.map((job) => (
+                <article className="studio-processing-job-card" key={job.id}>
+                  <header>
+                    <strong>{formatProcessingJobScope(job)}</strong>
+                    <span>{job.pipeline_id}</span>
+                  </header>
+                  <div className="studio-processing-job-card-progress">
+                    <progress max={Math.max(1, job.total_takes)} value={Math.min(job.total_takes, job.completed_takes + job.failed_takes + job.skipped_takes)} />
+                    <small>{job.completed_takes + job.failed_takes + job.skipped_takes}/{job.total_takes || 0}</small>
+                  </div>
+                  <div className="studio-processing-job-card-meta">
+                    <small>{job.status}</small>
+                    <small>{job.failed_takes} failed</small>
+                    <small>{job.started_at ? `started ${job.started_at}` : job.created_at}</small>
+                  </div>
+                  {job.status !== "cancelled" && job.status !== "completed" && job.status !== "failed" && (
+                    <button type="button" disabled={pipelineActionBusy} onClick={() => void cancelProcessingJob(job.id)}>Cancel</button>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
+          <div className="studio-processing-job-monitor-section">
+            <strong>Recent</strong>
+            {processingJobs.slice(0, 5).map((job) => (
+              <article className="studio-processing-job-card" key={job.id}>
+                <header>
+                  <strong>{formatProcessingJobScope(job)}</strong>
+                  <span>{job.pipeline_id}</span>
+                </header>
+                <div className="studio-processing-job-card-meta">
+                  <small>{job.status}</small>
+                  <small>{job.completed_takes}/{job.total_takes} complete</small>
+                  <small>{job.failed_takes} failed</small>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      </details>
     </main>
   );
 }

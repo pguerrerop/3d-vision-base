@@ -833,6 +833,19 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
             <small>{String(((chosen.decision_summary as Record<string, unknown> | undefined)?.final_decision_path) ?? "-")}</small>
             <small>Debug: classification_explanation.json found: yes</small>
           </div>
+          {chosen.semantic_group_summaries && typeof chosen.semantic_group_summaries === "object" ? (
+            <div className="artifact-reference">
+              <span>Semantic groups</span>
+              {Object.entries(chosen.semantic_group_summaries as Record<string, unknown>).map(([key, value]) => {
+                const row = (value && typeof value === "object") ? value as Record<string, unknown> : {};
+                return (
+                  <small key={`group_summary_${key}`}>
+                    {key}: {Boolean(row.pass) ? "pass" : "fail"} | {String(row.primary_metric ?? "-")}={String(row.value ?? "-")}
+                  </small>
+                );
+              })}
+            </div>
+          ) : null}
           <table className="compact-candidate-table">
             <thead>
               <tr>

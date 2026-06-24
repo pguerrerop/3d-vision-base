@@ -537,11 +537,12 @@ test("stage resolver maps segmentation artifacts from process runs", () => {
 });
 
 
-test("product navigation exposes Operations Studio Runtime Calibration Diagnostics", () => {
-  assert.deepEqual(PRODUCT_NAV_ITEMS.map((item) => item.label), ["Operations", "Studio", "Runtime", "Calibration", "Diagnostics"]);
+test("product navigation exposes top-level platform workspaces", () => {
+  assert.deepEqual(PRODUCT_NAV_ITEMS.map((item) => item.label), ["Operations", "Studio", "Datasets", "Classifiers", "Runtime", "Calibration", "Diagnostics"]);
   assert.equal(productAreaForPath("/operator"), "operations");
   assert.equal(productAreaForPath("/operator/inspection"), "operations");
   assert.equal(productAreaForPath("/processing-lab"), "studio");
+  assert.equal(productAreaForPath("/datasets"), "datasets");
   assert.equal(productAreaForPath("/debug"), "diagnostics");
   assert.equal(productAreaForPath("/studio"), "studio");
 });

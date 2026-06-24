@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import type { PipelineInfo, TakeDetail } from "../api/client";
+import { useEffect, useMemo, useState } from "react";
+import { fileUrl, type PipelineInfo, type TakeDetail } from "../api/client";
 import type { OverlayDebugInfo } from "./overlayModel";
 import { incompatibleModalityMessage } from "./pipelineModel";
 import { canonicalStageId, stageSemanticDefinition } from "./stageSemantics";
@@ -19,10 +19,16 @@ type Props = {
   selectedArtifact: StudioArtifact | null;
   overlayDebug: OverlayDebugInfo | null;
   hoverSample?: HoverInspectionSample | null;
+  acquisitionContext?: {
+    dataset?: string | null;
+    session?: string | null;
+    sessionType?: string | null;
+    sessionTags?: string[];
+  };
   onUpsertObjectAnnotation?: (payload: Record<string, unknown>) => void;
 };
 
-export default function StudioInspector({ detail, pipeline, stageId, compatible, selectedObjectId, selectedArtifact, overlayDebug, hoverSample = null, onUpsertObjectAnnotation }: Props) {
+export default function StudioInspector({ detail, pipeline, stageId, compatible, selectedObjectId, selectedArtifact, overlayDebug, hoverSample = null, acquisitionContext, onUpsertObjectAnnotation }: Props) {
   const objects = [...(detail?.result?.objects ?? []), ...(detail?.result?.rejected_objects ?? [])];
   const objectCandidates = detail?.result?.object_candidates ?? [];
   const artifacts = detail?.result?.artifacts ?? [];
@@ -89,6 +95,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
     ? null
     : objectCandidates.find((item) => Number(item.local_object_index) === selectedObjectId) ?? null;
   const hasClassificationExplanationArtifact = artifacts.some((item) => item.artifact_id === "classification_explanation");
+  const runtimeDiagnosticsArtifact = artifacts.find((item) => item.artifact_id === "classification_runtime_diagnostics") ?? null;
   const explanationArtifact = artifacts.find((item) => item.artifact_id === "classification_explanation") ?? null;
   const explanationRows = Array.isArray((explanationArtifact?.metadata as Record<string, unknown> | undefined)?.objects)
     ? (((explanationArtifact?.metadata as Record<string, unknown> | undefined)?.objects as unknown[])
@@ -100,6 +107,27 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
     if (Number.isFinite(oid) && oid > 0) explanationByObjectId.set(oid, row);
   }
   const artifactMeta = ((selectedArtifact?.metadata ?? {}) as Record<string, unknown>);
+  const [runtimeDiagnostics, setRuntimeDiagnostics] = useState<Record<string, unknown> | null>(null);
+  useEffect(() => {
+    async function loadRuntimeDiagnostics() {
+      if (!detail?.take_id || !runtimeDiagnosticsArtifact?.path) {
+        setRuntimeDiagnostics(null);
+        return;
+      }
+      try {
+        const response = await fetch(fileUrl(detail.take_id, String(runtimeDiagnosticsArtifact.path)));
+        if (!response.ok) {
+          setRuntimeDiagnostics(null);
+          return;
+        }
+        const payload = await response.json();
+        setRuntimeDiagnostics(payload as Record<string, unknown>);
+      } catch {
+        setRuntimeDiagnostics(null);
+      }
+    }
+    void loadRuntimeDiagnostics();
+  }, [detail?.take_id, runtimeDiagnosticsArtifact?.path]);
   const transformMeta = (artifactMeta.transform && typeof artifactMeta.transform === "object") ? (artifactMeta.transform as Record<string, unknown>) : null;
   // Resolve the canonical HeightColorMapping for the current take so we can
   // render the colorbar on every stage (not only when a height image is the
@@ -124,6 +152,14 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         <strong>{inspectorTitle}</strong>
       </div>
       <div className="inspector-section">
+        <span>Acquisition context</span>
+        <strong>{acquisitionContext?.dataset || (detail?.take_metadata?.dataset_id as string | undefined) || "-"}</strong>
+        <small>Session: {acquisitionContext?.session || (detail?.take_metadata?.session_id as string | undefined) || "-"}</small>
+        <small>Type: {acquisitionContext?.sessionType || "-"}</small>
+        <small>Reference: {String((detail?.take_metadata?.is_reference as boolean | undefined) ? "yes" : "no")} | Golden: {String((detail?.take_metadata?.is_golden_sample as boolean | undefined) ? "yes" : "no")}</small>
+        <small>Categories: {Array.isArray(detail?.take_metadata?.categories) && detail?.take_metadata?.categories.length ? (detail?.take_metadata?.categories as string[]).join(", ") : "-"}</small>
+      </div>
+      <div className="inspector-section">
         <span>Compatibility</span>
         <strong>{compatible ? "Compatible" : "Incompatible"}</strong>
         {!compatible && pipeline && <small>{incompatibleModalityMessage(pipeline, detail?.modalities)}</small>}
@@ -135,6 +171,43 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         <small>Inputs: {summary.inputArtifactCount} | Outputs: {summary.outputArtifactCount}</small>
         <small>Objects: {summary.objectCount}; rejected: {summary.rejectedCount}</small>
       </div>
+      {semantic.category === "classification" && (
+        <div className="inspector-section">
+          <span>Runtime diagnostics</span>
+          {(() => {
+            const diag = runtimeDiagnostics ?? {};
+            const fallback = Boolean(diag.fallback_used);
+            const comp = (diag.compatibility_checks as Record<string, unknown> | undefined) ?? {};
+            const errors = Array.isArray(comp.errors) ? comp.errors.map(String) : [];
+            const warnings = Array.isArray(comp.warnings) ? comp.warnings.map(String) : [];
+            const depStatus = String((((diag.deployment_resolution as Record<string, unknown> | undefined)?.deployment as Record<string, unknown> | undefined)?.status ?? ""));
+            const statusBadge = fallback
+              ? "FALLBACK"
+              : depStatus === "invalid"
+                ? "INVALID MODEL"
+                : String(diag.inference_backend_used ?? "") === "heuristic"
+                  ? "HEURISTIC"
+                  : errors.length
+                    ? "INCOMPATIBLE"
+                    : "ACTIVE MODEL";
+            return (
+              <>
+                <strong>{statusBadge}</strong>
+                <small>Deployment: {String(((diag.deployment_resolution as Record<string, unknown> | undefined)?.deployment as Record<string, unknown> | undefined)?.id ?? "-")}</small>
+                <small>Model: {String(((diag.deployment_resolution as Record<string, unknown> | undefined)?.model as Record<string, unknown> | undefined)?.id ?? "-")} / v{String(((diag.deployment_resolution as Record<string, unknown> | undefined)?.model as Record<string, unknown> | undefined)?.version ?? "-")}</small>
+                <small>Backend: {String(diag.inference_backend_used ?? "-")}</small>
+                <small>Inference ms: {String(diag.inference_duration_ms ?? "-")}</small>
+                <small>Fallback used: {String(fallback)}</small>
+                <small>Fallback reason: {String(diag.fallback_reason ?? "-")}</small>
+                <small>Feature schema version/hash: {String(diag.feature_schema_used ?? "-")} / {String(diag.feature_schema_hash ?? "-")}</small>
+                <small>Errors: {errors.length ? errors.join(" | ") : "-"}</small>
+                <small>Warnings: {warnings.length ? warnings.join(" | ") : "-"}</small>
+                <small>Calibration compatibility: {JSON.stringify(((comp.checks as Record<string, unknown> | undefined)?.calibration ?? "-"))}</small>
+              </>
+            );
+          })()}
+        </div>
+      )}
       <div className="inspector-section">
         <span>Stage semantics</span>
         <strong>{semantic.category}</strong>
@@ -537,6 +610,19 @@ function ObjectInspector({
         || (String(rule.contribution ?? "neutral") === "positive" && Boolean(rule.passed))
       ))
   ).slice(0, 3);
+  const footprintGeometry = ((object as Record<string, unknown>).footprint_geometry ?? null) as Record<string, unknown> | null;
+  const surfaceGeometry = ((object as Record<string, unknown>).surface_geometry ?? null) as Record<string, unknown> | null;
+  const sphereConsistency = ((object as Record<string, unknown>).sphere_consistency ?? null) as Record<string, unknown> | null;
+  const damageMetrics = ((object as Record<string, unknown>).damage_metrics ?? null) as Record<string, unknown> | null;
+  const featureReadiness = ((object as Record<string, unknown>).feature_readiness ?? null) as Record<string, unknown> | null;
+  const featureWarnings = Array.isArray((object as Record<string, unknown>).feature_warnings)
+    ? (((object as Record<string, unknown>).feature_warnings as unknown[])
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null))
+    : [];
+  const featureGroupSummaries = Array.isArray((object as Record<string, unknown>).feature_group_summaries)
+    ? (((object as Record<string, unknown>).feature_group_summaries as unknown[])
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null))
+    : [];
   return (
     <div className="inspector-section">
       <span>Selected object</span>
@@ -567,6 +653,28 @@ function ObjectInspector({
       {decisiveRules.map((rule, idx) => (
         <small key={`decisive_rule_${idx}`}>[{String(rule.severity ?? "info")}] {String(rule.label ?? rule.rule_id ?? "-")} {"->"} {String(rule.message ?? "-")}</small>
       ))}
+      <small>Footprint geometry: circ={String(footprintGeometry?.circularity ?? "-")} | radial_cv={String(footprintGeometry?.radial_cv ?? "-")} | ecc={String(footprintGeometry?.eccentricity ?? "-")}</small>
+      <small>Surface geometry: sphere_rmse={String(surfaceGeometry?.sphere_fit_rmse_mm ?? "-")} | sphere_r={String(surfaceGeometry?.sphere_fit_radius_mm ?? "-")} mm | ellipsoid_ar={String(surfaceGeometry?.ellipsoid_aspect_ratio ?? "-")}</small>
+      <small>Sphere consistency: radial_rmse={String(sphereConsistency?.radial_height_rmse_mm ?? "-")} | completeness={String(sphereConsistency?.surface_completeness_ratio ?? "-")} | volume_deficit={String(sphereConsistency?.volume_deficit_ratio ?? "-")}</small>
+      <small>Damage metrics: roughness={String(damageMetrics?.surface_roughness_mean ?? "-")} | flat_ratio={String(damageMetrics?.flat_region_ratio ?? "-")} | discontinuity={String(damageMetrics?.surface_discontinuity_score ?? "-")}</small>
+      {featureReadiness ? (
+        <small>
+          Feature readiness: overall={String(featureReadiness.overall_readiness ?? "-")} | footprint={String(((featureReadiness.group_readiness as Record<string, unknown> | undefined)?.footprint_geometry) ?? "-")} | surface={String(((featureReadiness.group_readiness as Record<string, unknown> | undefined)?.surface_geometry) ?? "-")} | consistency={String(((featureReadiness.group_readiness as Record<string, unknown> | undefined)?.sphere_consistency) ?? "-")} | damage={String(((featureReadiness.group_readiness as Record<string, unknown> | undefined)?.damage_metrics) ?? "-")}
+        </small>
+      ) : null}
+      {featureGroupSummaries.length ? featureGroupSummaries.map((group, idx) => {
+        const evidence = Array.isArray(group.key_evidence_features)
+          ? (group.key_evidence_features[0] as Record<string, unknown> | undefined)
+          : undefined;
+        return (
+          <small key={`feature_group_${idx}`}>
+            Feature group {String(group.group ?? "-")}: {String(group.status ?? "-")} | readiness={String(group.readiness ?? "-")} | severity={String(group.severity_score ?? "-")} | evidence={String(evidence?.feature ?? "-")}={String(evidence?.value ?? "-")}
+          </small>
+        );
+      }) : null}
+      {featureWarnings.length ? (
+        <small>Feature warnings: {featureWarnings.map((warning) => `[${String(warning.severity ?? "info")}] ${String(warning.message ?? "-")}`).join(" | ")}</small>
+      ) : null}
     </div>
   );
 }

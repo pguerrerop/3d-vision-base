@@ -12,6 +12,7 @@ export function canonicalStageId(stageId: string, stageLabel?: string | null): s
   if (raw.includes("extractconnectedcomponents")) return "connected_components";
   if (raw.includes("fitobjectgeometry") || raw.includes("footprint geometry") || raw === "geometry") return "fit_object_geometry";
   if (raw.includes("computeheightmetrics") || raw.includes("height + volume") || raw === "measurement") return "compute_height_metrics";
+  if (raw.includes("computemeasurementdiagnostics") || raw.includes("measurement diagnostics")) return "measurement_diagnostics";
   if (raw.includes("classify_25d")) return "classify_25d";
   if (raw.includes("classifyminingball25d")) return "classify_25d";
   if (raw.includes("generate25doverlays")) return "overlays_25d";
@@ -213,6 +214,20 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
         { id: "profiles", label: "Profiles", rendererType: "image", priority: 3, emptyState: { title: "Select image artifact to inspect object profiles." } },
         { id: "provenance", label: "Provenance", rendererType: "table", priority: 4, emptyState: { title: "No object provenance available yet." } },
         { id: "geometry_debug", label: "Geometry debug", rendererType: "table", priority: 5, emptyState: { title: "No geometry debug artifacts available yet." } },
+        { id: "json", label: "JSON", rendererType: "json", priority: 99 },
+      ],
+    };
+  }
+  if (canonical === "measurement_diagnostics") {
+    return {
+      stageId: canonical,
+      category: "measurement",
+      defaultViewId: "diagnostics",
+      views: [
+        { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 1, emptyState: { title: "No diagnostics artifact available yet." } },
+        { id: "feature_vector", label: "Feature Vector", rendererType: "table", priority: 2, emptyState: { title: "No feature vector available yet." } },
+        { id: "quality_flags", label: "Quality Flags", rendererType: "table", priority: 3, emptyState: { title: "No quality flags available yet." } },
+        { id: "provenance", label: "Provenance", rendererType: "table", priority: 4, emptyState: { title: "No feature provenance available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };
