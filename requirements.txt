@@ -22,6 +22,7 @@ matplotlib
 
 # Optional UI/API
 fastapi
+python-multipart
 uvicorn
 
 # Utilities

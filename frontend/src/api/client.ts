@@ -212,6 +212,65 @@ export interface ReplaySessionState {
   metadata?: Record<string, unknown>;
 }
 
+export type ProcessingJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "partial";
+export type ProcessingJobScopeType = "take_selection" | "dataset" | "dataset_session" | "acquisition_session" | "filter_query";
+export type ProcessingReprocessMode = "full" | "failed_only" | "missing_outputs";
+
+export interface ProcessingJobItem {
+  take_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "skipped" | "cancelled";
+  run_id?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  skipped_reason?: string | null;
+}
+
+export interface ProcessingJobRecord {
+  id: string;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  status: ProcessingJobStatus;
+  scope_type: ProcessingJobScopeType;
+  pipeline_id: string;
+  pipeline_family: string;
+  total_takes: number;
+  completed_takes: number;
+  failed_takes: number;
+  skipped_takes: number;
+  created_by?: string | null;
+  filters_summary?: Record<string, unknown>;
+  options?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
+  error_summary?: Array<Record<string, unknown>>;
+  take_items?: ProcessingJobItem[];
+  cancelled_at?: string | null;
+}
+
+export interface ProcessingJobCreateRequest {
+  take_ids?: string[];
+  dataset_id?: string | null;
+  dataset_session_id?: string | null;
+  acquisition_session_id?: string | null;
+  filters_snapshot?: Record<string, unknown> | null;
+  pipeline_id: string;
+  reprocess_mode?: ProcessingReprocessMode;
+  skip_completed?: boolean;
+  force?: boolean;
+  selected_stage?: string | null;
+  classifier_rules_path?: string | null;
+  created_by?: string | null;
+  options?: Record<string, unknown>;
+  take_selection?: {
+    take_ids?: string[];
+    dataset_id?: string | null;
+    session_id?: string | null;
+    filters?: Record<string, unknown> | null;
+  } | null;
+  scope_type?: ProcessingJobScopeType | null;
+}
+
 export interface RuntimeRoutingState {
   live_routing: Record<string, unknown> | null;
   persistent_default: Record<string, unknown> | null;
@@ -422,6 +481,24 @@ export interface TakeSummaryPage {
     processing_incomplete?: number;
     no_objects_detected?: number;
   };
+  profile?: {
+    enabled: boolean;
+    limit: number;
+    offset: number;
+    counters: {
+      scanned_take_ids: number;
+      candidate_count: number;
+      page_item_count: number;
+      total_count: number;
+    };
+    phase_ms: {
+      list_take_ids: number;
+      scan_and_filter: number;
+      sort_candidates: number;
+      hydrate_page_items: number;
+      total: number;
+    };
+  } | null;
 }
 
 export interface TakeBulkFilters {
@@ -482,7 +559,129 @@ export interface DatasetMlSet {
   updated_at?: string | null;
   notes?: string | null;
   member_count?: number;
+  membership_count?: number;
   membership_mode?: string;
+  physical_object_count?: number;
+  default_trainable_count?: number;
+  review_required_count?: number;
+  split_status?: string;
+  source_type?: string | null;
+  source_filename?: string | null;
+  source_sha256?: string | null;
+  normalization_version?: string | null;
+}
+
+export interface MaterializeMlIngestionResponse {
+  ok: boolean;
+  dataset_id: string;
+  ml_set_id: string;
+  ml_set_name: string;
+  created_or_updated: string;
+  ml_set_path: string;
+  memberships_path: string;
+  membership_count: number;
+  physical_object_count: number;
+  default_trainable_rows: number;
+  default_trainable_objects: number;
+  review_required_rows: number;
+  review_required_objects: number;
+  split_status: string;
+  warnings: string[];
+  errors: string[];
+  output_dir: string;
+  validation_report: Record<string, unknown>;
+}
+
+export interface MLSetSummaryResponse {
+  ml_set: DatasetMlSet & Record<string, unknown>;
+  dataset: DatasetSummary;
+  identity: {
+    take_count: number;
+    physical_object_count: number;
+    kept_in_ml_set_count?: number;
+    default_trainable_count?: number;
+    trainable_object_count: number;
+    review_required_count: number;
+    review_required_object_count?: number;
+    excluded_count: number;
+    class_count: number;
+    split_strategy: string;
+    label_schema_version: string;
+    leakage_safe: boolean;
+    validated_count: number;
+    unvalidated_count: number;
+    ingestion_run?: string;
+  };
+  readiness: {
+    labeled_coverage_pct: number;
+    split_completeness_pct: number;
+    leakage_risk: string;
+    class_imbalance_ratio: number;
+    uncertain_label_count: number;
+    take_count: number;
+    physical_object_count: number;
+    kept_in_ml_set_count?: number;
+    default_trainable_count?: number;
+    trainable_object_count: number;
+    review_required_count: number;
+    review_required_object_count?: number;
+    excluded_count: number;
+    empty_scene_count: number;
+    calibration_reference_count: number;
+    processing_completeness: string;
+    feature_coverage: string;
+    split_health: string;
+    split_status: string;
+  };
+  raw_label_distribution: Record<string, number>;
+  class_distribution: Record<string, number>;
+  superclass_distribution: Record<string, number>;
+  split_by_class: Record<string, Record<string, number>>;
+  representative_samples: Record<string, Array<{ take_id: string; thumbnail_path?: string | null; validation_status?: string; expected_class?: string; session_id?: string }>>;
+  split_summary: {
+    split_counts: Record<string, number>;
+    session_composition_by_split: Record<string, Record<string, number>>;
+    leaked_object_ids: string[];
+    warnings: Array<Record<string, unknown>>;
+  };
+  source_session_coverage: Array<{ session_id: string; included_takes: number; class_composition: Record<string, number>; uncertain_labels: number }>;
+  membership_definition: {
+    membership_mode: string;
+    filter_snapshot: Record<string, unknown>;
+    exclude_take_ids: string[];
+    semantics: Record<string, unknown>;
+  };
+  warnings: Array<{ severity: string; code: string; explanation: string; affected_count: number; affected_ids?: string[] }>;
+  derived_tasks: Array<{ task_id: string; included_classes: string[]; excluded_classes: string[]; effective_sample_count: number; uncertainty_policy: string; empty_scene_policy: string }>;
+  training_compatibility: {
+    feature_families: Record<string, string>;
+    classifier_ready: boolean;
+    processing_complete_count: number;
+  };
+  exports: Record<string, string>;
+}
+
+export interface PhysicalObjectSummary {
+  physical_object_id: string;
+  dataset_id: string;
+  source_session_ids: string[];
+  raw_operator_label?: string | null;
+  normalized_class?: string | null;
+  superclass?: string | null;
+  d1_mm?: number | string | null;
+  d2_mm?: number | string | null;
+  d3_mm?: number | string | null;
+  diameter_mean_mm?: number | null;
+  diameter_range_mm?: number | null;
+  annotation_confidence?: string | null;
+  needs_review?: boolean;
+  tags?: string[];
+  notes?: string | null;
+  source_type?: string | null;
+  source_row_index?: number | null;
+  observation_take_ids?: string[];
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface DatasetSessionDetailSummary {
@@ -626,6 +825,33 @@ export interface ProcessingResult {
     source_candidate_id?: string;
     decision_reasons?: string[];
     geometry?: Record<string, unknown>;
+    label?: string | null;
+    display_label?: string | null;
+    superclass?: string | null;
+    class_group?: string | null;
+    footprint_geometry?: Record<string, unknown> | null;
+    surface_geometry?: Record<string, unknown> | null;
+    sphere_consistency?: Record<string, unknown> | null;
+    damage_metrics?: Record<string, unknown> | null;
+    feature_group_summaries?: Array<{
+      group: string;
+      status: string;
+      severity_score: number;
+      readiness: string;
+      top_warnings?: Array<Record<string, unknown>>;
+      key_evidence_features?: Array<Record<string, unknown>>;
+    }>;
+    feature_warnings?: Array<{
+      feature: string;
+      severity: string;
+      message: string;
+      group: string;
+      ux_visibility?: string[];
+    }>;
+    feature_readiness?: {
+      overall_readiness?: string;
+      group_readiness?: Record<string, string>;
+    } | null;
   }>;
   object_candidates?: Array<{
     id: string;
@@ -667,6 +893,12 @@ export interface ProcessingResult {
     debug_filtered_foreground?: string | null;
     debug_rejected_points?: string | null;
     debug_clusters_filtered?: string | null;
+    measurement_diagnostics?: string | null;
+    feature_vector?: string | null;
+    feature_provenance?: string | null;
+    quality_flags?: string | null;
+    feature_runtime_summary?: string | null;
+    feature_studio_summary?: string | null;
   };
   timing_ms: {
     load: number;
@@ -698,6 +930,7 @@ export interface ProcessingResult {
   throughput?: Record<string, unknown> | null;
   synchronization?: Record<string, unknown> | null;
   acquisition_timestamps?: Record<string, string> | null;
+  feature_metadata?: Record<string, unknown> | null;
 }
 
 export interface PocRunSummary {
@@ -855,6 +1088,7 @@ export interface FeatureAnalyticsObject {
   object_id: string;
   dataset_id?: string | null;
   session_id?: string | null;
+  physical_object_id?: string | null;
   pipeline_id?: string | null;
   run_id?: string | null;
   stage_id?: string | null;
@@ -1351,6 +1585,18 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function postForm<T>(path: string, body: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    body,
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${message}`);
+  }
+  return response.json() as Promise<T>;
+}
+
 async function put<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: "PUT",
@@ -1537,6 +1783,7 @@ export const api = {
     reference_type?: string;
     is_reference?: boolean;
     is_golden_sample?: boolean;
+    profile?: boolean;
   }) => {
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
@@ -1550,6 +1797,19 @@ export const api = {
   createDataset: (payload: { name: string; notes?: string | null }) =>
     post<DatasetSummary>("/api/datasets", payload),
   datasetSessions: (datasetId: string) => request<DatasetSessionSummary[]>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions`),
+  physicalObjects: (params: { dataset_id: string; normalized_class?: string; superclass?: string; session_id?: string; needs_review?: boolean }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<PhysicalObjectSummary[]>(`/api/physical-objects?${qs.toString()}`);
+  },
+  physicalObject: (physicalObjectId: string, datasetId: string) =>
+    request<PhysicalObjectSummary>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}?dataset_id=${encodeURIComponent(datasetId)}`),
+  physicalObjectTakes: (physicalObjectId: string, datasetId: string) =>
+    request<{ takes: Array<{ session_id: string; take_id: string; metadata: Record<string, unknown> }> }>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/takes?dataset_id=${encodeURIComponent(datasetId)}`),
+  physicalObjectRepeatability: (physicalObjectId: string, datasetId: string) =>
+    request<Record<string, unknown>>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/repeatability?dataset_id=${encodeURIComponent(datasetId)}`),
   featureAnalyticsFeatures: (params: {
     datasets?: string;
     sessions?: string;
@@ -1571,7 +1831,7 @@ export const api = {
   },
   featureAnalyticsDistributions: (params: {
     feature_key: string;
-    group_by?: "superclass" | "label";
+    group_by?: "superclass" | "label" | "physical_object_id";
     bins?: number;
     mode?: "count" | "density";
     datasets?: string;
@@ -1701,6 +1961,11 @@ export const api = {
   getMlIngestionRun: (runId: string) => request<IngestionRun>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}`),
   ingestMlOperatorTable: (runId: string, payload: { content: string; input_format: string }) =>
     post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/table`, payload),
+  ingestMlOperatorFile: (runId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return postForm<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/table`, form);
+  },
   reconcileMlIngestionRun: (runId: string) =>
     post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/reconcile`, {}),
   updateMlIngestionPolicy: (runId: string, policy: Record<string, unknown>) =>
@@ -1708,7 +1973,7 @@ export const api = {
   generateMlIngestionManifest: (runId: string) =>
     post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/manifest`, {}),
   materializeMlIngestionRun: (runId: string, mlSetId: string) =>
-    post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/materialize`, { ml_set_id: mlSetId }),
+    post<MaterializeMlIngestionResponse>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/materialize`, { ml_set_id: mlSetId }),
   applyMlIngestionMetadata: (runId: string) =>
     post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/apply-metadata`, {}),
   take: (takeId: string) => request<TakeDetail>(`/api/takes/${encodeURIComponent(takeId)}`),
@@ -1736,6 +2001,16 @@ export const api = {
     `/api/datasets/${encodeURIComponent(datasetId)}/ml-sets/${encodeURIComponent(mlSetId)}/members`,
     payload
   ),
+  mlSetSummary: (mlSetId: string, datasetId?: string) =>
+    request<MLSetSummaryResponse>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/summary${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  mlSetClassDistribution: (mlSetId: string, datasetId?: string) =>
+    request<Record<string, unknown>>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/class-distribution${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  mlSetSplitSummary: (mlSetId: string, datasetId?: string) =>
+    request<Record<string, unknown>>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/split-summary${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  mlSetWarnings: (mlSetId: string, datasetId?: string) =>
+    request<{ warnings: Array<Record<string, unknown>> }>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/warnings${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  mlSetRepresentativeSamples: (mlSetId: string, datasetId?: string) =>
+    request<{ representative_samples: Record<string, unknown> }>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/representative-samples${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
   removeTakeFromDataset: (takeId: string) => post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/remove-from-dataset`, {}),
   archiveTake: (takeId: string, reason?: string | null) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/archive`, { reason: reason ?? null }),
@@ -1750,6 +2025,12 @@ export const api = {
     ),
   processTake: (takeId: string, payload: { pipeline_id: string; run_until_stage?: string | null; reprocess?: boolean; stage_params?: Record<string, unknown> | null }) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/process`, payload),
+  createProcessingJob: (payload: ProcessingJobCreateRequest) =>
+    post<{ job: ProcessingJobRecord }>("/api/processing-jobs", payload),
+  processingJobs: () => request<{ jobs: ProcessingJobRecord[]; counts: Record<string, number> }>("/api/processing-jobs"),
+  processingJob: (jobId: string) => request<{ job: ProcessingJobRecord }>(`/api/processing-jobs/${encodeURIComponent(jobId)}`),
+  cancelProcessingJob: (jobId: string) =>
+    post<{ ok: boolean; job_id: string; status: ProcessingJobStatus }>(`/api/processing-jobs/${encodeURIComponent(jobId)}/cancel`, {}),
   pipelineDefaults25d: () => request<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d"),
   savePipelineDefaults25d: (defaults: Record<string, unknown>) =>
     put<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d", defaults),

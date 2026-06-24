@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, fileUrl, type DatasetMlSet, type DatasetSessionSummary, type DatasetSummary, type TakeDetail, type TakeSummary } from "../api/client";
+import { api, fileUrl, type DatasetMlSet, type DatasetSessionDetailSummary, type DatasetSessionSummary, type DatasetSummary, type MaterializeMlIngestionResponse, type PhysicalObjectSummary, type TakeDetail, type TakeSummary } from "../api/client";
 import DatasetSessionDrawer from "../components/datasets/DatasetSessionDrawer";
+import MLSetDetailDrawer from "../components/datasets/MLSetDetailDrawer";
+import PhysicalObjectDetailDrawer from "../components/datasets/PhysicalObjectDetailDrawer";
 import MLSetIngestionWizard from "../components/ingestion/MLSetIngestionWizard";
 
 type SplitBucket = "training" | "validation" | "test" | "benchmark" | "production-shadow" | "cross-site";
-type DatasetTab = "overview" | "takes" | "objects" | "labels" | "ml_sets" | "splits";
+type DatasetTab = "overview" | "takes" | "physical_objects" | "objects" | "labels" | "ml_sets" | "splits";
 
 type ObjectAnnotation = {
   id?: string;
@@ -68,15 +70,36 @@ type PagedSummaryCounts = {
   no_objects_detected: number;
 };
 type BulkModalKind = "move_dataset" | "move_session" | "ml_set" | "split" | "tags" | "validation" | "expected_class";
+type DatasetsPageProfilerSnapshot = {
+  captured_at: string;
+  append: boolean;
+  frontend_request_ms: number;
+  frontend_commit_ms: number;
+  page_item_count: number;
+  total_visible_rows: number;
+  backend_profile: NonNullable<Awaited<ReturnType<typeof api.pagedTakes>>["profile"]> | null;
+};
 
 function countFromValidation(summary: PagedSummaryCounts | null, key: string, fallback = 0): number {
   return Number(summary?.validation?.[key] ?? fallback);
+}
+
+function readDatasetsProfilerEnabled() {
+  if (typeof window === "undefined") return false;
+  const params = new URLSearchParams(window.location.search);
+  return params.get("profile") === "datasets" || params.get("datasets_profile") === "1";
+}
+
+function formatProfilerMs(value: number | null | undefined) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "-";
+  return `${value.toFixed(1)} ms`;
 }
 
 export default function DatasetsPage() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [sessions, setSessions] = useState<DatasetSessionSummary[]>([]);
   const [mlSets, setMlSets] = useState<DatasetMlSet[]>([]);
+  const [physicalObjects, setPhysicalObjects] = useState<PhysicalObjectSummary[]>([]);
   const [modalDatasetSessions, setModalDatasetSessions] = useState<DatasetSessionSummary[]>([]);
   const [pagedTakes, setPagedTakes] = useState<TakeSummary[]>([]);
   const [offset, setOffset] = useState(0);
@@ -84,8 +107,11 @@ export default function DatasetsPage() {
   const [selectedDataset, setSelectedDataset] = useState("");
   const [selectedSession, setSelectedSession] = useState("");
   const [sessionDrawerId, setSessionDrawerId] = useState("");
+  const [selectedSessionDetailSummary, setSelectedSessionDetailSummary] = useState<DatasetSessionDetailSummary | null>(null);
   const [selectedTakeId, setSelectedTakeId] = useState("");
   const [selectedObjectId, setSelectedObjectId] = useState("");
+  const [selectedPhysicalObjectId, setSelectedPhysicalObjectId] = useState("");
+  const [selectedMlSetId, setSelectedMlSetId] = useState("");
   const [selectedSplit, setSelectedSplit] = useState<"all" | SplitBucket>("all");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
@@ -108,6 +134,7 @@ export default function DatasetsPage() {
   const [serverTotalCount, setServerTotalCount] = useState<number | null>(null);
   const [pagedSummaryCounts, setPagedSummaryCounts] = useState<PagedSummaryCounts | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [savedCollections, setSavedCollections] = useState<SavedCollection[]>([]);
   const [newCollectionName, setNewCollectionName] = useState("");
   const [showSessionTree, setShowSessionTree] = useState(true);
@@ -133,6 +160,8 @@ export default function DatasetsPage() {
   const [modalAffectedCount, setModalAffectedCount] = useState<number | null>(null);
   const [modalCounting, setModalCounting] = useState(false);
   const [ingestionWizardOpen, setIngestionWizardOpen] = useState(false);
+  const [datasetsProfilerEnabled, setDatasetsProfilerEnabled] = useState(readDatasetsProfilerEnabled);
+  const [datasetsProfiler, setDatasetsProfiler] = useState<DatasetsPageProfilerSnapshot | null>(null);
 
   useEffect(() => {
     void api.datasets().then((items) => {
@@ -159,13 +188,40 @@ export default function DatasetsPage() {
   useEffect(() => {
     if (!selectedDataset) {
       setSessions([]);
+      setSelectedSession("");
+      setSessionDrawerId("");
+      setSelectedSessionDetailSummary(null);
       return;
     }
     void api.datasetSessions(selectedDataset).then((items) => {
       setSessions(items);
-      if (selectedSession && !items.find((s) => s.id === selectedSession)) setSelectedSession("");
+      if (selectedSession && !items.find((s) => s.id === selectedSession)) {
+        setSelectedSession("");
+        setSessionDrawerId("");
+        setSelectedSessionDetailSummary(null);
+      }
     }).catch((err: unknown) => setError(err instanceof Error ? err.message : "Failed to load sessions"));
   }, [selectedDataset, selectedSession]);
+
+  useEffect(() => {
+    if (!selectedSession) {
+      setSelectedSessionDetailSummary(null);
+      return;
+    }
+    const sessionId = selectedSession;
+    let cancelled = false;
+    void api.datasetSessionSummary(sessionId, selectedDataset || undefined)
+      .then((payload) => {
+        if (cancelled) return;
+        setSelectedSessionDetailSummary(payload.summary ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedSessionDetailSummary(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSession, selectedDataset]);
 
   useEffect(() => {
     if (!selectedDataset) {
@@ -177,12 +233,44 @@ export default function DatasetsPage() {
       .catch(() => setMlSets([]));
   }, [selectedDataset]);
 
+  async function refreshMlSetsForDataset(datasetId: string) {
+    const items = await api.datasetMlSets(datasetId);
+    setMlSets(items);
+    return items;
+  }
+
+  async function handleWizardMaterialized(result: MaterializeMlIngestionResponse) {
+    try {
+      setError(null);
+      setSuccessMessage(`Created ML set ${result.ml_set_id} with ${result.membership_count} memberships / ${result.physical_object_count} physical objects.`);
+      setActiveTab("ml_sets");
+      const items = await refreshMlSetsForDataset(result.dataset_id);
+      const created = items.find((item) => item.id === result.ml_set_id);
+      if (created) {
+        setSelectedMlSetId(created.id);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to refresh ML sets after materialization");
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedDataset) {
+      setPhysicalObjects([]);
+      return;
+    }
+    void api.physicalObjects({ dataset_id: selectedDataset })
+      .then((items) => setPhysicalObjects(items))
+      .catch(() => setPhysicalObjects([]));
+  }, [selectedDataset]);
+
   useEffect(() => {
     setSelectedTakeIds(new Set());
     setExcludedTakeIds(new Set());
     setSelectionScope("visible");
     setSelectedTakeId("");
     setSelectedObjectId("");
+    setSelectedPhysicalObjectId("");
     setDetail(null);
   }, [selectedDataset, selectedSession, validationFilter, search, tagFilter, fromDate, toDate, datePreset, selectedSplit, expectedClassFilter, calibrationOnly, governanceFlags]);
 
@@ -224,6 +312,8 @@ export default function DatasetsPage() {
   const selectedDatasetSummary = useMemo(() => datasets.find((dataset) => dataset.id === selectedDataset) ?? null, [datasets, selectedDataset]);
   const selectedSessionSummary = useMemo(() => sessions.find((session) => session.id === selectedSession) ?? null, [sessions, selectedSession]);
   const drawerSessionSummary = useMemo(() => sessions.find((session) => session.id === sessionDrawerId) ?? null, [sessions, sessionDrawerId]);
+  const selectedPhysicalObjectSummary = useMemo(() => physicalObjects.find((item) => item.physical_object_id === selectedPhysicalObjectId) ?? null, [physicalObjects, selectedPhysicalObjectId]);
+  const selectedMlSetSummary = useMemo(() => mlSets.find((item) => item.id === selectedMlSetId) ?? null, [mlSets, selectedMlSetId]);
   const modalSessions = useMemo(
     () => (modalDatasetId === selectedDataset ? sessions : modalDatasetSessions),
     [modalDatasetId, selectedDataset, sessions, modalDatasetSessions]
@@ -276,6 +366,16 @@ export default function DatasetsPage() {
     hasClientOnlyFilters
   );
   const selectedCount = selectionScope === "visible" ? selectedTakeIds.size : Math.max(0, filteredCount - excludedTakeIds.size);
+  const selectedSessionTakeCount = selectedSessionDetailSummary?.total_takes ?? selectedSessionSummary?.take_count ?? 0;
+  const selectedSessionReviewedPct = selectedSessionTakeCount ? Math.round(((selectedSessionDetailSummary?.reviewed ?? 0) / selectedSessionTakeCount) * 100) : 0;
+  const selectedSessionValidatedPct = selectedSessionTakeCount
+    ? Math.round((Math.max(0, selectedSessionTakeCount - (selectedSessionDetailSummary?.unreviewed ?? 0)) / selectedSessionTakeCount) * 100)
+    : 0;
+  const selectedSessionCalibrationStatus = selectedSessionDetailSummary?.calibration_assignment && selectedSessionDetailSummary.calibration_assignment !== "-"
+    ? "linked"
+    : selectedSessionSummary?.calibration_id
+      ? "linked"
+      : "unlinked";
 
   useEffect(() => {
     if (selectedTakeId && !takes.find((t) => t.take_id === selectedTakeId)) {
@@ -284,6 +384,12 @@ export default function DatasetsPage() {
       setSelectedObjectId("");
     }
   }, [selectedTakeId, takes]);
+
+  useEffect(() => {
+    if (sessionDrawerId && sessionDrawerId !== selectedSession) {
+      setSessionDrawerId("");
+    }
+  }, [selectedSession, sessionDrawerId]);
 
   useEffect(() => {
     const visible = new Set(takes.map((take) => take.take_id));
@@ -402,6 +508,15 @@ export default function DatasetsPage() {
     []
   );
 
+  function selectSession(sessionId: string, options?: { openDrawer?: boolean }) {
+    setSelectedSession(sessionId);
+    setSessionDrawerId(options?.openDrawer ? sessionId : "");
+  }
+
+  function openSessionDrawer(sessionId: string) {
+    selectSession(sessionId, { openDrawer: true });
+  }
+
   useEffect(() => {
     if (!KEYBOARD_CURATION_ENABLED || activeTab !== "takes") return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -432,6 +547,7 @@ export default function DatasetsPage() {
       limit: TAKES_PAGE_LIMIT,
       offset: nextOffset,
       show_archived: false,
+      profile: datasetsProfilerEnabled,
     };
     if (DEBUG_DATASETS_TAKES) {
       console.debug("[datasets:takes] request", {
@@ -447,7 +563,9 @@ export default function DatasetsPage() {
       });
     }
     try {
+      const requestStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       const page = await api.pagedTakes(params);
+      const responseReceivedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (DEBUG_DATASETS_TAKES) {
         console.debug("[datasets:takes] response", {
           count: page.items.length,
@@ -455,7 +573,8 @@ export default function DatasetsPage() {
           next_offset: page.next_offset,
         });
       }
-      setPagedTakes((prev) => (append ? [...prev, ...page.items] : page.items));
+      const nextItems = append ? [...pagedTakes, ...page.items] : page.items;
+      setPagedTakes(nextItems);
       setOffset(page.next_offset ?? (page.offset + page.items.length));
       setHasMore(Boolean(page.has_more));
       setServerFilteredCount(page.filtered_count ?? page.total_count ?? null);
@@ -469,6 +588,24 @@ export default function DatasetsPage() {
         processing_incomplete: Number(page.summary_counts?.processing_incomplete ?? 0),
         no_objects_detected: Number(page.summary_counts?.no_objects_detected ?? 0),
       });
+      if (datasetsProfilerEnabled) {
+        requestAnimationFrame(() => {
+          const committedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+          const snapshot = {
+            captured_at: new Date().toISOString(),
+            append,
+            frontend_request_ms: responseReceivedAt - requestStartedAt,
+            frontend_commit_ms: committedAt - requestStartedAt,
+            page_item_count: page.items.length,
+            total_visible_rows: nextItems.length,
+            backend_profile: page.profile ?? null,
+          };
+          setDatasetsProfiler(snapshot);
+          console.debug("[datasets:profile]", snapshot);
+        });
+      } else {
+        setDatasetsProfiler(null);
+      }
     } finally {
       setIsInitialLoading(false);
       setIsLoadingMore(false);
@@ -484,7 +621,7 @@ export default function DatasetsPage() {
       setIsInitialLoading(false);
       setIsLoadingMore(false);
     });
-  }, [selectedDataset, selectedSession, validationFilter, search, tagFilter, fromDate, toDate, selectedSplit, expectedClassFilter, calibrationOnly, governanceFlags, selectedDatasetSummary?.take_count]);
+  }, [selectedDataset, selectedSession, validationFilter, search, tagFilter, fromDate, toDate, selectedSplit, expectedClassFilter, calibrationOnly, governanceFlags, selectedDatasetSummary?.take_count, datasetsProfilerEnabled]);
 
   async function refreshTakes() {
     await loadTakePage(0, false);
@@ -730,7 +867,7 @@ export default function DatasetsPage() {
     if (bulkModal === "expected_class") await assignBulkClass(modalExpectedClassValue);
     clearSelection();
     setSelectionScope("visible");
-    setSelectedSession("");
+    selectSession("");
     const refreshedSessions = selectedDataset ? await api.datasetSessions(selectedDataset) : [];
     setSessions(refreshedSessions);
     await refreshTakes();
@@ -739,7 +876,7 @@ export default function DatasetsPage() {
 
   function applyCollection(collection: SavedCollection) {
     setSelectedDataset(collection.filters.dataset);
-    setSelectedSession(collection.filters.session);
+    selectSession(collection.filters.session);
     setValidationFilter(collection.filters.validation);
     setSelectedSplit(collection.filters.split);
     setSearch(collection.filters.search);
@@ -914,8 +1051,17 @@ export default function DatasetsPage() {
   return (
     <main className="datasets-page datasets-command-center">
       <section className="datasets-headline">
-        <h2>Datasets</h2>
-        <p>Organize captures, labels, object reviews, ML sets, and splits.</p>
+        <div>
+          <h2>Datasets</h2>
+          <p>Organize captures, labels, object reviews, ML sets, and splits.</p>
+        </div>
+        <button
+          type="button"
+          className={`datasets-profiler-toggle ${datasetsProfilerEnabled ? "active" : ""}`}
+          onClick={() => setDatasetsProfilerEnabled((prev) => !prev)}
+        >
+          {datasetsProfilerEnabled ? "Profiler on" : "Profiler off"}
+        </button>
       </section>
 
       <section className="datasets-grid">
@@ -933,7 +1079,15 @@ export default function DatasetsPage() {
             <div className="datasets-hierarchy-block">
             <div className="datasets-hierarchy-header">
               <strong>{selectedDatasetSummary?.name ?? "No dataset selected"}</strong>
-              <button type="button" onClick={() => setShowSessionTree((prev) => !prev)}>{showSessionTree ? "Hide" : "Show"}</button>
+              <button
+                type="button"
+                className="datasets-hierarchy-toggle"
+                aria-label={showSessionTree ? "Hide sessions" : "Show sessions"}
+                title={showSessionTree ? "Hide sessions" : "Show sessions"}
+                onClick={() => setShowSessionTree((prev) => !prev)}
+              >
+                {showSessionTree ? "▾" : "▸"}
+              </button>
             </div>
             <small>{sessions.length} sessions · validation {filteredCount ? Math.round((validatedCount / filteredCount) * 100) : 0}%</small>
             {showSessionTree && (
@@ -942,18 +1096,36 @@ export default function DatasetsPage() {
                   const sessionTakes = takes.filter((take) => (take.experiment_session_id ?? "") === session.id);
                   const sessionValid = sessionTakes.filter((take) => take.validation_status === "valid").length;
                   return (
-                    <button
+                    <div
                       key={session.id}
-                      type="button"
                       className={`datasets-session-node ${selectedSession === session.id ? "active" : ""}`}
-                      onClick={() => {
-                        setSelectedSession(session.id);
-                        setSessionDrawerId(session.id);
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => selectSession(session.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          selectSession(session.id);
+                        }
                       }}
                     >
-                      <span>{session.name}</span>
-                      <small>{sessionTakes.length} takes · {sessionTakes.length ? Math.round((sessionValid / sessionTakes.length) * 100) : 0}% valid</small>
-                    </button>
+                      <div className="datasets-session-node-main">
+                        <span>{session.name}</span>
+                        <small>{sessionTakes.length} takes · {sessionTakes.length ? Math.round((sessionValid / sessionTakes.length) * 100) : 0}% valid</small>
+                      </div>
+                      <button
+                        type="button"
+                        className="datasets-session-node-menu"
+                        aria-label="Edit session"
+                        title="Edit session"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          openSessionDrawer(session.id);
+                        }}
+                      >
+                        ⋯
+                      </button>
+                    </div>
                   );
                 })}
               </div>
@@ -964,14 +1136,14 @@ export default function DatasetsPage() {
             <summary>Filters</summary>
           <label className="field-label">
             Dataset
-            <select value={selectedDataset} onChange={(e) => { setSelectedDataset(e.target.value); setSelectedSession(""); }}>
+            <select value={selectedDataset} onChange={(e) => { setSelectedDataset(e.target.value); selectSession(""); }}>
               <option value="">All datasets</option>
               {datasets.map((dataset) => <option key={dataset.id} value={dataset.id}>{dataset.name}</option>)}
             </select>
           </label>
           <label className="field-label">
             Session
-            <select value={selectedSession} onChange={(e) => setSelectedSession(e.target.value)}>
+            <select value={selectedSession} onChange={(e) => selectSession(e.target.value)}>
               <option value="">All sessions</option>
               {sessions.map((session) => <option key={session.id} value={session.id}>{session.name}</option>)}
             </select>
@@ -1087,6 +1259,7 @@ export default function DatasetsPage() {
             {[
               ["overview", "Overview"],
               ["takes", "Takes"],
+              ["physical_objects", "Physical Objects"],
               ["objects", "Objects"],
               ["labels", "Labels"],
               ["ml_sets", "ML Sets"],
@@ -1177,6 +1350,22 @@ export default function DatasetsPage() {
                   </button>
                 ))}
               </div>
+              {selectedSessionSummary && (
+                <section className="concept-panel compact datasets-session-context">
+                  <div className="datasets-session-context-head">
+                    <div className="datasets-session-context-copy">
+                      <h3>Session: {selectedSessionSummary.name}</h3>
+                      <small>
+                        {selectedSessionTakeCount} takes · reviewed {selectedSessionReviewedPct}% · validation {selectedSessionValidatedPct}% · calibration {selectedSessionCalibrationStatus}
+                        {selectedSessionSummary.session_type ? ` · type ${selectedSessionSummary.session_type}` : ""}
+                      </small>
+                    </div>
+                    <button type="button" className="datasets-session-context-edit" onClick={() => openSessionDrawer(selectedSessionSummary.id)}>
+                      Edit session
+                    </button>
+                  </div>
+                </section>
+              )}
               <div className="datasets-toolbar" role="toolbar" aria-label="Takes selection and bulk actions">
                 <span className="datasets-toolbar-status">
                   {selectionScope === "filtered"
@@ -1226,6 +1415,52 @@ export default function DatasetsPage() {
                   </div>
                 </details>
               </div>
+              {datasetsProfilerEnabled && (
+                <div className="datasets-profiler-panel concept-panel compact">
+                  <div className="datasets-profiler-header">
+                    <strong>Datasets profiler</strong>
+                    <small>
+                      {datasetsProfiler?.captured_at
+                        ? `last capture ${new Date(datasetsProfiler.captured_at).toLocaleTimeString()}`
+                        : "waiting for next paged request"}
+                    </small>
+                  </div>
+                  <div className="datasets-profiler-grid">
+                    <div>
+                      <span>Frontend request</span>
+                      <strong>{formatProfilerMs(datasetsProfiler?.frontend_request_ms)}</strong>
+                    </div>
+                    <div>
+                      <span>Frontend commit</span>
+                      <strong>{formatProfilerMs(datasetsProfiler?.frontend_commit_ms)}</strong>
+                    </div>
+                    <div>
+                      <span>Backend total</span>
+                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.total)}</strong>
+                    </div>
+                    <div>
+                      <span>Scan + filter</span>
+                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.scan_and_filter)}</strong>
+                    </div>
+                    <div>
+                      <span>Hydrate rows</span>
+                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.hydrate_page_items)}</strong>
+                    </div>
+                    <div>
+                      <span>Scanned takes</span>
+                      <strong>{datasetsProfiler?.backend_profile?.counters.scanned_take_ids ?? "-"}</strong>
+                    </div>
+                    <div>
+                      <span>Filtered matches</span>
+                      <strong>{datasetsProfiler?.backend_profile?.counters.candidate_count ?? "-"}</strong>
+                    </div>
+                    <div>
+                      <span>Page rows</span>
+                      <strong>{datasetsProfiler?.page_item_count ?? "-"}</strong>
+                    </div>
+                  </div>
+                </div>
+              )}
               {compareOpen && (
                 <div className="concept-panel compact datasets-compare-panel">
                   <h3>Compare Selected</h3>
@@ -1350,8 +1585,7 @@ export default function DatasetsPage() {
                                 onClick={(event) => {
                                   event.preventDefault();
                                   event.stopPropagation();
-                                  setSelectedSession(take.experiment_session_id || "");
-                                  setSessionDrawerId(take.experiment_session_id || "");
+                                  selectSession(take.experiment_session_id || "");
                                 }}
                               >
                                 {take.experiment_session_name || take.experiment_session_id}
@@ -1378,6 +1612,44 @@ export default function DatasetsPage() {
                 <button type="button" disabled={!hasMore || isInitialLoading || isLoadingMore} onClick={() => void loadMoreTakes()}>
                   {isLoadingMore ? "Loading more..." : hasMore ? "Load more" : "All filtered takes loaded"}
                 </button>
+              </div>
+            </section>
+          )}
+
+          {activeTab === "physical_objects" && (
+            <section className="datasets-tab-panel">
+              <div className="concept-panel compact">
+                <h3>Physical Objects</h3>
+                <small>Real-world semantic entities observed across one or more takes.</small>
+                <div className="datasets-table-wrap">
+                  <table className="datasets-table compact-table">
+                    <thead>
+                      <tr>
+                        <th>Object</th>
+                        <th>Class</th>
+                        <th>Takes</th>
+                        <th>Sessions</th>
+                        <th>Dimensions</th>
+                        <th>Confidence</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {physicalObjects.map((item) => (
+                        <tr key={item.physical_object_id} className={selectedPhysicalObjectId === item.physical_object_id ? "active" : ""}>
+                          <td><button type="button" className="link-button" onClick={() => setSelectedPhysicalObjectId(item.physical_object_id)}>{item.physical_object_id}</button></td>
+                          <td>{item.normalized_class || "-"}</td>
+                          <td>{item.observation_take_ids?.length ?? 0}</td>
+                          <td>{item.source_session_ids?.length ?? 0}</td>
+                          <td>{[item.d1_mm, item.d2_mm, item.d3_mm].filter(Boolean).join(" / ") || "-"}</td>
+                          <td>{item.annotation_confidence || "-"}</td>
+                        </tr>
+                      ))}
+                      {!physicalObjects.length && (
+                        <tr><td colSpan={6}>No physical objects registered yet.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </section>
           )}
@@ -1450,7 +1722,7 @@ export default function DatasetsPage() {
                 <small>inclusion filters + validation requirements + allowed labels: placeholder</small>
                 <small>balancing constraints + split ownership + classifier compatibility: placeholder</small>
                 {ingestionWizardOpen && (
-                  <MLSetIngestionWizard dataset={selectedDatasetSummary} sessions={sessions} onClose={() => setIngestionWizardOpen(false)} />
+                  <MLSetIngestionWizard dataset={selectedDatasetSummary} sessions={sessions} onClose={() => setIngestionWizardOpen(false)} onMaterialized={(result) => { void handleWizardMaterialized(result); }} />
                 )}
                 <div className="datasets-table-wrap">
                   <table className="datasets-table">
@@ -1466,13 +1738,13 @@ export default function DatasetsPage() {
                     </thead>
                     <tbody>
                       {mlSets.map((item) => (
-                        <tr key={item.id}>
-                          <td>{item.name || item.id}</td>
+                        <tr key={item.id} className={selectedMlSetId === item.id ? "active" : ""}>
+                          <td><button type="button" className="link-button" onClick={() => setSelectedMlSetId(item.id)}>{item.name || item.id}</button></td>
                           <td>{item.dataset_id || "-"}</td>
-                          <td>{String(item.member_count ?? 0)}</td>
+                          <td>{String(item.member_count ?? item.membership_count ?? 0)}</td>
                           <td>{item.membership_mode || "ids"}</td>
                           <td>{item.created_at || "-"}</td>
-                          <td>placeholder</td>
+                          <td>{`${item.split_status || "unassigned"} · ${item.physical_object_count ?? 0} objects · ${item.default_trainable_count ?? 0} trainable · ${item.review_required_count ?? 0} review`}</td>
                         </tr>
                       ))}
                       {!mlSets.length && (
@@ -1873,7 +2145,26 @@ export default function DatasetsPage() {
           setSessions(refreshed);
         }}
       />
+      <MLSetDetailDrawer
+        open={Boolean(selectedMlSetId && selectedMlSetSummary)}
+        mlSet={selectedMlSetSummary}
+        dataset={selectedDatasetSummary}
+        onClose={() => setSelectedMlSetId("")}
+        onSelectSession={(sessionId) => {
+          openSessionDrawer(sessionId);
+        }}
+      />
+      <PhysicalObjectDetailDrawer
+        open={Boolean(selectedPhysicalObjectId && selectedPhysicalObjectSummary)}
+        physicalObject={selectedPhysicalObjectSummary}
+        dataset={selectedDatasetSummary}
+        onClose={() => setSelectedPhysicalObjectId("")}
+        onSelectSession={(sessionId) => {
+          openSessionDrawer(sessionId);
+        }}
+      />
 
+      {successMessage && <div className="warning-line">{successMessage}</div>}
       {error && <div className="warning-line active">{error}</div>}
     </main>
   );

@@ -14,7 +14,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from PIL import Image, ImageOps
@@ -53,6 +53,7 @@ from vision_3d_acquisition.api.filesystem import (
 )
 from vision_3d_acquisition.api.dataset_session_exports import DatasetSessionExportService
 from vision_3d_acquisition.datasets import DatasetService
+from vision_3d_acquisition.datasets.physical_objects import PhysicalObjectRegistry
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
 from vision_3d_acquisition.api.feature_analytics import (
     build_distributions,
@@ -65,6 +66,11 @@ from vision_3d_acquisition.api.pipeline_defaults_25d import (
     clear_25d_defaults,
     read_25d_defaults,
     write_25d_defaults,
+)
+from vision_3d_acquisition.api.processing_jobs import (
+    ProcessingJobCancelResponse,
+    ProcessingJobCreateRequest,
+    get_processing_job_service,
 )
 from vision_3d_acquisition.api.processing_dispatch import dispatch_take_processing
 from vision_3d_acquisition.api.schemas import DatasetSessionSummary, DatasetSummary, HealthResponse, RuntimeState, TakeDetail, TakeSummary, TakeSummaryPage
@@ -81,6 +87,7 @@ from vision_3d_acquisition.processes import ProcessService
 from vision_3d_acquisition.processes.bindings import ProcessBindingService
 from vision_3d_acquisition.ml import MLService
 from vision_3d_acquisition.ml.ingestion import IngestionWizardService
+from vision_3d_acquisition.ml.ml_set_summary import MLSetSummaryService
 from vision_3d_acquisition.runtime_config import (
     RuntimeConfig,
     clear_default_calibration,
@@ -353,6 +360,11 @@ class IngestionPolicyUpdateRequest(BaseModel):
 
 class IngestionMaterializeRequest(BaseModel):
     ml_set_id: str
+
+
+class PhysicalObjectReconcileRequest(BaseModel):
+    dataset_id: str
+    rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ObjectAnnotationUpsertRequest(BaseModel):
@@ -1678,6 +1690,7 @@ def takes_paged(
     is_reference: bool | None = None,
     is_golden_sample: bool | None = None,
     show_archived: bool = False,
+    profile: bool = False,
 ) -> TakeSummaryPage:
     payload = list_takes_paged(
         settings,
@@ -1702,6 +1715,7 @@ def takes_paged(
         is_reference=is_reference,
         is_golden_sample=is_golden_sample,
         include_archived=show_archived,
+        profile=profile,
     )
     return TakeSummaryPage(**payload)
 
@@ -1766,11 +1780,11 @@ def update_dataset(dataset_id: str, payload: DatasetRequest, settings: ApiSettin
 def dataset_sessions(dataset_id: str, settings: ApiSettings = Depends(get_settings)) -> list[DatasetSessionSummary]:
     service = DatasetService(settings.data_dir)
     sessions = service.list_sessions(dataset_id=dataset_id)
+    take_counts = service.visible_take_counts_by_session(dataset_id, include_archived=False)
     payload: list[DatasetSessionSummary] = []
     for item in sessions:
         sid = str(item.get("id") or "")
-        takes_dir = settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "sessions" / f"session_{sid}" / "takes"
-        take_count = len([child for child in takes_dir.iterdir() if child.is_dir()]) if takes_dir.is_dir() else 0
+        take_count = int(take_counts.get(sid) or 0)
         payload.append(DatasetSessionSummary(**item, take_count=take_count))
     return payload
 
@@ -1804,12 +1818,53 @@ def dataset_ml_sets(dataset_id: str, settings: ApiSettings = Depends(get_setting
     for item in service.list_ml_sets(dataset_id=dataset_id):
         ml_set_id = str(item.get("id") or "")
         memberships = service.list_ml_set_memberships(dataset_id=dataset_id, ml_set_id=ml_set_id) if ml_set_id else []
-        rows.append({
-            **item,
-            "member_count": len(memberships),
-            "membership_mode": str((item.get("membership") or {}).get("mode") or "ids"),
-        })
+        rows.append({**item, **service.summarize_ml_set_memberships(item, memberships)})
     return rows
+
+
+@app.get("/api/physical-objects")
+def list_physical_objects(
+    dataset_id: str,
+    normalized_class: str | None = None,
+    superclass: str | None = None,
+    session_id: str | None = None,
+    needs_review: bool | None = None,
+    settings: ApiSettings = Depends(get_settings),
+) -> list[dict[str, Any]]:
+    if DatasetService(settings.data_dir).get_dataset(dataset_id) is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return PhysicalObjectRegistry(settings).list_objects(
+        dataset_id,
+        normalized_class=normalized_class,
+        superclass=superclass,
+        session_id=session_id,
+        needs_review=needs_review,
+    )
+
+
+@app.get("/api/physical-objects/{physical_object_id}")
+def get_physical_object(physical_object_id: str, dataset_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    payload = PhysicalObjectRegistry(settings).get_object(dataset_id, physical_object_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Physical object not found")
+    return payload
+
+
+@app.get("/api/physical-objects/{physical_object_id}/takes")
+def get_physical_object_takes(physical_object_id: str, dataset_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    return {"takes": PhysicalObjectRegistry(settings).object_takes(dataset_id, physical_object_id)}
+
+
+@app.get("/api/physical-objects/{physical_object_id}/repeatability")
+def get_physical_object_repeatability(physical_object_id: str, dataset_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    return PhysicalObjectRegistry(settings).object_repeatability(dataset_id, physical_object_id)
+
+
+@app.post("/api/physical-objects/reconcile")
+def reconcile_physical_objects(payload: PhysicalObjectReconcileRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    registry = PhysicalObjectRegistry(settings)
+    synced = registry.sync_from_manifest_rows(payload.dataset_id, payload.rows)
+    return {"dataset_id": payload.dataset_id, "synced_count": len(synced), "objects": synced}
 
 
 @app.post("/api/datasets/{dataset_id}/ml-sets")
@@ -1842,7 +1897,7 @@ def create_dataset_ml_set(dataset_id: str, payload: DatasetMlSetRequest, setting
     existing["updated_at"] = datetime.now(UTC).isoformat()
     ml_set_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
     memberships = service.list_ml_set_memberships(dataset_id=dataset_id, ml_set_id=did)
-    return {**created, **existing, "member_count": len(memberships), "membership_mode": str((existing.get("membership") or {}).get("mode") or "ids")}
+    return {**created, **existing, **service.summarize_ml_set_memberships(existing, memberships)}
 
 
 @app.post("/api/datasets/{dataset_id}/ml-sets/{ml_set_id}/members")
@@ -1899,6 +1954,53 @@ def add_dataset_ml_set_members(dataset_id: str, ml_set_id: str, payload: Dataset
     }
 
 
+@app.get("/api/ml-sets/{ml_set_id}/summary")
+def ml_set_summary(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        return MLSetSummaryService(settings).build_summary(ml_set_id, dataset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/ml-sets/{ml_set_id}/class-distribution")
+def ml_set_class_distribution(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    payload = ml_set_summary(ml_set_id, dataset_id=dataset_id, settings=settings)
+    return {
+        "class_distribution": payload.get("class_distribution") or {},
+        "superclass_distribution": payload.get("superclass_distribution") or {},
+        "split_by_class": payload.get("split_by_class") or {},
+    }
+
+
+@app.get("/api/ml-sets/{ml_set_id}/split-summary")
+def ml_set_split_summary(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    payload = ml_set_summary(ml_set_id, dataset_id=dataset_id, settings=settings)
+    return payload.get("split_summary") or {}
+
+
+@app.get("/api/ml-sets/{ml_set_id}/warnings")
+def ml_set_warnings(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    payload = ml_set_summary(ml_set_id, dataset_id=dataset_id, settings=settings)
+    return {"warnings": payload.get("warnings") or []}
+
+
+@app.get("/api/ml-sets/{ml_set_id}/representative-samples")
+def ml_set_representative_samples(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    payload = ml_set_summary(ml_set_id, dataset_id=dataset_id, settings=settings)
+    return {"representative_samples": payload.get("representative_samples") or {}}
+
+
+@app.get("/api/ml-sets/{ml_set_id}/export")
+def ml_set_export(ml_set_id: str, kind: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> FileResponse:
+    try:
+        path = MLSetSummaryService(settings).export_file(ml_set_id, kind, dataset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Export not found: {kind}")
+    return FileResponse(path)
+
+
 @app.post("/api/ml-ingestion/runs")
 def create_ingestion_run(payload: IngestionRunCreateRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
     service = IngestionWizardService(settings.data_dir)
@@ -1912,9 +2014,24 @@ def get_ingestion_run(run_id: str, settings: ApiSettings = Depends(get_settings)
 
 
 @app.post("/api/ml-ingestion/runs/{run_id}/table")
-def ingest_operator_table(run_id: str, payload: IngestionTableRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+async def ingest_operator_table(
+    run_id: str,
+    request: Request,
+    file: UploadFile | None = File(default=None),
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
     service = IngestionWizardService(settings.data_dir)
     try:
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" in content_type:
+            if file is None:
+                raise ValueError("No file uploaded.")
+            data = await file.read()
+            return service.ingest_uploaded_file(run_id, filename=file.filename or "uploaded_table", content_bytes=data)
+        payload_raw = await request.json()
+        payload = IngestionTableRequest(**payload_raw)
+        if payload is None:
+            raise ValueError("Missing ingestion payload.")
         return service.ingest_table(run_id, content=payload.content, input_format=payload.input_format)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1956,8 +2073,7 @@ def update_dataset_session(dataset_id: str, session_id: str, payload: DatasetSes
     updated = service.update_session(dataset_id, session_id, payload.model_dump(exclude_unset=True))
     if updated is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    takes_dir = settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "sessions" / f"session_{session_id}" / "takes"
-    take_count = len([child for child in takes_dir.iterdir() if child.is_dir()]) if takes_dir.is_dir() else 0
+    take_count = _dataset_session_take_count(settings, dataset_id=dataset_id, session_id=session_id)
     return DatasetSessionSummary(**updated, take_count=take_count)
 
 
@@ -2041,7 +2157,7 @@ def feature_analytics_distributions(
     records, debug = build_feature_records(settings, query=query, max_takes=max_takes, time_budget_ms=time_budget_ms)
     resolved_bins = max(4, min(int(bins), 128))
     resolved_mode = "density" if mode == "density" else "count"
-    resolved_group = "label" if group_by == "label" else "superclass"
+    resolved_group = group_by if group_by in {"label", "physical_object_id"} else "superclass"
     payload = build_distributions(records, feature_key=feature_key, group_by=resolved_group, bins=resolved_bins, mode=resolved_mode)
     payload["debug"] = debug
     logger.info("feature_analytics.distributions:done groups=%s records=%s duration_ms=%.2f", len(payload.get("groups") or []), len(records), (time.monotonic() - started) * 1000.0)
@@ -2602,6 +2718,50 @@ def process_take_for_pipeline(take_id: str, payload: ExecuteTakeRequest, setting
         return response
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/processing-jobs")
+def create_processing_job(payload: ProcessingJobCreateRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        job = get_processing_job_service(settings).create_job(payload)
+        return {"job": job.model_dump(mode="json")}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/processing-jobs")
+def list_processing_jobs(settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    service = get_processing_job_service(settings)
+    jobs = [job.model_dump(mode="json") for job in service.list_jobs()]
+    counts = {
+        "queued": sum(1 for job in jobs if str(job.get("status")) == "queued"),
+        "running": sum(1 for job in jobs if str(job.get("status")) == "running"),
+        "completed": sum(1 for job in jobs if str(job.get("status")) == "completed"),
+        "failed": sum(1 for job in jobs if str(job.get("status")) == "failed"),
+        "cancelled": sum(1 for job in jobs if str(job.get("status")) == "cancelled"),
+        "partial": sum(1 for job in jobs if str(job.get("status")) == "partial"),
+    }
+    return {"jobs": jobs, "counts": counts}
+
+
+@app.get("/api/processing-jobs/{job_id}")
+def get_processing_job(job_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    job = get_processing_job_service(settings).load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown processing job: {job_id}")
+    return {"job": job.model_dump(mode="json")}
+
+
+@app.post("/api/processing-jobs/{job_id}/cancel")
+def cancel_processing_job(job_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        job = get_processing_job_service(settings).cancel_job(job_id)
+        payload = ProcessingJobCancelResponse(ok=True, job_id=job_id, status=job.status)
+        return payload.model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/pipelines/preview-segmentation")
