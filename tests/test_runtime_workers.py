@@ -250,7 +250,7 @@ def test_fusion_publisher_worker_fuses_and_publishes_complete_group(tmp_path: Pa
         source_id=group["id"],
         modality="acquisition_group",
         purpose="fusion",
-        pipeline_id="mining_steel_ball_fusion_rgb_25d",
+        pipeline_id="mining_steel_ball_fusion",
         recipe_id="recipe_fusion_worker",
     )
 

@@ -18,7 +18,7 @@ def test_detect_charuco_legacy_mode(monkeypatch) -> None:
 
     aruco = SimpleNamespace(interpolateCornersCharuco=interpolate)
     monkeypatch.setattr(camera_2d, "_aruco_module", lambda: aruco)
-    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1], [2]], dtype=np.int32)))
+    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1], [2]], dtype=np.int32), None))
 
     result = camera_2d.detect_charuco_corners_compat(np.zeros((32, 32), dtype=np.uint8), _Board())
     assert result["api_mode"] == "legacy"
@@ -37,7 +37,7 @@ def test_detect_charuco_detector_mode(monkeypatch) -> None:
 
     aruco = SimpleNamespace(CharucoDetector=Detector)
     monkeypatch.setattr(camera_2d, "_aruco_module", lambda: aruco)
-    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1]], dtype=np.int32)))
+    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1]], dtype=np.int32), None))
 
     result = camera_2d.detect_charuco_corners_compat(np.zeros((32, 32), dtype=np.uint8), _Board())
     assert result["api_mode"] == "detector"
@@ -47,7 +47,7 @@ def test_detect_charuco_detector_mode(monkeypatch) -> None:
 def test_detect_charuco_fallback_mode(monkeypatch) -> None:
     aruco = SimpleNamespace()
     monkeypatch.setattr(camera_2d, "_aruco_module", lambda: aruco)
-    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1], [2]], dtype=np.int32)))
+    monkeypatch.setattr(camera_2d, "_detect_markers", lambda *_args, **_kwargs: ([np.zeros((4, 1, 2), dtype=np.float32)], np.array([[1], [2]], dtype=np.int32), None))
 
     result = camera_2d.detect_charuco_corners_compat(np.zeros((32, 32), dtype=np.uint8), _Board())
     assert result["api_mode"] == "aruco_fallback"

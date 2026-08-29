@@ -266,6 +266,9 @@ def test_25d_good_ball_requires_min_3d_sphericity() -> None:
         "feature_flatness": 0.5,
         "feature_edge_roughness": 2.0,
         "feature_volume_proxy_mm3": 100000.0,
+        "footprint_geometry": {"radial_cv": 0.08},
+        "surface_geometry": {"sphere_fit_rmse_mm": 1.7},
+        "sphere_consistency": {"radial_height_rmse_mm": 2.0, "surface_completeness_ratio": 0.82},
     }
 
     assert _classify_25d(base)[2] == "ball"

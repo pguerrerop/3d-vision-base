@@ -28,6 +28,7 @@ import {
   type RuntimeWorkerStatus,
   type TakeSummary,
   type PipelineRunEntry,
+  type ValidationBaseline,
 } from "../api/client";
 import PipelineExecutionGraph from "../components/PipelineExecutionGraph";
 import StudioInspector from "../components/StudioInspector";
@@ -1036,6 +1037,8 @@ export default function ProcessingLabPage() {
   const [takesLoading, setTakesLoading] = useState(false);
   const [takesLoadingMore, setTakesLoadingMore] = useState(false);
   const [detail, setDetail] = useState<TakeDetail | null>(null);
+  const [artifactBaseline, setArtifactBaseline] = useState<ValidationBaseline | null>(null);
+  const [validationMessage, setValidationMessage] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [pipelineRuns, setPipelineRuns] = useState<PipelineRunEntry[]>([]);
   const [pipelineRunsLoading, setPipelineRunsLoading] = useState(false);
@@ -2736,7 +2739,8 @@ export default function ProcessingLabPage() {
   const rightPanelOverlay = shellLayoutMode === "narrow" || shellLayoutMode === "very_narrow";
   const leftRailDrawer = shellLayoutMode === "narrow" || shellLayoutMode === "very_narrow";
   const inspectorCanCollapse = rightPanelOverlay;
-  const inspectorOpen = inspectorCanCollapse ? inspectorExpanded : !inspectorCollapsed;
+  // Desktop inspection remains visible; collapsing is only a narrow-overlay affordance.
+  const inspectorOpen = inspectorCanCollapse ? inspectorExpanded : true;
   const leftRailCanCollapse = shellLayoutMode === "wide";
   const leftRailReallyCollapsed = leftRailCanCollapse && leftRailCollapsed;
   const leftRailVisible = !focusMode && (!leftRailDrawer || leftRailExpanded);
@@ -3758,10 +3762,6 @@ export default function ProcessingLabPage() {
       setPipelineActionMessage(`Run updated: ${response.run_id ?? refreshed?.result?.processed_at ?? "completed"}`);
       if (roiEditStatus === "rerun_required" || roiEditStatus === "saved") {
         setRoiEditStatus("saved");
-      }
-      if (response.run_id) {
-        setSelectedArtifactId(null);
-        setSelectedObjectId(null);
       }
     } catch (err) {
       setPipelineActionMessage(`Apply + rerun failed: ${err instanceof Error ? err.message : "unknown error"}`);
@@ -5211,16 +5211,18 @@ export default function ProcessingLabPage() {
             <span className="eyebrow">Stage controls</span>
             <strong>{inspectorOpen ? (focusedArtifact?.title ?? selectedStage?.display_name ?? "Context") : "Controls"}</strong>
           </div>
+          {inspectorCanCollapse && (
           <button
             type="button"
             className="panel-collapse-toggle"
-            onClick={() => (inspectorCanCollapse ? setInspectorExpanded((current) => !current) : setInspectorCollapsed((current) => !current))}
+            onClick={() => setInspectorExpanded((current) => !current)}
             aria-expanded={inspectorOpen}
             aria-label={inspectorOpen ? "Collapse controls panel" : "Expand controls panel"}
             title={inspectorOpen ? "Collapse controls panel" : "Expand controls panel"}
           >
             {inspectorOpen ? "›" : "‹"}
           </button>
+          )}
         </div>
         <div className={`stage-control-tabs ${inspectorOpen ? "expanded" : "collapsed"}`}>
           {(["inspect", "tune", "view", "graph", "compare", "actions", "debug"] as ControlPanelTab[])
@@ -5582,12 +5584,12 @@ export default function ProcessingLabPage() {
             {canonicalSelectedStageId === "load_heightmap" && planeQaParams && (
               <>
                 <details className="control-panel-details" open>
-                  <summary>ROI</summary>
+                  <summary>Reference surface region</summary>
                   <div className="control-panel-form-grid">
                     <label>Mode
                       <select value={String(planeQaParams.reference_surface_region_mode ?? "none")} onChange={(e) => { setPlaneQaParams((c) => c ? { ...c, reference_surface_region_mode: e.target.value, plane_fit_roi_type: e.target.value === "full_height_x_band" ? "full_height_x_band" : e.target.value === "none" ? "rectangle" : e.target.value } : c); setPlaneQaDirty(true); }}>
                         <option value="none">Full frame</option>
-                        <option value="full_height_x_band">Vertical band</option>
+                        <option value="full_height_x_band">Vertical band ROI</option>
                         <option value="rectangle">Rectangle</option>
                         <option value="polygon">Polygon</option>
                       </select>
@@ -6179,11 +6181,24 @@ export default function ProcessingLabPage() {
             )}
             <section className="control-panel-section">
               <span>Artifact</span>
+              {artifactBaseline?.status === "active" ? <small>REFERENCE · v{artifactBaseline.version}</small> : null}
+              {validationMessage ? <small>{validationMessage}</small> : null}
               <div className="control-panel-button-row">
                 {detail?.take_id && focusedArtifact?.path ? (
                   <a className="control-link-button" href={fileUrl(detail.take_id, String(focusedArtifact.path))} target="_blank" rel="noreferrer">Open selected artifact</a>
                 ) : null}
                 <button type="button" disabled={!focusedArtifact?.artifact_id} onClick={() => { void navigator.clipboard?.writeText(String(focusedArtifact?.artifact_id ?? "")); }}>Copy artifact id</button>
+                <button type="button" disabled={!detail?.take_id || !focusedArtifact?.artifact_id} onClick={() => {
+                  if (!detail?.take_id || !focusedArtifact?.artifact_id) return;
+                  setValidationMessage("Approving reference…");
+                  void api.approveValidationBaseline({ take_id: detail.take_id, pipeline_id: selectedPipelineId, run_id: activeRunId ?? (detail.result?.run_id as string | undefined) ?? "latest", approval_scope: "artifact", stage_id: canonicalSelectedStageId, processing_unit_id: selectedContractUnitId, view_id: activeTab, artifact_id: focusedArtifact.artifact_id }).then((result) => {
+                    const baseline = result.baselines[0] ?? null; setArtifactBaseline(baseline); setValidationMessage(baseline ? `Reference v${baseline.version} approved.` : "Artifact is not comparison-eligible.");
+                  }).catch((error: unknown) => setValidationMessage(error instanceof Error ? error.message : "Reference approval failed."));
+                }}>Mark as reference</button>
+                <button type="button" disabled={!artifactBaseline} onClick={() => {
+                  if (!artifactBaseline) return; setValidationMessage("Comparing with reference…");
+                  void api.compareValidationBaseline(artifactBaseline.id, activeRunId ?? (detail?.result?.run_id as string | undefined) ?? "latest").then((result) => setValidationMessage(`${String(result.status)}: ${String(result.summary)}`)).catch((error: unknown) => setValidationMessage(error instanceof Error ? error.message : "Comparison failed."));
+                }}>Compare with reference</button>
                 <button type="button" disabled={!focusedArtifact?.path} onClick={() => { void navigator.clipboard?.writeText(String(focusedArtifact?.path ?? "")); }}>Copy artifact path</button>
                 <button type="button" disabled title="Coming later">Compare with previous run</button>
                 <button type="button" disabled={!focusedArtifact?.path} title={focusedArtifact?.path ? "" : "No exportable artifact selected"}>Export selected artifact</button>

@@ -45,7 +45,10 @@ export function resolveOverlayTarget(
       warning: null,
     };
   }
-  return { target: null, overlays: [], warning: "No renderable target artifact available." };
+  // Non-image, non-overlay kinds (json, table, metric, ...) never attempt
+  // overlay-target resolution, so the overlay-specific warning would be
+  // misleading here; their own dedicated renderer branches handle display.
+  return { target: null, overlays: [], warning: null };
 }
 
 export function overlaysForTarget(artifacts: StudioArtifact[], targetArtifactId: string): StudioArtifact[] {

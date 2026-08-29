@@ -365,7 +365,8 @@ class PipelineExecutor2D:
                     )
                     alpha = float(step.params.get("overlay_alpha", 0.35))
                     active = overlay_mask > 0
-                    overlay[active] = cv2.addWeighted(overlay[active], 1.0 - alpha, color_layer[active], alpha, 0)
+                    if np.any(active):
+                        overlay[active] = cv2.addWeighted(overlay[active], 1.0 - alpha, color_layer[active], alpha, 0)
                     self._working["morphology_overlay_image"] = overlay
                     artifacts.append(_artifact("overlay_image", "morphology", "image", "Segmentation overlay image"))
                     artifacts[-1]["metadata"] = {
@@ -383,7 +384,8 @@ class PipelineExecutor2D:
                     rejected_active = rejected_mask > 0
                     rejected_color = np.zeros_like(rejected_overlay)
                     rejected_color[:, :] = (24, 24, 220)
-                    rejected_overlay[rejected_active] = cv2.addWeighted(rejected_overlay[rejected_active], 0.4, rejected_color[rejected_active], 0.6, 0)
+                    if np.any(rejected_active):
+                        rejected_overlay[rejected_active] = cv2.addWeighted(rejected_overlay[rejected_active], 0.4, rejected_color[rejected_active], 0.6, 0)
                     self._working["rejected_components_overlay_image"] = rejected_overlay
                     artifacts.append(_artifact("rejected_components_overlay", "morphology", "image", "Rejected components overlay"))
                     artifacts[-1]["metadata"] = {
@@ -1525,11 +1527,19 @@ def _fit_ellipse_with_method(
 
 def _ellipse_point_errors(points: np.ndarray, ellipse: tuple[Any, Any, Any]) -> np.ndarray:
     (cx, cy), (ma, mi), angle = ellipse
-    major = float(max(ma, mi))
-    minor = float(min(ma, mi))
+    # OpenCV's `axes` tuple is coupled to `angle`: axes[0] lies along `angle`
+    # and axes[1] lies perpendicular to it. Swapping which one we call
+    # "major" (by raw magnitude) requires rotating the frame by 90 degrees
+    # to match, otherwise the projected residuals are computed against the
+    # wrong axis and every point looks like a huge outlier.
+    if ma >= mi:
+        major, minor = float(ma), float(mi)
+        theta = np.deg2rad(float(angle))
+    else:
+        major, minor = float(mi), float(ma)
+        theta = np.deg2rad(float(angle) + 90.0)
     rx = max(major / 2.0, 1e-6)
     ry = max(minor / 2.0, 1e-6)
-    theta = np.deg2rad(float(angle))
     cos_t = float(np.cos(theta))
     sin_t = float(np.sin(theta))
     dx = points[:, 0] - float(cx)

@@ -9,6 +9,12 @@ import { artifactLineage, objectGeneratingStages, selectedObject, stageInspector
 import type { HoverInspectionSample } from "./hoverInspectionModel";
 import HeightLegend from "./HeightLegend";
 import { resolveHeightColorMapping, toHeightLegendSemantic } from "./heightSemantics";
+import {
+  parseClusterDiagnostics,
+  selectedClusterRow,
+  topRejectedClusterRow,
+  type ClusterDiagnostics,
+} from "./clusterDecisionModel";
 
 type Props = {
   detail: TakeDetail | null;
@@ -84,7 +90,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
   const effectiveParams = (morphDebugMeta.effective_params as Record<string, unknown> | undefined)
     ?? (morphMetricsMeta.effective_params as Record<string, unknown> | undefined)
     ?? {};
-  const inspectorTitle = object
+  const inspectorTitle = (object && semantic.category !== "plane_qa")
     ? `Object #${object.object_id}`
     : selectedArtifact?.title
       ? selectedArtifact.title
@@ -128,6 +134,38 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
     }
     void loadRuntimeDiagnostics();
   }, [detail?.take_id, runtimeDiagnosticsArtifact?.path]);
+  const isDetectStage = semantic.category === "plane_qa";
+  const clustersArtifact = artifacts.find((item) => item.artifact_id === "blob_height_clusters") ?? null;
+  const clusterDebugArtifact = artifacts.find((item) => item.artifact_id === "blob_cluster_selection_debug") ?? null;
+  const [clusterDiagnostics, setClusterDiagnostics] = useState<ClusterDiagnostics | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    async function loadClusterDiagnostics() {
+      if (!detail?.take_id || !isDetectStage || (!clustersArtifact?.path && !clusterDebugArtifact?.path)) {
+        if (!cancelled) setClusterDiagnostics(null);
+        return;
+      }
+      async function fetchJson(path: string | null | undefined): Promise<unknown> {
+        if (!path) return null;
+        try {
+          const response = await fetch(fileUrl(detail!.take_id, String(path)));
+          if (!response.ok) return null;
+          return await response.json();
+        } catch {
+          return null;
+        }
+      }
+      const [clusters, debug] = await Promise.all([
+        fetchJson(clustersArtifact?.path),
+        fetchJson(clusterDebugArtifact?.path),
+      ]);
+      if (cancelled) return;
+      const diagnostics = parseClusterDiagnostics(clusters, debug);
+      setClusterDiagnostics(diagnostics.hasData ? diagnostics : null);
+    }
+    void loadClusterDiagnostics();
+    return () => { cancelled = true; };
+  }, [detail?.take_id, isDetectStage, clustersArtifact?.path, clusterDebugArtifact?.path]);
   const transformMeta = (artifactMeta.transform && typeof artifactMeta.transform === "object") ? (artifactMeta.transform as Record<string, unknown>) : null;
   // Resolve the canonical HeightColorMapping for the current take so we can
   // render the colorbar on every stage (not only when a height image is the
@@ -218,6 +256,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
         {semantic.category === "input" && <small>Primary visualization prefers human-readable source previews (height preview for 2.5D).</small>}
         {semantic.category === "plane_qa" && <small>Plane-fit quality and near-zero normalization diagnostics are prioritized.</small>}
       </div>
+      {!isDetectStage && (
       <div className="inspector-section">
         <span>Object candidates</span>
         <strong>{objectCandidates.length}</strong>
@@ -232,6 +271,37 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Select an object to inspect candidate details.</small>
         )}
       </div>
+      )}
+      {isDetectStage && (
+        <div className="inspector-section">
+          <span>Reference support</span>
+          {(() => {
+            if (!clusterDiagnostics) {
+              return <small>No cluster-scoring diagnostics were emitted for this run.</small>;
+            }
+            const selected = selectedClusterRow(clusterDiagnostics);
+            const topRejected = topRejectedClusterRow(clusterDiagnostics);
+            if (!selected) {
+              return <small>No selected reference cluster was emitted for this run.</small>;
+            }
+            return (
+              <>
+                <strong>Cluster {selected.clusterId}</strong>
+                <small>Decision: {selected.decision}</small>
+                <small>Score: {selected.score == null ? "-" : selected.score.toFixed(2)}</small>
+                <small>Components/fragments: {selected.componentCount} / {selected.fragmentCount}</small>
+                <small>Area: {selected.areaFraction == null ? "-" : `${(selected.areaFraction * 100).toFixed(1)}% valid ROI`}</small>
+                <small>Median Z: {selected.medianZ == null ? "-" : `${selected.medianZ.toFixed(1)} mm`}</small>
+                <small>Z MAD: {selected.zMad == null ? "-" : `${selected.zMad.toFixed(1)} mm`}</small>
+                <small>Border contact: {selected.borderContact == null ? "-" : (selected.borderContact ? "yes" : "no")}</small>
+                <small>Reason: best weighted support score</small>
+                {topRejected ? <small>Top rejected: {topRejected.clusterId} (score {topRejected.score == null ? "-" : topRejected.score.toFixed(2)}{topRejected.rejectionReason ? `, ${topRejected.rejectionReason}` : ""})</small> : null}
+                <small>Entity types: reference_component · reference_fragment · reference_cluster · reference_support_mask · reference_model</small>
+              </>
+            );
+          })()}
+        </div>
+      )}
       {semantic.category === "segmentation" && (
         <div className="inspector-section">
           <span>Morphology diagnostics</span>
@@ -290,7 +360,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Convention: height_above_belt_mm = raw_z_mm - plane_z_at_xy</small>
         </div>
       )}
-      {(beltPlaneArtifact || segmentationArtifact || componentsArtifact) && (
+      {!isDetectStage && (beltPlaneArtifact || segmentationArtifact || componentsArtifact) && (
         <div className="inspector-section">
           <span>25D diagnostics</span>
           <strong>Belt plane + segmentation</strong>
@@ -300,7 +370,7 @@ export default function StudioInspector({ detail, pipeline, stageId, compatible,
           <small>Connected components: {String(((componentsArtifact?.metadata as Record<string, unknown> | undefined)?.component_count) ?? detail?.result?.objects?.length ?? "-")}</small>
         </div>
       )}
-      <ObjectInspector object={object} producingStages={producingStages} explanationByObjectId={explanationByObjectId} />
+      {!isDetectStage && <ObjectInspector object={object} producingStages={producingStages} explanationByObjectId={explanationByObjectId} />}
       {!object && semantic.category === "geometry" && (
         <div className="inspector-section">
           <span>Blob candidate</span>

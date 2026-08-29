@@ -15,6 +15,10 @@ export type BlobCandidate = {
   status?: "candidate" | "rejected";
   rejectionReason?: string;
   parentRoi?: unknown;
+  // Populated only for reference-detection components (belt_bg/belt_stripe/unknown
+  // classification + height stats), never for ball-detection blob candidates.
+  role?: string;
+  meanHeightMm?: number;
 };
 
 export type BlobDetectionSummary = {
@@ -29,6 +33,15 @@ export type BlobDetectionSummary = {
   aspectRatioStats?: { min?: number; median?: number; max?: number };
   rejectedReasonCounts?: Record<string, number>;
 };
+
+// The blob overlay is always drawn against the plain RGB frame the detector ran on, never
+// against a debug/overlay artifact, so contour coordinates line up with the pixels shown.
+// Both Studio and the Report walkthrough resolve this the same way so they never drift apart.
+export function resolveBlobSetSourceImage(stageArtifacts: StudioArtifact[]): StudioArtifact | null {
+  return stageArtifacts.find((item) => item.artifact_id === "source_rgb_image" && item.path)
+    ?? stageArtifacts.find((item) => item.kind === "image" && item.path)
+    ?? null;
+}
 
 export function normalizeBlobDetectionArtifacts(artifacts: StudioArtifact[]): {
   candidates: BlobCandidate[];

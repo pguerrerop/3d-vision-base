@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 
@@ -13,8 +15,9 @@ from vision_3d_acquisition.vision_core.pipelines.stages_25d import (
     ClassifyMiningBall25DStage,
     _apply_known_object_scale_correction,
     _classify_25d,
-    _contour_metrics_in_metric_space,
     _compose_diameter_metrics,
+    _contour_metrics_in_metric_space,
+    _summarize_low_gradient_blobs,
 )
 from vision_3d_acquisition.vision_core.heightmap import HeightmapFrame, load_heightmap_npz, save_heightmap_npz
 
@@ -22,6 +25,12 @@ from vision_3d_acquisition.vision_core.heightmap import HeightmapFrame, load_hei
 def _load_result(data_dir: Path, take_id: str) -> dict:
     path = data_dir / "processed" / take_id / "result.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_mask_png(path: Path) -> np.ndarray:
+    mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    assert mask is not None, path
+    return mask > 0
 
 
 def test_create_synthetic_25d_take_and_load(tmp_path: Path) -> None:
@@ -80,6 +89,10 @@ def test_25d_pipeline_plane_normalization_segmentation_measurement(tmp_path: Pat
         assert "radial_cv" in (obj.get("footprint_geometry") or {})
         assert "sphere_fit_rmse_mm" in (obj.get("surface_geometry") or {})
         assert "radial_height_rmse_mm" in (obj.get("sphere_consistency") or {})
+        consistency = obj.get("sphere_consistency") or {}
+        assert "surface_sphere_fit_rmse_norm" in consistency
+        assert "surface_visible_cap_fraction" in consistency
+        assert "surface_volume_fill_ratio_model" in consistency
         assert "flat_region_ratio" in (obj.get("damage_metrics") or {})
         assert isinstance(obj.get("superclass"), str)
         assert isinstance(obj.get("label"), str)
@@ -87,6 +100,50 @@ def test_25d_pipeline_plane_normalization_segmentation_measurement(tmp_path: Pat
     assert isinstance(object_candidates, list)
     if object_candidates:
         assert object_candidates[0].get("source_modality") == "derived_25d"
+
+
+def test_25d_pipeline_emits_surface_sphere_fit_rmse(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    run_ball_inspection_25d_flow(data_dir, take_id=take_id)
+    payload = _load_result(data_dir, take_id)
+    output_dir = data_dir / "processed" / take_id
+
+    assert payload.get("status") == "ok"
+    objects = payload.get("objects") or []
+    assert len(objects) > 0
+
+    emitted: list[float] = []
+    for obj in objects:
+        surface = obj.get("surface_geometry") if isinstance(obj.get("surface_geometry"), dict) else {}
+        value = surface.get("sphere_fit_rmse_mm")
+        if value is not None:
+            emitted.append(float(value))
+        assert "surface_geometry" in obj
+
+    assert emitted, "expected at least one object with finite surface_sphere_fit_rmse_mm"
+    assert all(np.isfinite(value) and value >= 0.0 for value in emitted)
+
+    feature_vector_path = output_dir / "feature_vector.json"
+    assert feature_vector_path.is_file()
+    feature_vector = json.loads(feature_vector_path.read_text(encoding="utf-8"))
+    fv_value = (feature_vector.get("features") or {}).get("surface_sphere_fit_rmse_mm")
+    assert fv_value is not None
+    assert np.isfinite(float(fv_value))
+
+    from vision_3d_acquisition.api.feature_catalog import feature_definition_for_key
+    from vision_3d_acquisition.api.feature_analytics import _extract_feature_values
+
+    definition = feature_definition_for_key("surface_sphere_fit_rmse_mm")
+    assert "surface_geometry.sphere_fit_rmse_mm" in definition.extraction_paths
+    for obj in objects:
+        extracted, sources = _extract_feature_values(obj)
+        if "surface_sphere_fit_rmse_mm" in extracted:
+            assert extracted["surface_sphere_fit_rmse_mm"] >= 0.0
+            assert sources["surface_sphere_fit_rmse_mm"] == "pipeline_run"
+        if "surface_sphere_fit_rmse_norm" in extracted:
+            assert extracted["surface_sphere_fit_rmse_norm"] >= 0.0
+            assert sources["surface_sphere_fit_rmse_norm"] == "pipeline_run"
 
 
 def test_25d_result_payload_contains_expected_fields(tmp_path: Path) -> None:
@@ -237,6 +294,671 @@ def test_reference_surface_vertical_band_roi_uses_full_height(tmp_path: Path) ->
     assert plane_fit_debug.get("roi_height") == int(frame.z_mm.shape[0])
 
 
+def test_25d_result_payload_preserves_nested_stage_params(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    stage_params = {
+        "detect_belt_plane": {
+            "background_detection_strategy": "low_gradient_surface",
+            "reference_surface_model": "constant_z",
+            "belt_stripe_filter_enabled": False,
+        },
+        "remove_belt_segment_objects": {
+            "min_height_mm": 9.5,
+            "max_height_mm": 150.0,
+        },
+        "known_object_25d": {
+            "enabled": True,
+            "target_selection": "manual_component_id",
+            "manual_component_id": 1,
+            "known_width_mm": 40.0,
+            "known_depth_mm": 40.0,
+            "known_height_mm": 25.0,
+            "tolerance_percent": 5.0,
+            "apply_correction": False,
+        },
+    }
+
+    payload = run_ball_inspection_25d_flow(data_dir, take_id=take_id, stage_params=stage_params).result_payload
+
+    assert payload.get("status") == "ok"
+    assert payload.get("stage_params") == stage_params
+    recipe_snapshot = payload.get("recipe_snapshot")
+    assert isinstance(recipe_snapshot, dict)
+    assert recipe_snapshot.get("pipeline_id") == "mining_steel_ball_classification_25d"
+    assert recipe_snapshot.get("strategy_branch") == "low_gradient_surface"
+    assert recipe_snapshot.get("stage_params") == stage_params
+    unit_trace = payload.get("processing_unit_trace")
+    assert isinstance(unit_trace, dict)
+    unit_results = unit_trace.get("unit_results")
+    assert isinstance(unit_results, dict)
+    assert unit_trace.get("trace_source") == "mixed"
+    assert unit_trace.get("trace_precision") == "mixed"
+    refinement = unit_results.get("detect_belt_plane.candidate_support_refinement")
+    assert isinstance(refinement, dict)
+    assert refinement.get("trace_source") == "runtime_unit_callbacks"
+    assert refinement.get("trace_precision") == "unit_level"
+    assert refinement.get("status") in {"completed", "warning", "skipped"}
+    assert isinstance(refinement.get("duration_ms"), int)
+    assert "selected_blob_cluster_refined_mask" in list(refinement.get("output_artifacts") or [])
+    params_used = refinement.get("parameters_used")
+    assert isinstance(params_used, dict)
+    assert "blob_cluster_refine_by_mad" in params_used
+    segmentation = unit_results.get("remove_belt_segment_objects.morphology_cleanup")
+    assert isinstance(segmentation, dict)
+    assert segmentation.get("trace_source") == "runtime_unit_callbacks"
+    segmentation_params = segmentation.get("parameters_used")
+    assert isinstance(segmentation_params, dict)
+    assert segmentation_params.get("morphology_kernel") == 5
+    diagnostics = unit_results.get("measurement_diagnostics.known_object_validation")
+    assert isinstance(diagnostics, dict)
+    assert diagnostics.get("trace_source") == "runtime_unit_callbacks"
+    diagnostics_params = diagnostics.get("parameters_used")
+    assert isinstance(diagnostics_params, dict)
+    assert diagnostics_params.get("enabled") is True
+
+
+def test_runtime_trace_expands_coverage_across_non_detect_stages(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_trace_coverage")
+
+    payload = run_ball_inspection_25d_flow(data_dir, take_id=take_id).result_payload
+
+    trace = payload.get("processing_unit_trace")
+    assert isinstance(trace, dict)
+    summary = trace.get("trace_summary")
+    assert isinstance(summary, dict)
+    assert int(summary.get("runtime_traced_units") or 0) >= 35
+    coverage_by_stage = summary.get("coverage_by_stage")
+    assert isinstance(coverage_by_stage, dict)
+    assert int(((coverage_by_stage.get("normalize_heights_to_plane") or {}).get("runtime_traced_units") or 0)) >= 5
+    assert int(((coverage_by_stage.get("geometry") or {}).get("runtime_traced_units") or 0)) >= 5
+    assert int(((coverage_by_stage.get("measurement_diagnostics") or {}).get("runtime_traced_units") or 0)) >= 4
+    assert int(((coverage_by_stage.get("overlay") or {}).get("runtime_traced_units") or 0)) >= 4
+
+    unit_results = trace.get("unit_results")
+    assert isinstance(unit_results, dict)
+
+    normalize = unit_results.get("normalize_heights_to_plane.height_above_belt")
+    assert isinstance(normalize, dict)
+    assert normalize.get("trace_source") == "runtime_unit_callbacks"
+    assert "height_max_mm" in dict(normalize.get("metrics") or {})
+
+    geometry = unit_results.get("geometry.ellipse_fitting")
+    assert isinstance(geometry, dict)
+    assert geometry.get("trace_source") == "runtime_unit_callbacks"
+    assert "ellipse_fit_success_count" in dict(geometry.get("metrics") or {})
+
+    measurement = unit_results.get("measurement.height_metrics")
+    assert isinstance(measurement, dict)
+    assert measurement.get("trace_source") == "runtime_unit_callbacks"
+    assert "max_height_max_mm" in dict(measurement.get("metrics") or {})
+
+    diagnostics = unit_results.get("measurement_diagnostics.feature_vector_generation")
+    assert isinstance(diagnostics, dict)
+    assert diagnostics.get("trace_source") == "runtime_unit_callbacks"
+    assert "feature_count" in dict(diagnostics.get("metrics") or {})
+
+    overlay = unit_results.get("overlay.classification_overlay")
+    assert isinstance(overlay, dict)
+    assert overlay.get("trace_source") == "runtime_unit_callbacks"
+    assert "classification_overlay_object_count" in dict(overlay.get("metrics") or {})
+
+
+def test_25d_result_payload_defaults_to_empty_stage_params_without_overrides(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+
+    payload = run_ball_inspection_25d_flow(data_dir, take_id=take_id).result_payload
+
+    assert payload.get("status") == "ok"
+    assert payload.get("stage_params") == {}
+
+
+def test_reference_method_metadata_and_alias_masks_are_emitted(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_reference_method")
+
+    payload = run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_component_mode": "height_aware",
+                "blob_split_method": "disabled",
+                "blob_component_use_smoothed_z": False,
+                "blob_neighbor_z_tolerance_mm": 2.0,
+                "reference_surface_model": "constant_z",
+                "reference_suppression_mask_policy": "selected_support",
+            },
+        },
+    ).result_payload
+
+    by_id = {item.get("artifact_id"): item for item in (payload.get("artifacts") or []) if isinstance(item, dict)}
+    for artifact_id in ("selected_reference_support_mask", "reference_model_inlier_mask", "reference_suppression_mask"):
+        assert artifact_id in by_id
+
+    plane_fit_meta = (by_id.get("plane_fit_debug", {}).get("metadata") or {}) if isinstance(by_id.get("plane_fit_debug"), dict) else {}
+    reference_method = plane_fit_meta.get("reference_method") or {}
+    assert reference_method.get("preset_id") == "blob_height_aware_constant_z"
+    assert reference_method.get("support_selection_method") == "blob_height_clusters"
+    assert reference_method.get("background_detection_strategy") == "low_gradient_blob_height_clusters"
+    assert reference_method.get("blob_component_mode") == "height_aware"
+    assert reference_method.get("blob_split_method") == "disabled"
+    assert reference_method.get("reference_surface_model") == "constant_z"
+    assert reference_method.get("reference_suppression_mask_policy") == "selected_support"
+
+
+def test_reference_suppression_mask_policy_selected_support_uses_selected_support_mask(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_suppression_policy")
+
+    run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_component_mode": "height_aware",
+                "blob_split_method": "disabled",
+                "reference_surface_model": "constant_z",
+                "reference_suppression_mask_policy": "selected_support",
+            },
+        },
+    )
+
+    out = data_dir / "processed" / take_id
+    selected = (out / "selected_reference_support_mask.png").read_bytes()
+    suppression = (out / "reference_suppression_mask.png").read_bytes()
+    assert suppression == selected
+
+
+def _run_low_gradient_bg_and_stripes_flow(tmp_path: Path, *, session_id: str) -> tuple[Path, dict[str, Any]]:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id=session_id)
+
+    payload = run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={"detect_belt_plane": {"background_detection_strategy": "low_gradient_bg_and_stripes"}},
+    ).result_payload
+    return data_dir / "processed" / take_id, payload
+
+
+def test_low_gradient_bg_and_stripes_strategy_preserves_support_and_suppression_invariants(tmp_path: Path) -> None:
+    out, payload = _run_low_gradient_bg_and_stripes_flow(
+        tmp_path,
+        session_id="synthetic_25d_bg_and_stripes",
+    )
+
+    assert payload.get("status") == "ok"
+    belt_bg = _load_mask_png(out / "belt_bg_mask.png")
+    stripes = _load_mask_png(out / "belt_stripes_mask.png")
+    suppression = _load_mask_png(out / "surface_suppression_mask.png")
+    model_support = _load_mask_png(out / "reference_model_support_mask.png")
+    unknown = _load_mask_png(out / "unknown_low_gradient_mask.png")
+    object_search_domain = _load_mask_png(out / "object_search_domain_mask.png")
+
+    assert not np.any(belt_bg & stripes)
+    assert np.array_equal(model_support, belt_bg)
+    assert np.array_equal(suppression, belt_bg | stripes)
+    assert not np.any(unknown & suppression)
+    assert np.array_equal(object_search_domain, ~(belt_bg | stripes) & object_search_domain)
+
+    stripe_debug = json.loads((out / "belt_stripe_filter_debug.json").read_text(encoding="utf-8"))
+    assert stripe_debug.get("background_detection_strategy") == "low_gradient_bg_and_stripes"
+    invariants = stripe_debug.get("invariants") or {}
+    assert invariants.get("background_support_equals_belt_bg") is True
+    assert invariants.get("surface_suppression_equals_bg_or_stripes") is True
+    assert invariants.get("stripes_excluded_from_background_fit") is True
+    assert int(invariants.get("baseline_above_source_pixel_count") or 0) == 0
+    assert int(invariants.get("negative_altitude_pixel_count") or 0) == 0
+    assert int(invariants.get("unknown_low_gradient_suppressed_pixel_count") or 0) == 0
+
+    segmentation_debug = json.loads((out / "segmentation_debug.json").read_text(encoding="utf-8"))
+    assert segmentation_debug.get("suppression_source") == "surface_suppression_mask"
+    assert int(segmentation_debug.get("unknown_low_gradient_suppressed_pixel_count") or 0) == 0
+
+
+def test_low_gradient_bg_and_stripes_runtime_trace_reflects_reused_units(tmp_path: Path) -> None:
+    _, payload = _run_low_gradient_bg_and_stripes_flow(
+        tmp_path,
+        session_id="synthetic_25d_bg_and_stripes_trace",
+    )
+
+    unit_results = (payload.get("processing_unit_trace") or {}).get("unit_results") or {}
+    # depth_plateaus and blob_components genuinely execute inline for this hybrid strategy
+    # (it calls the same _detect_depth_plateaus/_summarize_low_gradient_blobs functions the
+    # dedicated strategies use), so their trace status must not read "skipped".
+    assert unit_results.get("detect_belt_plane.depth_plateaus", {}).get("status") == "completed"
+    assert unit_results.get("detect_belt_plane.blob_components", {}).get("status") == "completed"
+    # blob_splitting and fragment_merge are NOT performed by this branch (no height-based
+    # splitting or weak-boundary merge occurs) — must remain "skipped", not be over-corrected.
+    assert unit_results.get("detect_belt_plane.blob_splitting", {}).get("status") == "skipped"
+    assert unit_results.get("detect_belt_plane.fragment_merge", {}).get("status") == "skipped"
+
+
+def test_low_gradient_bg_and_stripes_debug_counts_match_masks(tmp_path: Path) -> None:
+    out, payload = _run_low_gradient_bg_and_stripes_flow(
+        tmp_path,
+        session_id="synthetic_25d_bg_and_stripes_debug_counts",
+    )
+
+    assert payload.get("status") == "ok"
+    belt_bg = _load_mask_png(out / "belt_bg_mask.png")
+    stripes = _load_mask_png(out / "belt_stripes_mask.png")
+    unknown = _load_mask_png(out / "unknown_low_gradient_mask.png")
+    suppression = _load_mask_png(out / "surface_suppression_mask.png")
+
+    stripe_debug = json.loads((out / "belt_stripe_filter_debug.json").read_text(encoding="utf-8"))
+    surface_roles = stripe_debug.get("surface_roles") or {}
+    invariants = stripe_debug.get("invariants") or {}
+
+    assert int(surface_roles.get("belt_bg_pixels") or 0) == int(np.count_nonzero(belt_bg))
+    assert int(surface_roles.get("belt_stripe_pixels") or 0) == int(np.count_nonzero(stripes))
+    assert int(surface_roles.get("unknown_low_gradient_pixels") or 0) == int(np.count_nonzero(unknown))
+    assert int(surface_roles.get("suppression_pixels") or 0) == int(np.count_nonzero(suppression))
+    assert int(surface_roles.get("bg_stripe_overlap_pixels") or 0) == int(np.count_nonzero(belt_bg & stripes))
+    assert int(invariants.get("unknown_low_gradient_suppressed_pixel_count") or 0) == int(
+        np.count_nonzero(unknown & suppression)
+    )
+    assert int(invariants.get("raw_negative_altitude_pixel_count") or 0) >= int(
+        invariants.get("negative_altitude_pixel_count") or 0
+    )
+
+
+def test_low_gradient_bg_and_stripes_preserves_reference_support_and_objects(tmp_path: Path) -> None:
+    out, payload = _run_low_gradient_bg_and_stripes_flow(
+        tmp_path,
+        session_id="synthetic_25d_bg_and_stripes_support",
+    )
+
+    assert payload.get("status") == "ok"
+    belt_bg = _load_mask_png(out / "belt_bg_mask.png")
+    stripes = _load_mask_png(out / "belt_stripes_mask.png")
+    stripe_filtered = _load_mask_png(out / "stripe_filtered_reference_support_mask.png")
+    selected_support = _load_mask_png(out / "selected_reference_support_mask.png")
+    stripe_removed = _load_mask_png(out / "support_removed_by_stripe_filter.png")
+    model_support = _load_mask_png(out / "reference_model_support_mask.png")
+    suppression = _load_mask_png(out / "reference_suppression_mask.png")
+    final_objects = _load_mask_png(out / "final_object_mask.png")
+
+    assert np.array_equal(stripe_removed, selected_support & (~stripe_filtered))
+    assert np.array_equal(selected_support, stripe_filtered)
+    assert np.array_equal(model_support, belt_bg)
+    assert np.array_equal(suppression, belt_bg | stripes)
+    assert not np.any(final_objects & suppression)
+    assert int(np.count_nonzero(final_objects)) > 0
+
+
+def test_blob_height_cluster_strategy_emits_expected_debug_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_blob")
+
+    payload = run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={"detect_belt_plane": {"background_detection_strategy": "low_gradient_blob_height_clusters"}},
+    ).result_payload
+
+    assert payload.get("status") == "ok"
+    by_id = {item.get("artifact_id"): item for item in (payload.get("artifacts") or []) if isinstance(item, dict)}
+    out = data_dir / "processed" / take_id
+    for name in (
+        "low_gradient_blob_components_overlay.png",
+        "low_gradient_blob_id_mask.png",
+        "low_gradient_blob_summary.json",
+        "height_border_strength.png",
+        "height_border_cut_mask.png",
+        "height_border_fragments_overlay.png",
+        "height_border_fragments_mask.png",
+        "height_border_split_debug.json",
+        "fragment_merge_debug.json",
+        "height_split_blob_fragments_overlay.png",
+        "height_split_blob_fragments_mask.png",
+        "height_split_blob_id_mask.png",
+        "height_split_debug.json",
+        "height_consistent_blob_summary.json",
+        "blob_height_clusters.json",
+        "blob_cluster_score_table.csv",
+        "selected_blob_cluster_mask.png",
+        "selected_blob_cluster_pre_refine_mask.png",
+        "selected_blob_cluster_refined_mask.png",
+        "support_removed_by_candidate_refinement.png",
+        "support_added_by_candidate_refinement.png",
+        "support_removed_by_candidate_refinement_overlay.png",
+        "selected_blob_cluster_overlay.png",
+        "rejected_blob_clusters_mask.png",
+        "rejected_blob_clusters_overlay.png",
+        "blob_cluster_selection_debug.json",
+        "stripe_filtered_reference_support_mask.png",
+        "support_removed_by_stripe_filter.png",
+        "support_added_by_stripe_filter.png",
+        "support_removed_by_stripe_filter_overlay.png",
+        "reference_model_support_mask.png",
+        "support_removed_by_model_residual.png",
+        "support_added_by_model_expansion.png",
+        "support_removed_by_model_residual_overlay.png",
+        "support_removed_by_suppression_policy.png",
+        "support_added_by_suppression_policy.png",
+        "support_removed_by_suppression_policy_overlay.png",
+        "selected_support_lineage.json",
+        "component_formation_debug.json",
+        "height_border_detection_debug.json",
+        "candidate_support_refinement_debug.json",
+        "final_support_debug.json",
+        "support_loss_waterfall.json",
+    ):
+        assert (out / name).is_file(), name
+    for artifact_id in (
+        "component_formation_debug",
+        "height_border_detection_debug",
+        "candidate_support_refinement_debug",
+        "final_support_debug",
+        "support_loss_waterfall",
+        "final_selected_support_mask",
+        "reference_model",
+        "plane_residual_heatmap",
+    ):
+        assert artifact_id in by_id
+        assert by_id[artifact_id].get("stage_id") == "detect_belt_plane"
+        metadata = (by_id[artifact_id].get("metadata") or {}) if isinstance(by_id[artifact_id], dict) else {}
+        assert "substage_id" in metadata
+        assert "role" in metadata
+        assert "order_index" in metadata
+    assert (by_id["selected_reference_support_mask"].get("metadata") or {}).get("role") == "logical_support"
+    assert (by_id["reference_model_support_mask"].get("metadata") or {}).get("role") == "fit_support"
+    assert (by_id["reference_suppression_mask"].get("metadata") or {}).get("role") == "suppression_mask"
+    gradient_debug = json.loads((out / "gradient_debug.json").read_text(encoding="utf-8"))
+    assert gradient_debug.get("strategy") == "low_gradient_blob_height_clusters"
+    blob_rows = json.loads((out / "low_gradient_blob_summary.json").read_text(encoding="utf-8"))
+    assert isinstance(blob_rows, list)
+    lineage = json.loads((out / "selected_support_lineage.json").read_text(encoding="utf-8"))
+    assert lineage.get("strategy") == "low_gradient_blob_height_clusters"
+    assert [step.get("id") for step in lineage.get("steps") or []] == [
+        "selected_blob_cluster",
+        "candidate_refinement",
+        "stripe_suppression",
+        "reference_model_support",
+        "suppression_mask",
+    ]
+    steps = {str(step.get("id")): step for step in lineage.get("steps") or []}
+    model_step = steps["reference_model_support"]
+    assert "added_pixels" in model_step
+    assert "added_fraction" in model_step
+    assert "net_change_pixels" in model_step
+    assert "net_change_fraction" in model_step
+    assert model_step.get("change_type") in {"shrink", "expand", "same", "skipped", "alias", "unknown", "mixed"}
+    assert "largest_support_gain_step" in (lineage.get("summary") or {})
+    assert "largest_support_gain_fraction" in (lineage.get("summary") or {})
+
+    refined_mask = _load_mask_png(out / "selected_blob_cluster_refined_mask.png")
+    selected_support_mask = _load_mask_png(out / "selected_reference_support_mask.png")
+    stripe_removed_mask = _load_mask_png(out / "support_removed_by_stripe_filter.png")
+    stripe_added_mask = _load_mask_png(out / "support_added_by_stripe_filter.png")
+    assert np.array_equal(stripe_removed_mask, refined_mask & (~selected_support_mask))
+    assert np.array_equal(stripe_added_mask, selected_support_mask & (~refined_mask))
+
+    model_input_mask = _load_mask_png(out / "selected_reference_support_mask.png")
+    model_output_mask = _load_mask_png(out / "reference_model_support_mask.png")
+    model_removed_mask = _load_mask_png(out / "support_removed_by_model_residual.png")
+    model_added_mask = _load_mask_png(out / "support_added_by_model_expansion.png")
+    assert np.array_equal(model_removed_mask, model_input_mask & (~model_output_mask))
+    assert np.array_equal(model_added_mask, model_output_mask & (~model_input_mask))
+    assert int(np.count_nonzero(model_added_mask)) == int(model_step.get("added_pixels") or 0)
+    assert int(np.count_nonzero(model_output_mask) - np.count_nonzero(model_input_mask)) == int(model_step.get("net_change_pixels") or 0)
+    if blob_rows:
+        assert "blob_id" in blob_rows[0]
+        assert "median_z" in blob_rows[0]
+        assert "overlap_with_height_gate" in blob_rows[0]
+    fragment_rows = json.loads((out / "height_consistent_blob_summary.json").read_text(encoding="utf-8"))
+    assert isinstance(fragment_rows, list)
+    if fragment_rows:
+        assert "fragment_id" in fragment_rows[0]
+        assert "source_blob_id" in fragment_rows[0]
+        assert "was_split_from_blob" in fragment_rows[0]
+    split_debug = json.loads((out / "height_split_debug.json").read_text(encoding="utf-8"))
+    assert split_debug.get("strategy") == "low_gradient_blob_height_clusters"
+    assert split_debug.get("method") in {"disabled", "histogram_gap", "height_borders", "height_borders_then_histogram"}
+    assert "blobs" in split_debug
+    border_debug = json.loads((out / "height_border_split_debug.json").read_text(encoding="utf-8"))
+    assert border_debug.get("strategy") == "low_gradient_blob_height_clusters"
+    merge_debug = json.loads((out / "fragment_merge_debug.json").read_text(encoding="utf-8"))
+    assert merge_debug.get("strategy") == "low_gradient_blob_height_clusters"
+    support_loss_waterfall = json.loads((out / "support_loss_waterfall.json").read_text(encoding="utf-8"))
+    assert isinstance(support_loss_waterfall, list)
+    assert [row.get("row_id") for row in support_loss_waterfall[:4]] == [
+        "valid_roi",
+        "low_gradient_candidates",
+        "height_gate_candidates",
+        "component_candidates",
+    ]
+    fit_support_row = next(row for row in support_loss_waterfall if row.get("row_id") == "reference_model_fit_support")
+    assert "percent_valid_roi" in fit_support_row
+    assert fit_support_row.get("status") == "ok"
+    waterfall_meta = (by_id["support_loss_waterfall"].get("metadata") or {}) if isinstance(by_id["support_loss_waterfall"], dict) else {}
+    assert isinstance(waterfall_meta.get("rows"), list)
+    final_support_debug = json.loads((out / "final_support_debug.json").read_text(encoding="utf-8"))
+    assert "stripe_overlap_with_fit_support_px" in final_support_debug
+
+
+def test_blob_height_cluster_strategy_can_record_fallback(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_blob_fallback")
+
+    run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_cluster_min_total_pixels": 10_000_000,
+                "blob_cluster_fallback_strategy": "low_gradient_depth_plateaus",
+            },
+        },
+    )
+
+    out = data_dir / "processed" / take_id
+    gradient_debug = json.loads((out / "gradient_debug.json").read_text(encoding="utf-8"))
+    assert gradient_debug.get("strategy") == "low_gradient_blob_height_clusters"
+    assert gradient_debug.get("fallback_used") is True
+    assert gradient_debug.get("fallback_strategy") == "low_gradient_depth_plateaus"
+    split_debug = json.loads((out / "height_split_debug.json").read_text(encoding="utf-8"))
+    assert split_debug.get("enabled") is True
+
+
+def test_selected_support_lineage_records_skipped_candidate_refinement(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_lineage_skip")
+
+    run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_cluster_refine_by_mad": False,
+                "blob_cluster_refine_keep_border_support": False,
+            },
+        },
+    )
+
+    lineage = json.loads((data_dir / "processed" / take_id / "selected_support_lineage.json").read_text(encoding="utf-8"))
+    candidate_step = next(step for step in lineage.get("steps") or [] if step.get("id") == "candidate_refinement")
+    assert candidate_step.get("status") == "skipped"
+    assert candidate_step.get("net_change_pixels") == 0
+    assert candidate_step.get("change_type") in {"skipped", "alias"}
+
+
+def _blob_component_test_arrays(
+    *,
+    z_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    z = np.asarray(z_values, dtype=np.float32)
+    valid_mask = np.ones_like(z, dtype=bool)
+    low_grad_mask = np.ones_like(z, dtype=bool)
+    gradient = np.zeros_like(z, dtype=np.float32)
+    roi_mask = np.ones_like(z, dtype=bool)
+    return z, valid_mask, low_grad_mask, gradient, roi_mask
+
+
+def test_blob_component_mode_xy_only_uses_classic_connected_components() -> None:
+    z = np.zeros((40, 80), dtype=np.float32)
+    z[:, :40] = 100.0
+    z[:, 40:] = 130.0
+    z_arr, valid_mask, low_grad_mask, gradient, roi_mask = _blob_component_test_arrays(z_values=z)
+    xy_result = _summarize_low_gradient_blobs(
+        low_grad_mask=low_grad_mask,
+        gradient=gradient,
+        z=z_arr,
+        valid_mask=valid_mask,
+        roi_mask=roi_mask,
+        height_gate_mask=valid_mask,
+        min_component_area=1,
+        component_mode="xy_only",
+    )
+    assert xy_result.get("component_mode") == "xy_only"
+    assert int(np.max(xy_result["labels"])) == 1
+
+
+def test_height_aware_components_separate_sharp_touching_regions() -> None:
+    z = np.zeros((40, 80), dtype=np.float32)
+    z[:, :40] = 100.0
+    z[:, 40:] = 130.0
+    z_arr, valid_mask, low_grad_mask, gradient, roi_mask = _blob_component_test_arrays(z_values=z)
+    result = _summarize_low_gradient_blobs(
+        low_grad_mask=low_grad_mask,
+        gradient=gradient,
+        z=z_arr,
+        valid_mask=valid_mask,
+        roi_mask=roi_mask,
+        height_gate_mask=valid_mask,
+        min_component_area=1,
+        component_mode="height_aware",
+        blob_neighbor_z_tolerance_mm=3.0,
+        blob_component_min_area_px=1,
+        blob_component_use_smoothed_z=False,
+    )
+    assert result.get("component_mode") == "height_aware"
+    assert len(result.get("blobs") or []) == 2
+    debug = result.get("connectivity_debug") or {}
+    assert int(debug.get("rejected_neighbor_edges") or 0) >= 1
+
+
+def test_height_aware_components_keep_smooth_sloped_belt_connected() -> None:
+    z = np.zeros((20, 120), dtype=np.float32)
+    for x in range(120):
+        z[:, x] = 100.0 + 0.5 * x
+    z_arr, valid_mask, low_grad_mask, gradient, roi_mask = _blob_component_test_arrays(z_values=z)
+    result = _summarize_low_gradient_blobs(
+        low_grad_mask=low_grad_mask,
+        gradient=gradient,
+        z=z_arr,
+        valid_mask=valid_mask,
+        roi_mask=roi_mask,
+        height_gate_mask=valid_mask,
+        min_component_area=1,
+        component_mode="height_aware",
+        blob_neighbor_z_tolerance_mm=3.0,
+        blob_component_allow_gradual_slope=True,
+        blob_component_max_local_slope_mm_per_px=3.0,
+        blob_component_min_area_px=1,
+    )
+    assert len(result.get("blobs") or []) == 1
+
+
+def test_height_aware_tolerance_controls_component_count_and_rejected_edges() -> None:
+    z = np.zeros((20, 120), dtype=np.float32)
+    for x in range(120):
+        z[:, x] = 100.0 + 1.0 * x
+    z_arr, valid_mask, low_grad_mask, gradient, roi_mask = _blob_component_test_arrays(z_values=z)
+    loose = _summarize_low_gradient_blobs(
+        low_grad_mask=low_grad_mask,
+        gradient=gradient,
+        z=z_arr,
+        valid_mask=valid_mask,
+        roi_mask=roi_mask,
+        height_gate_mask=valid_mask,
+        min_component_area=1,
+        component_mode="height_aware",
+        blob_neighbor_z_tolerance_mm=3.0,
+        blob_component_min_area_px=1,
+    )
+    strict = _summarize_low_gradient_blobs(
+        low_grad_mask=low_grad_mask,
+        gradient=gradient,
+        z=z_arr,
+        valid_mask=valid_mask,
+        roi_mask=roi_mask,
+        height_gate_mask=valid_mask,
+        min_component_area=1,
+        component_mode="height_aware",
+        blob_neighbor_z_tolerance_mm=0.5,
+        blob_component_min_area_px=1,
+    )
+    loose_debug = loose.get("connectivity_debug") or {}
+    strict_debug = strict.get("connectivity_debug") or {}
+    assert len(strict.get("blobs") or []) >= len(loose.get("blobs") or [])
+    assert int(strict_debug.get("rejected_neighbor_edges") or 0) >= int(loose_debug.get("rejected_neighbor_edges") or 0)
+
+
+def test_height_aware_disabled_split_emits_expected_artifacts(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_blob_height_aware")
+    run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_component_mode": "height_aware",
+                "blob_split_method": "disabled",
+                "blob_split_by_height_enabled": False,
+            },
+        },
+    )
+    out = data_dir / "processed" / take_id
+    for name in (
+        "height_aware_blob_components_overlay.png",
+        "height_aware_blob_id_mask.png",
+        "height_aware_connectivity_rejected_edges.png",
+        "height_aware_connectivity_debug.json",
+        "low_gradient_blob_components_overlay.png",
+        "low_gradient_blob_summary.json",
+    ):
+        assert (out / name).is_file(), name
+    gradient_debug = json.loads((out / "gradient_debug.json").read_text(encoding="utf-8"))
+    assert gradient_debug.get("component_mode") == "height_aware"
+    assert gradient_debug.get("split_method") == "disabled"
+    connectivity_debug = json.loads((out / "height_aware_connectivity_debug.json").read_text(encoding="utf-8"))
+    assert connectivity_debug.get("parameters", {}).get("blob_component_mode") == "height_aware"
+
+
+def test_reference_audit_includes_height_aware_artifacts(tmp_path: Path) -> None:
+    from vision_3d_acquisition.debug.reference_audit import build_reference_audit_bundle
+
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_blob_audit")
+    run_ball_inspection_25d_flow(
+        data_dir,
+        take_id=take_id,
+        stage_params={
+            "detect_belt_plane": {
+                "background_detection_strategy": "low_gradient_blob_height_clusters",
+                "blob_component_mode": "height_aware",
+                "blob_split_method": "disabled",
+                "blob_split_by_height_enabled": False,
+            },
+        },
+    )
+    bundle = build_reference_audit_bundle(data_dir, take_id=take_id)
+    manifest = bundle.manifest
+    assert "height_aware_blob_components_overlay" in manifest.get("artifacts_found", [])
+    assert "height_aware_connectivity_debug" in manifest.get("artifacts_found", [])
+    assert bundle.output_dir.joinpath("04_blob_clusters/height_aware_connectivity_debug.json").is_file()
+
+
 def test_processing_artifacts_mark_display_only_vs_numeric_source(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
@@ -381,7 +1103,18 @@ def test_classification_explanation_has_decisive_rule_for_each_object(tmp_path: 
         assert len(decisive) >= 1
 
 
-def test_known_cube_correction_not_double_applied() -> None:
+def test_classification_explanation_includes_sphere_consistency_rules(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    take_id, _ = create_synthetic_25d_take(data_dir, session_id="synthetic_25d_demo")
+    run_ball_inspection_25d_flow(data_dir, take_id=take_id)
+    explanation = json.loads((data_dir / "processed" / take_id / "classification_explanation.json").read_text(encoding="utf-8"))
+    explained_objects = explanation.get("objects") or []
+    assert explained_objects
+    rule_ids = {str(rule.get("rule_id") or "") for obj in explained_objects for rule in (obj.get("rules") or [])}
+    assert "consistency.sphere_rmse_norm" in rule_ids
+    assert "consistency.sphere_radius_error" in rule_ids
+    assert "consistency.volume_fill_ratio" in rule_ids
+
     objects = [{
         "object_id": 1,
         "dimensions_mm": [10.0, 20.0, 30.0],
@@ -662,6 +1395,9 @@ def test_near_round_object_classifies_as_ball_after_correction() -> None:
         "contour_px": contour,
         "geometry_metric_context": {"x_resolution_mm": 1.0, "y_resolution_mm": 1.0},
         "height_above_belt_mm": {"max_height_mm": 2052.0, "mean_height_mm": 1742.0, "p95_height_mm": 2025.0, "height_std_mm": 220.0},
+        "footprint_geometry": {"radial_cv": 0.05},
+        "surface_geometry": {"sphere_fit_rmse_mm": 2.5},
+        "sphere_consistency": {"radial_height_rmse_mm": 2.0, "surface_completeness_ratio": 0.82},
     }]
     _apply_known_object_scale_correction(
         objects, scale_x=0.95, scale_y=0.2, scale_z=0.0365,

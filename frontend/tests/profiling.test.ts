@@ -249,6 +249,36 @@ test("pipeline discovery groups compatibility and auto-selection chooses best co
   assert.equal(rememberedRgb?.id, "mining_steel_ball_classification_2d");
 });
 
+test("artifact list backfills detect-reference semantic metadata for older runs", () => {
+  const detail = {
+    result: {
+      artifacts: [
+        {
+          artifact_id: "reference_model_support_mask",
+          stage_id: "detect_belt_plane",
+          kind: "image",
+          title: "Reference-model fit support",
+          metadata: {},
+        },
+        {
+          artifact_id: "support_loss_waterfall",
+          stage_id: "detect_belt_plane",
+          kind: "table",
+          title: "Support-loss waterfall",
+          metadata: {},
+        },
+      ],
+    },
+  } as any;
+
+  const [fitSupport, waterfall] = artifactList(detail);
+  assert.equal(fitSupport.metadata?.substage_id, "final_support");
+  assert.equal(fitSupport.metadata?.role, "fit_support");
+  assert.equal(fitSupport.metadata?.is_authoritative_for_fit, true);
+  assert.equal(waterfall.metadata?.semantic_type, "support_loss_waterfall");
+  assert.equal(waterfall.metadata?.order_index, 11);
+});
+
 test("take status compaction hides generic and marks unavailable families", () => {
   const compactRgb = compactTakeFamilyStatus(
     [
@@ -538,7 +568,7 @@ test("stage resolver maps segmentation artifacts from process runs", () => {
 
 
 test("product navigation exposes top-level platform workspaces", () => {
-  assert.deepEqual(PRODUCT_NAV_ITEMS.map((item) => item.label), ["Operations", "Studio", "Datasets", "Classifiers", "Runtime", "Calibration", "Diagnostics"]);
+  assert.deepEqual(PRODUCT_NAV_ITEMS.map((item) => item.label), ["Operations", "Studio", "Validation", "Datasets", "Classifiers", "Feature Analytics", "Runtime", "Calibration", "Diagnostics"]);
   assert.equal(productAreaForPath("/operator"), "operations");
   assert.equal(productAreaForPath("/operator/inspection"), "operations");
   assert.equal(productAreaForPath("/processing-lab"), "studio");

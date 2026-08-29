@@ -1,3 +1,5 @@
+import { featureAnalyticsQueryToSearchParams } from "../featureAnalyticsQuery";
+
 export type Decision = "accept" | "reject" | "review";
 export type TakeStatus = "incoming" | "processed" | "failed";
 export type ProcessingMode = "mock" | "real";
@@ -271,6 +273,63 @@ export interface ProcessingJobCreateRequest {
   scope_type?: ProcessingJobScopeType | null;
 }
 
+export type FeatureJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "partial";
+export type FeatureJobScope = "ml_set" | "dataset" | "takes";
+export type FeatureJobMode = "reprocess" | "backfill";
+
+export interface FeatureJobRequest {
+  scope: FeatureJobScope;
+  dataset_id?: string;
+  ml_set_id?: string;
+  take_ids?: string[];
+  feature_key: string;
+  mode: FeatureJobMode;
+  pipeline_id?: string;
+  only_missing?: boolean;
+}
+
+export interface FeatureJobItem {
+  take_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "skipped" | "cancelled";
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  skipped_reason?: string | null;
+  values_written?: number;
+}
+
+export interface FeatureJobRecord {
+  id: string;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  status: FeatureJobStatus;
+  scope: FeatureJobScope;
+  dataset_id?: string | null;
+  ml_set_id?: string | null;
+  feature_key: string;
+  feature_display_name: string;
+  mode: FeatureJobMode;
+  pipeline_id?: string | null;
+  only_missing: boolean;
+  total_takes: number;
+  completed_takes: number;
+  failed_takes: number;
+  skipped_takes: number;
+  values_written: number;
+  current_take_id?: string | null;
+  summary?: Record<string, unknown>;
+  error_summary?: Array<Record<string, unknown>>;
+  take_items?: FeatureJobItem[];
+  cancelled_at?: string | null;
+}
+
+export interface FeatureJobResponse {
+  job_id: string;
+  status: FeatureJobStatus;
+  job: FeatureJobRecord;
+}
+
 export interface RuntimeRoutingState {
   live_routing: Record<string, unknown> | null;
   persistent_default: Record<string, unknown> | null;
@@ -365,6 +424,379 @@ export interface PipelineStageInfo {
   parameter_schema?: Record<string, unknown>;
 }
 
+export interface ProcessingUnitDefinition {
+  id: string;
+  label: string;
+  kind: "stage" | "substage" | "utility" | string;
+  parent_id?: string | null;
+  stage_id: string;
+  category: string;
+  order: number;
+  description: string;
+  inputs: Array<{
+    id: string;
+    label: string;
+    artifact_id?: string | null;
+    kind?: string | null;
+    coordinate_space?: string | null;
+    units?: string | null;
+    required?: boolean;
+    description?: string | null;
+  }>;
+  outputs: Array<{
+    id: string;
+    label: string;
+    artifact_id?: string | null;
+    kind?: string | null;
+    coordinate_space?: string | null;
+    units?: string | null;
+    description?: string | null;
+  }>;
+  artifacts: Array<{
+    id: string;
+    label: string;
+    artifact_id: string;
+    kind: string;
+    role: string;
+    renderer: string;
+    description?: string | null;
+    produced_by?: string | null;
+    source_artifact_id?: string | null;
+    coordinate_space?: string | null;
+    aliases?: string[];
+    feeds_into?: string[];
+  }>;
+  parameters: Array<{
+    id: string;
+    label: string;
+    type: string;
+    default?: unknown;
+    min?: number | null;
+    max?: number | null;
+    options?: string[] | null;
+    advanced?: boolean;
+    affects?: string[];
+    description?: string | null;
+    tuning_hint?: string | null;
+    active_when?: Record<string, unknown> | null;
+    group?: string | null;
+    unit?: string | null;
+    step?: number | null;
+    nullable?: boolean;
+  }>;
+  diagnostics: string[];
+  views: Array<{
+    id: string;
+    label: string;
+    renderer_type: string;
+    artifact_ids: string[];
+    description?: string | null;
+    empty_state?: string | null;
+  }>;
+  default_view?: string | null;
+  help_markdown?: string | null;
+  enabled_by_default?: boolean;
+  strategy_keys?: string[];
+  supports_preview?: boolean;
+  supports_partial_rerun?: boolean;
+  controlled_by?: string[];
+  parameter_groups?: Array<{
+    id: string;
+    label: string;
+    param_keys?: string[];
+    description?: string | null;
+    affects?: string[];
+  }>;
+  downstream_effects?: string[];
+  tuning_hints?: Array<{ condition: string; actions: string[] }>;
+}
+
+export interface PipelineRecipe {
+  recipe_id: string;
+  name: string;
+  description?: string | null;
+  pipeline_id: string;
+  pipeline_family?: string | null;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  parent_recipe_id?: string | null;
+  tags: string[];
+  notes?: string | null;
+  processing_unit_contract_version?: string | null;
+  processing_unit_contract_fingerprint?: string | null;
+  parameters_by_unit?: Record<string, Record<string, unknown>>;
+  stage_params?: Record<string, unknown>;
+  unit_enabled_state?: Record<string, unknown>;
+  artifact_policy?: Record<string, unknown>;
+  calibration_snapshot_reference?: Record<string, unknown>;
+  provenance?: Record<string, unknown>;
+  archived?: boolean;
+  compatibility?: "compatible" | "compatible_with_warnings" | "incompatible" | string;
+  validation_warnings?: string[];
+  validation_errors?: string[];
+}
+
+export interface PipelineComparisonSource {
+  type: "run" | "recipe" | "current" | string;
+  label?: string | null;
+  take_id?: string | null;
+  run_id?: string | null;
+  recipe_id?: string | null;
+  recipe_version?: number | null;
+}
+
+export interface PipelineComparisonRow {
+  id?: string;
+  parameter_id?: string;
+  artifact_id?: string;
+  label: string;
+  left: unknown;
+  right: unknown;
+  status: "changed" | "unchanged" | "added" | "removed" | string;
+}
+
+export interface PipelineArtifactComparisonRow {
+  artifact_id: string;
+  label: string;
+  kind?: string | null;
+  left_present: boolean;
+  right_present: boolean;
+  left_path?: string | null;
+  right_path?: string | null;
+  left_url?: string | null;
+  right_url?: string | null;
+  diffable?: boolean;
+  same_dimensions?: boolean | null;
+  left_dimensions?: { width: number; height: number } | null;
+  right_dimensions?: { width: number; height: number } | null;
+  diff_available: boolean;
+  diff_type?: "binary_mask" | "image_metadata" | "json_numeric" | string | null;
+  diff_reason?: string | null;
+  pixel_diff?: {
+    width: number;
+    height: number;
+    total_pixels: number;
+    changed_pixels: number;
+    changed_percent: number;
+    left_active_pixels: number;
+    right_active_pixels: number;
+    added_pixels: number;
+    removed_pixels: number;
+    intersection_pixels: number;
+    union_pixels: number;
+    iou: number;
+    added_percent_of_union?: number;
+    removed_percent_of_union?: number;
+  } | null;
+  diff_artifacts?: Record<string, { path: string; url: string }>;
+  status: "changed" | "unchanged" | string;
+}
+
+export interface PipelineComparisonUnit {
+  label: string;
+  stage_id: string;
+  kind: string;
+  order: number;
+  has_changes: boolean;
+  parameter_diff: Array<{
+    parameter_id: string;
+    label: string;
+    left: unknown;
+    right: unknown;
+    status: "changed" | "unchanged" | "added" | "removed" | string;
+  }>;
+  artifact_diff: PipelineArtifactComparisonRow[];
+  metric_diff: PipelineComparisonRow[];
+  diagnostic_diff: PipelineComparisonRow[];
+}
+
+export interface PipelineComparisonResponse {
+  comparison_id: string;
+  pipeline_id: string;
+  contract_fingerprint?: string | null;
+  left: PipelineComparisonSource;
+  right: PipelineComparisonSource;
+  summary: {
+    parameter_changes: number;
+    artifact_changes: number;
+    metric_changes: number;
+    classification_changed: boolean;
+    warnings_changed: boolean;
+    left_object_count?: number | null;
+    right_object_count?: number | null;
+    left_status?: string | null;
+    right_status?: string | null;
+    key_affected_units: string[];
+    mask_artifacts_compared?: number;
+    mask_artifacts_changed?: number;
+    largest_changed_artifact?: string | null;
+    largest_changed_unit?: string | null;
+    average_iou?: number | null;
+    object_count_changed?: boolean;
+    what_changed_most?: PipelineComparisonChangeSummary | null;
+  };
+  units: Record<string, PipelineComparisonUnit>;
+  warnings?: string[];
+}
+
+export interface PartialRerunPlanResponse {
+  pipeline_id: string;
+  safe: boolean;
+  mode: string;
+  selected_unit_id: string;
+  selected_stage_id?: string | null;
+  effective_start_stage_id?: string | null;
+  execution_boundary_unit_id?: string | null;
+  selection_policy?: string;
+  suggested_mode?: string;
+  fallback_mode?: string | null;
+  stages_to_reuse?: string[];
+  stages_to_rerun?: string[];
+  stages_invalidated?: string[];
+  units_to_reuse: string[];
+  units_to_rerun: string[];
+  units_invalidated: string[];
+  required_missing_artifacts: string[];
+  reusable_artifacts?: string[];
+  warnings: string[];
+  blocking_reasons: string[];
+  changed_unit_ids?: string[];
+  changed_parameters?: Record<string, Record<string, unknown>>;
+  contract_fingerprint_match?: boolean | null;
+  calibration_match?: boolean | null;
+  parent_trace_source?: string | null;
+  explanation?: {
+    summary?: string | null;
+    selected_unit_reason?: string | null;
+    boundary_reason?: string | null;
+    reuse_reason?: string | null;
+    rerun_reason?: string | null;
+    fallback_reason?: string | null;
+  };
+  plan_quality?: string;
+  confidence?: string;
+  plan_id?: string | null;
+  created_at?: string | null;
+  plan_path?: string | null;
+}
+
+export interface PartialRerunPlanListEntry {
+  plan_id?: string | null;
+  created_at?: string | null;
+  pipeline_id?: string | null;
+  selected_unit_id?: string | null;
+  execution_boundary_unit_id?: string | null;
+  safe?: boolean;
+  mode?: string | null;
+  fallback_mode?: string | null;
+  plan_quality?: string | null;
+  confidence?: string | null;
+  plan_path?: string | null;
+}
+
+export interface PartialRerunExecuteResponse {
+  ok: boolean;
+  safe: boolean;
+  can_execute: boolean;
+  pipeline_id: string;
+  take_id?: string | null;
+  child_run_id?: string | null;
+  parent_run_id?: string | null;
+  execution_mode?: string | null;
+  boundary_unit_id?: string | null;
+  boundary_stage_id?: string | null;
+  reused_units?: string[];
+  rerun_units?: string[];
+  invalidated_units?: string[];
+  comparison_id?: string | null;
+  result_path?: string | null;
+  warnings?: string[];
+  blocking_reasons?: string[];
+  fallback_mode?: string | null;
+  partial_rerun_plan_id?: string | null;
+  partial_rerun_plan?: PartialRerunPlanResponse | Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+}
+
+export interface PipelineRunEntry {
+  run_id: string;
+  run_type: "full_run" | "partial_rerun" | "legacy_3d_result";
+  execution_mode?: string | null;
+  pipeline_family?: string | null;
+  pipeline_id?: string | null;
+  parent_run_id?: string | null;
+  parent_take_id?: string | null;
+  boundary_stage_id?: string | null;
+  boundary_unit_id?: string | null;
+  selected_unit_id?: string | null;
+  partial_rerun_plan_id?: string | null;
+  comparison_id?: string | null;
+  recipe_id?: string | null;
+  recipe_version_id?: string | null;
+  created_at?: string | null;
+  status?: string | null;
+  summary?: {
+    reused_units?: number;
+    rerun_units?: number;
+    invalidated_units?: number;
+    changed_parameters?: number;
+    classification_label?: string | null;
+    classification_superclass?: string | null;
+    object_count?: number | null;
+  } | null;
+}
+
+export interface PipelineRunLineage {
+  pipeline_id: string;
+  run_id: string;
+  parent: PipelineRunEntry | null;
+  children: PipelineRunEntry[];
+  comparison_id: string | null;
+}
+
+export interface PipelineComparisonChangeSummary {
+  top_changed_unit?: {
+    unit_id?: string | null;
+    label?: string | null;
+    mask_changed_percent?: number | null;
+    parameter_changes?: Array<{
+      parameter_id?: string | null;
+      label?: string | null;
+      left?: unknown;
+      right?: unknown;
+    }>;
+  } | null;
+  top_changed_artifact?: {
+    artifact_id?: string | null;
+    label?: string | null;
+    unit_id?: string | null;
+    unit_label?: string | null;
+    changed_percent?: number | null;
+  } | null;
+  classification_changed?: boolean;
+  object_count_changed?: boolean;
+  warnings_changed?: boolean;
+}
+
+export interface PipelineComparisonIndexEntry {
+  comparison_id: string;
+  created_at?: string | null;
+  pipeline_id?: string | null;
+  left?: PipelineComparisonSource;
+  right?: PipelineComparisonSource;
+  summary?: {
+    parameter_changes?: number;
+    artifact_changes?: number;
+    metric_changes?: number;
+    classification_changed?: boolean;
+    object_count_changed?: boolean;
+    warnings_changed?: boolean;
+    what_changed_most?: PipelineComparisonChangeSummary | null;
+  };
+  comparison_json_path?: string | null;
+}
+
 export interface PipelineInfo {
   id: string;
   name: string;
@@ -380,6 +812,8 @@ export interface PipelineInfo {
   implemented: boolean;
   description?: string;
   stages: PipelineStageInfo[];
+  processing_units?: ProcessingUnitDefinition[];
+  processing_unit_registry_version?: string;
   composition?: {
     execution_order?: string[];
     artifact_flow?: Record<string, string[]>;
@@ -503,6 +937,7 @@ export interface TakeSummaryPage {
 
 export interface TakeBulkFilters {
   dataset_id?: string;
+  ml_set_id?: string;
   session_id?: string;
   validation_status?: string;
   search?: string;
@@ -512,6 +947,11 @@ export interface TakeBulkFilters {
   split?: string;
   expected_class?: string;
   calibration_linkage_only?: boolean;
+  physical_object_id?: string;
+  raw_label?: string;
+  normalized_class?: string;
+  superclass?: string;
+  membership_status?: string;
 }
 
 export interface TakeBulkMetadataRequest {
@@ -661,6 +1101,98 @@ export interface MLSetSummaryResponse {
   exports: Record<string, string>;
 }
 
+export interface MLSetMemberRow {
+  dataset_id: string;
+  ml_set_id: string;
+  take_id: string;
+  take_name?: string | null;
+  created_at?: string | null;
+  thumbnail_path?: string | null;
+  physical_object_id?: string | null;
+  raw_label?: string | null;
+  normalized_class?: string | null;
+  superclass?: string | null;
+  review_required: boolean;
+  default_trainable: boolean;
+  trainable: boolean;
+  include: boolean;
+  split: string;
+  validation_status?: string | null;
+  session_id?: string | null;
+  session_name?: string | null;
+  processing_ready: boolean;
+  feature_ready: boolean;
+  processed_class_label?: string | null;
+  processed_superclass?: string | null;
+  warnings: string[];
+  warning_count: number;
+  label_provenance: {
+    raw_label?: string | null;
+    expected_label?: string | null;
+    normalized_class?: string | null;
+    superclass?: string | null;
+    normalization_version?: string | null;
+    source_row?: string | null;
+    label_policy?: string | null;
+  };
+  feature_summary: {
+    processed_class_label?: string | null;
+    processed_superclass?: string | null;
+    processing_by_family?: TakeSummary["processing_by_family"];
+  };
+}
+
+export interface MLSetMembersResponse {
+  ml_set: DatasetMlSet & Record<string, unknown>;
+  dataset: DatasetSummary;
+  items: MLSetMemberRow[];
+  filtered_count: number;
+  total_count: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  next_offset?: number | null;
+  stats: {
+    member_count: number;
+    object_count: number;
+    review_required_count: number;
+  };
+}
+
+export interface MLSetReviewFacetOption {
+  value: string;
+  count: number;
+}
+
+export interface MLSetReviewObjectFacetOption {
+  value: string;
+  take_count: number;
+  normalized_class?: string | null;
+  superclass?: string | null;
+}
+
+export interface MLSetReviewSessionFacetOption {
+  value: string;
+  name?: string | null;
+  count: number;
+}
+
+export interface MLSetReviewFacetsResponse {
+  ml_set: DatasetMlSet & Record<string, unknown>;
+  dataset: DatasetSummary;
+  stats: {
+    member_count: number;
+    object_count: number;
+  };
+  object_ids: MLSetReviewObjectFacetOption[];
+  raw_labels: MLSetReviewFacetOption[];
+  normalized_classes: MLSetReviewFacetOption[];
+  superclasses: MLSetReviewFacetOption[];
+  splits: MLSetReviewFacetOption[];
+  membership_statuses: MLSetReviewFacetOption[];
+  sessions: MLSetReviewSessionFacetOption[];
+}
+
 export interface PhysicalObjectSummary {
   physical_object_id: string;
   dataset_id: string;
@@ -722,8 +1254,21 @@ export interface IngestionRun {
   policy?: Record<string, unknown>;
 }
 
+export interface PartialExecutionSummary {
+  reused_artifact_count: number;
+  reused_artifact_bytes: number;
+  rerun_artifact_count: number;
+  partial_execution_duration_ms: number;
+  boundary_stage_id: string | null;
+  parent_run_id: string | null;
+}
+
 export interface ProcessingResult {
   take_id: string;
+  run_id?: string | null;
+  parent_run_id?: string | null;
+  execution_mode?: string | null;
+  partial_execution_summary?: PartialExecutionSummary | null;
   processed_at: string;
   processing_mode: ProcessingMode;
   processing_engine?: "legacy" | "native" | "mock" | null;
@@ -740,7 +1285,7 @@ export interface ProcessingResult {
     required_modalities: CaptureModality[];
     optional_modalities?: CaptureModality[];
     stages?: PipelineStageInfo[];
-    processing_units?: PipelineStageInfo[];
+    processing_units?: ProcessingUnitDefinition[];
     composition?: PipelineInfo["composition"];
   } | null;
   stage_outputs?: Array<{
@@ -924,6 +1469,66 @@ export interface ProcessingResult {
   rejected_objects?: ProcessingResult["objects"];
   poc_summary?: PocRunSummary | null;
   calibration_diagnostics?: Record<string, unknown> | null;
+  stage_params?: Record<string, unknown>;
+  recipe_snapshot?: Record<string, unknown> | null;
+  processing_unit_trace?: {
+    pipeline_id?: string | null;
+    registry_version?: string | null;
+    trace_source?: string | null;
+    trace_precision?: string | null;
+    trace_summary?: {
+      total_units?: number;
+      runtime_traced_units?: number;
+      inferred_units?: number;
+      failed_units?: number;
+      warning_units?: number;
+      trace_coverage_percent?: number;
+      coverage_by_stage?: Record<string, {
+        total_units?: number;
+        runtime_traced_units?: number;
+        inferred_units?: number;
+        failed_units?: number;
+        warning_units?: number;
+        trace_coverage_percent?: number;
+      }> | null;
+    } | null;
+    units?: Record<string, {
+      unit_id?: string;
+      stage_id?: string;
+      parent_id?: string | null;
+      status: string;
+      started_at?: string | null;
+      completed_at?: string | null;
+      duration_ms?: number | null;
+      parameters_used?: Record<string, unknown>;
+      input_artifacts?: string[];
+      output_artifacts?: string[];
+      metrics?: Record<string, unknown>;
+      diagnostics?: Record<string, unknown>;
+      warnings?: string[];
+      errors?: string[];
+      trace_source?: string | null;
+      trace_precision?: string | null;
+    }>;
+    unit_results?: Record<string, {
+      status: string;
+      unit_id?: string;
+      stage_id?: string;
+      parent_id?: string | null;
+      started_at?: string | null;
+      completed_at?: string | null;
+      duration_ms?: number | null;
+      parameters_used?: Record<string, unknown>;
+      input_artifacts?: string[];
+      output_artifacts?: string[];
+      metrics?: Record<string, unknown>;
+      diagnostics?: Record<string, unknown>;
+      warnings?: string[];
+      errors?: string[];
+      trace_source?: string | null;
+      trace_precision?: string | null;
+    }>;
+  } | null;
   session_id?: string | null;
   frameset_id?: string | null;
   runtime_acquisition?: Record<string, unknown> | null;
@@ -1043,18 +1648,41 @@ export interface DatasetSessionSummary {
 }
 
 export interface FeatureDefinition {
+  key?: string;
   feature_key: string;
   display_name: string;
   semantic_group: string;
+  family?: string;
+  family_label?: string;
   unit?: string | null;
   description?: string | null;
   source_stage?: string | null;
+  studio_stage?: string | null;
   source_metric_path?: string | null;
+  formula?: string | null;
+  algorithm_summary?: string | null;
+  inputs?: string[];
+  interpretation?: string | null;
+  caveats?: string[];
+  stable_schema?: boolean;
+  diagnostic_only?: boolean;
+  experimental?: boolean;
+  higher_is_worse?: boolean | null;
+  expected_range?: number[] | null;
+  display_precision?: number | null;
+  preferred_chart_scale?: "linear" | "log" | string | null;
+  legacy_aliases?: string[];
 }
 
 export interface FeatureAnalyticsFeaturesResponse {
   record_count: number;
   object_count: number;
+  scope_summary: {
+    record_count: number;
+    take_count: number;
+    physical_object_count: number;
+    object_count: number;
+  };
   feature_definitions: FeatureDefinition[];
 }
 
@@ -1092,11 +1720,40 @@ export interface FeatureAnalyticsObject {
   pipeline_id?: string | null;
   run_id?: string | null;
   stage_id?: string | null;
+  labeled_superclass?: string | null;
+  labeled_superclass_source?: string | null;
+  labeled_superclass_unresolved?: boolean | null;
+  normalized_class?: string | null;
+  processed_superclass?: string | null;
+  processed_class?: string | null;
+  processed_label?: string | null;
   superclass?: string | null;
+  raw_labels?: string[];
   labels?: string[];
+  validation_status?: string | null;
+  split?: string | null;
   feature_value: number;
+  feature_source?: string | null;
+  confidence?: number | null;
   timestamp?: string | null;
   annotation?: Record<string, unknown> | null;
+}
+
+export interface FeatureAnalyticsThumbnailInfo {
+  requested_mode: "auto" | "heightmap" | "reflectance" | "classification_overlay";
+  resolved_source:
+    | "heightmap"
+    | "normalized_heightmap"
+    | "reflectance"
+    | "source_crop"
+    | "classification_overlay"
+    | "take_thumbnail"
+    | "placeholder";
+  resolved_artifact_id?: string | null;
+  resolved_artifact_path?: string | null;
+  colorized: boolean;
+  fallback_used: boolean;
+  fallback_reason?: string | null;
 }
 
 export interface FeatureAnalyticsObjectsResponse {
@@ -1105,7 +1762,44 @@ export interface FeatureAnalyticsObjectsResponse {
   max_value?: number | null;
   limit: number;
   objects: FeatureAnalyticsObject[];
+  scope_summary: FeatureAnalyticsFeaturesResponse["scope_summary"];
   stats: FeatureAnalyticsDistributionResponse["stats"];
+}
+
+export interface FeatureAnalyticsQuery {
+  dataset_id?: string;
+  ml_set_id?: string;
+  session_id?: string;
+  physical_object_ids?: string[];
+  take_ids?: string[];
+  labeled_superclasses?: string[];
+  processed_superclasses?: string[];
+  raw_labels?: string[];
+  normalized_classes?: string[];
+  processed_classes?: string[];
+  superclasses?: string[];
+  validation_status?: string[];
+  split?: string[];
+  pipeline_id?: string;
+  calibration_id?: string;
+  date_from?: string;
+  date_to?: string;
+}
+
+export interface FeatureAnalyticsFilterOptionsResponse {
+  raw_labels: string[];
+  normalized_classes: string[];
+  labeled_superclasses: string[];
+  processed_superclasses: string[];
+  processed_classes: string[];
+  superclasses: string[];
+  physical_object_ids: string[];
+  take_ids: string[];
+  validation_statuses: string[];
+  splits: string[];
+  pipeline_ids: string[];
+  calibration_ids: string[];
+  stats: FeatureAnalyticsFeaturesResponse["scope_summary"];
 }
 
 export interface MLDatasetSummary {
@@ -1564,6 +2258,19 @@ export interface SegmentationPreviewResponse {
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
+export interface ValidationBaseline {
+  id: string; version: number; status: "active" | "inactive" | string;
+  take_id: string; pipeline_id: string; source_run_id: string; stage_id?: string | null;
+  processing_unit_id?: string | null; view_id?: string | null; artifact_id?: string | null;
+  review?: { notes?: string; reviewed_at?: string; reviewed_by?: string | null };
+}
+export type ValidationResolutionMode = "active" | "pinned" | "allowed_versions";
+export interface ValidationBaselineResolution { mode: ValidationResolutionMode; baseline_id?: string | null; allowed_baseline_ids?: string[]; }
+export interface ValidationSuiteCase { id: string; take_id: string; baseline_ids: string[]; baseline_resolution?: ValidationBaselineResolution; enabled: boolean; tags: string[]; notes: string; included_artifacts?: string[]; }
+export interface ValidationSuiteDetail { id: string; name: string; description: string; pipeline_id: string; status: string; cases: ValidationSuiteCase[]; }
+export interface ValidationCoverageArea { area: string; approved: number; missing: number; stale: number; unsupported: number; visual_only: number; coverage_fraction: number; }
+export interface ValidationPromotionResponse { baseline: ValidationBaseline; already_promoted: boolean; previous_active_baseline: ValidationBaseline | null; resulting_active_baseline: ValidationBaseline | null; affected_case_resolution: Record<string, Array<{ suite_id: string; case_id: string }>>; }
+
 async function request<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`);
   if (!response.ok) {
@@ -1632,11 +2339,47 @@ export function runtimePreviewUrl(cacheKey?: string | number): string {
   return `${API_BASE_URL}/api/runtime/preview${suffix}`;
 }
 
-export function objectThumbnailUrl(takeId: string, objectId: string | number, size = 56): string {
-  return `${API_BASE_URL}/api/takes/${encodeURIComponent(takeId)}/objects/${encodeURIComponent(String(objectId))}/thumbnail?size=${encodeURIComponent(String(size))}`;
+export function objectThumbnailUrl(
+  takeId: string,
+  objectId: string | number,
+  size = 56,
+  mode: "auto" | "heightmap" | "reflectance" | "classification_overlay" = "auto",
+  semanticGroup?: string | null,
+): string {
+  const params = new URLSearchParams({
+    size: String(size),
+    mode,
+  });
+  if (semanticGroup) params.set("semantic_group", semanticGroup);
+  return `${API_BASE_URL}/api/takes/${encodeURIComponent(takeId)}/objects/${encodeURIComponent(String(objectId))}/thumbnail?${params.toString()}`;
 }
 
 export const api = {
+  validationBaselines: (takeId?: string, pipelineId?: string) => {
+    const query = new URLSearchParams(); if (takeId) query.set("take_id", takeId); if (pipelineId) query.set("pipeline_id", pipelineId);
+    return request<ValidationBaseline[]>(`/api/validation/baselines${query.size ? `?${query}` : ""}`);
+  },
+  approveValidationBaseline: (payload: Record<string, unknown>) => post<{ baselines: ValidationBaseline[]; included: string[]; skipped: Array<Record<string, unknown>> }>("/api/validation/baselines", payload),
+  compareValidationBaseline: (baselineId: string, candidateRunId: string) => post<Record<string, unknown>>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/compare?candidate_run_id=${encodeURIComponent(candidateRunId)}`, {}),
+  deactivateValidationBaseline: (baselineId: string) => post<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/deactivate`, {}),
+  validationSuites: () => request<Array<{ id: string; name: string; pipeline_id: string; status: string }>>("/api/validation/suites"),
+  validationSuite: (suiteId: string) => request<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}`),
+  createValidationSuite: (payload: { name: string; pipeline_id: string; description?: string }) => post<ValidationSuiteDetail>("/api/validation/suites", payload),
+  updateValidationSuite: (suiteId: string, payload: Partial<Pick<ValidationSuiteDetail, "name" | "description" | "status">>) => fetch(`${API_BASE_URL}/api/validation/suites/${encodeURIComponent(suiteId)}`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) }).then(async response => { if (!response.ok) throw new Error(await response.text()); return response.json() as Promise<ValidationSuiteDetail>; }),
+  duplicateValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/duplicate`, {}),
+  archiveValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/archive`, {}),
+  restoreValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/restore`, {}),
+  validationCoverage: (suiteId: string) => request<{ suite_id: string; case_count: number; areas: ValidationCoverageArea[] }>(`/api/validation/suites/${encodeURIComponent(suiteId)}/coverage`),
+  validationSuiteExecutions: (suiteId: string) => request<Array<Record<string, unknown>>>(`/api/validation/suites/${encodeURIComponent(suiteId)}/executions`),
+  validationBaselineHistory: (params?: { take_id?: string; pipeline_id?: string; artifact_id?: string }) => {
+    const query=new URLSearchParams(); Object.entries(params ?? {}).forEach(([key,value]) => { if (value) query.set(key,value); });
+    return request<ValidationBaseline[]>(`/api/validation/baselines/history${query.size ? `?${query}` : ""}`);
+  },
+  promoteValidationComparison: (executionId: string, comparisonId: string, payload: { case_id: string; activate?: boolean; notes?: string; carry_forward_policy?: boolean; reviewed_by?: string }) => post<ValidationPromotionResponse>(`/api/validation/executions/${encodeURIComponent(executionId)}/comparisons/${encodeURIComponent(comparisonId)}/promote`, payload),
+  validationExecutions: () => request<Array<Record<string, unknown>>>("/api/validation/executions"),
+  validationExecution: (executionId: string) => request<Record<string, unknown>>(`/api/validation/executions/${encodeURIComponent(executionId)}`),
+  validationMatrix: (executionId: string) => request<{ execution_id: string; columns: Array<{ id:string; label:string; stage_id:string; order:number }>; rows: Array<{ case_id:string; take_id:string; overall_status:string; cells:Array<{ column_id:string; status:string; comparison_ids:Array<string | null>; first_divergence:boolean; artifact_id?:string | null }> }> }>(`/api/validation/executions/${encodeURIComponent(executionId)}/matrix`),
+  runValidationSuite: (suiteId: string, candidateRunId = "latest") => post<Record<string, unknown>>(`/api/validation/suites/${encodeURIComponent(suiteId)}/execute`, { candidate_run_id: candidateRunId }),
   health: () => request<HealthResponse>("/api/health"),
   state: () => request<RuntimeState>("/api/state"),
   runtimePreviewMetadata: () => request<RuntimePreviewMetadata>("/api/runtime/preview/metadata"),
@@ -1810,45 +2553,33 @@ export const api = {
     request<{ takes: Array<{ session_id: string; take_id: string; metadata: Record<string, unknown> }> }>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/takes?dataset_id=${encodeURIComponent(datasetId)}`),
   physicalObjectRepeatability: (physicalObjectId: string, datasetId: string) =>
     request<Record<string, unknown>>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/repeatability?dataset_id=${encodeURIComponent(datasetId)}`),
-  featureAnalyticsFeatures: (params: {
-    datasets?: string;
-    sessions?: string;
-    labels?: string;
-    superclass?: string;
-    validation_status?: string;
-    split?: string;
-    pipeline?: string;
-    calibration?: string;
-    date_from?: string;
-    date_to?: string;
-    feature_selection?: string;
-  }) => {
-    const qs = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
-    });
+  featureAnalyticsFeatures: (params: FeatureAnalyticsQuery & { feature_selection?: string[] }) => {
+    const qs = featureAnalyticsQueryToSearchParams(params);
     return request<FeatureAnalyticsFeaturesResponse>(`/api/feature-analytics/features${qs.toString() ? `?${qs.toString()}` : ""}`);
+  },
+  featureAnalyticsFilterOptions: (params: FeatureAnalyticsQuery) => {
+    const qs = featureAnalyticsQueryToSearchParams(params);
+    return request<FeatureAnalyticsFilterOptionsResponse>(`/api/feature-analytics/filter-options${qs.toString() ? `?${qs.toString()}` : ""}`);
   },
   featureAnalyticsDistributions: (params: {
     feature_key: string;
-    group_by?: "superclass" | "label" | "physical_object_id";
+    group_by?:
+      | "superclass"
+      | "processed_superclass"
+      | "labeled_superclass"
+      | "label"
+      | "raw_label"
+      | "normalized_class"
+      | "physical_object_id"
+      | "processed_class";
     bins?: number;
     mode?: "count" | "density";
-    datasets?: string;
-    sessions?: string;
-    labels?: string;
-    superclass?: string;
-    validation_status?: string;
-    split?: string;
-    pipeline?: string;
-    calibration?: string;
-    date_from?: string;
-    date_to?: string;
-  }) => {
-    const qs = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
-    });
+  } & FeatureAnalyticsQuery) => {
+    const qs = featureAnalyticsQueryToSearchParams(params);
+    qs.set("feature_key", params.feature_key);
+    if (params.group_by) qs.set("group_by", params.group_by);
+    if (params.bins !== undefined) qs.set("bins", String(params.bins));
+    if (params.mode) qs.set("mode", params.mode);
     return request<FeatureAnalyticsDistributionResponse>(`/api/feature-analytics/distributions?${qs.toString()}`);
   },
   featureAnalyticsObjects: (params: {
@@ -1856,22 +2587,26 @@ export const api = {
     min_value?: number;
     max_value?: number;
     limit?: number;
-    datasets?: string;
-    sessions?: string;
-    labels?: string;
-    superclass?: string;
-    validation_status?: string;
-    split?: string;
-    pipeline?: string;
-    calibration?: string;
-    date_from?: string;
-    date_to?: string;
-  }) => {
-    const qs = new URLSearchParams();
-    Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
-    });
+  } & FeatureAnalyticsQuery) => {
+    const qs = featureAnalyticsQueryToSearchParams(params);
+    qs.set("feature_key", params.feature_key);
+    if (params.min_value !== undefined) qs.set("min_value", String(params.min_value));
+    if (params.max_value !== undefined) qs.set("max_value", String(params.max_value));
+    if (params.limit !== undefined) qs.set("limit", String(params.limit));
     return request<FeatureAnalyticsObjectsResponse>(`/api/feature-analytics/objects?${qs.toString()}`);
+  },
+  objectThumbnailInfo: (
+    takeId: string,
+    objectId: string | number,
+    params: {
+      mode?: "auto" | "heightmap" | "reflectance" | "classification_overlay";
+      semantic_group?: string;
+    } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.mode) qs.set("mode", params.mode);
+    if (params.semantic_group) qs.set("semantic_group", params.semantic_group);
+    return request<FeatureAnalyticsThumbnailInfo>(`/api/takes/${encodeURIComponent(takeId)}/objects/${encodeURIComponent(String(objectId))}/thumbnail-info${qs.toString() ? `?${qs.toString()}` : ""}`);
   },
   createDatasetSession: (datasetId: string, payload: { name: string; notes?: string | null }) =>
     post<DatasetSessionSummary>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions`, payload),
@@ -1976,7 +2711,10 @@ export const api = {
     post<MaterializeMlIngestionResponse>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/materialize`, { ml_set_id: mlSetId }),
   applyMlIngestionMetadata: (runId: string) =>
     post<Record<string, unknown>>(`/api/ml-ingestion/runs/${encodeURIComponent(runId)}/apply-metadata`, {}),
-  take: (takeId: string) => request<TakeDetail>(`/api/takes/${encodeURIComponent(takeId)}`),
+  take: (takeId: string, runId?: string | null) =>
+    request<TakeDetail>(
+      `/api/takes/${encodeURIComponent(takeId)}${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`,
+    ),
   updateTakeMetadata: (takeId: string, payload: Record<string, unknown>) =>
     put<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/metadata`, payload),
   bulkUpdateTakeMetadata: (payload: TakeBulkMetadataRequest) =>
@@ -2001,8 +2739,57 @@ export const api = {
     `/api/datasets/${encodeURIComponent(datasetId)}/ml-sets/${encodeURIComponent(mlSetId)}/members`,
     payload
   ),
+  updateDatasetMlSetMemberships: (datasetId: string, mlSetId: string, payload: {
+    take_ids: string[];
+    split?: string;
+    include?: boolean;
+    expected_class?: string;
+    expected_subclass?: string;
+    review_required?: boolean;
+    default_trainable?: boolean;
+  }) => post<{ ok: boolean; updated_count: number; skipped_count: number; skipped_ids: string[] }>(
+    `/api/datasets/${encodeURIComponent(datasetId)}/ml-sets/${encodeURIComponent(mlSetId)}/members/update`,
+    payload
+  ),
   mlSetSummary: (mlSetId: string, datasetId?: string) =>
     request<MLSetSummaryResponse>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/summary${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
+  mlSetMembers: (mlSetId: string, params?: {
+    dataset_id?: string;
+    physical_object_id?: string;
+    raw_label?: string;
+    normalized_class?: string;
+    superclass?: string;
+    membership_status?: string;
+    split?: string;
+    session_id?: string;
+    search?: string;
+    validation_status?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params ?? {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<MLSetMembersResponse>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/members${qs.toString() ? `?${qs.toString()}` : ""}`);
+  },
+  mlSetReviewFacets: (datasetId: string, mlSetId: string, params?: {
+    physical_object_id?: string;
+    raw_label?: string;
+    normalized_class?: string;
+    superclass?: string;
+    membership_status?: string;
+    split?: string;
+    session_id?: string;
+    search?: string;
+    validation_status?: string;
+  }) => {
+    const qs = new URLSearchParams();
+    Object.entries(params ?? {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") qs.set(key, String(value));
+    });
+    return request<MLSetReviewFacetsResponse>(`/api/datasets/${encodeURIComponent(datasetId)}/ml-sets/${encodeURIComponent(mlSetId)}/facets${qs.toString() ? `?${qs.toString()}` : ""}`);
+  },
   mlSetClassDistribution: (mlSetId: string, datasetId?: string) =>
     request<Record<string, unknown>>(`/api/ml-sets/${encodeURIComponent(mlSetId)}/class-distribution${datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : ""}`),
   mlSetSplitSummary: (mlSetId: string, datasetId?: string) =>
@@ -2023,14 +2810,181 @@ export const api = {
     request<SourceHistogramResponse>(
       `/api/takes/${encodeURIComponent(takeId)}/source-histogram?max_dim=${encodeURIComponent(String(maxDim))}&bins=${encodeURIComponent(String(bins))}${filename ? `&filename=${encodeURIComponent(filename)}` : ""}`
     ),
-  processTake: (takeId: string, payload: { pipeline_id: string; run_until_stage?: string | null; reprocess?: boolean; stage_params?: Record<string, unknown> | null }) =>
+  processTake: (
+    takeId: string,
+    payload: {
+      pipeline_id: string;
+      run_until_stage?: string | null;
+      reprocess?: boolean;
+      stage_params?: Record<string, unknown> | null;
+      recipe_id?: string | null;
+      recipe_version?: number | null;
+    }
+  ) =>
     post<Record<string, unknown>>(`/api/takes/${encodeURIComponent(takeId)}/process`, payload),
+  pipelineRecipes: (pipelineId: string, includeArchived = false) =>
+    request<{ pipeline_id: string; recipes: PipelineRecipe[] }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/recipes${includeArchived ? "?include_archived=true" : ""}`
+    ),
+  pipelineRecipe: (pipelineId: string, recipeId: string, version?: number | null) =>
+    request<PipelineRecipe>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/${encodeURIComponent(recipeId)}${version != null ? `?version=${encodeURIComponent(String(version))}` : ""}`
+    ),
+  createPipelineRecipe: (
+    pipelineId: string,
+    payload: {
+      recipe_id?: string | null;
+      name: string;
+      description?: string | null;
+      tags?: string[];
+      notes?: string | null;
+      parameters_by_unit?: Record<string, unknown> | null;
+      stage_params?: Record<string, unknown> | null;
+      unit_enabled_state?: Record<string, unknown> | null;
+      artifact_policy?: Record<string, unknown> | null;
+      calibration_snapshot_reference?: Record<string, unknown> | null;
+      provenance?: Record<string, unknown> | null;
+      parent_recipe_id?: string | null;
+    },
+  ) => post<PipelineRecipe>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes`, payload),
+  createPipelineRecipeFromCurrent: (
+    pipelineId: string,
+    payload: {
+      recipe_id?: string | null;
+      name: string;
+      description?: string | null;
+      tags?: string[];
+      notes?: string | null;
+      parameters_by_unit?: Record<string, unknown> | null;
+      stage_params?: Record<string, unknown> | null;
+      unit_enabled_state?: Record<string, unknown> | null;
+      artifact_policy?: Record<string, unknown> | null;
+      calibration_snapshot_reference?: Record<string, unknown> | null;
+      provenance?: Record<string, unknown> | null;
+      parent_recipe_id?: string | null;
+    },
+  ) => post<PipelineRecipe>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/from-current`, payload),
+  updatePipelineRecipe: (
+    pipelineId: string,
+    recipeId: string,
+    payload: {
+      name: string;
+      description?: string | null;
+      tags?: string[];
+      notes?: string | null;
+      parameters_by_unit?: Record<string, unknown> | null;
+      stage_params?: Record<string, unknown> | null;
+      unit_enabled_state?: Record<string, unknown> | null;
+      artifact_policy?: Record<string, unknown> | null;
+      calibration_snapshot_reference?: Record<string, unknown> | null;
+      provenance?: Record<string, unknown> | null;
+    },
+  ) => put<PipelineRecipe>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/${encodeURIComponent(recipeId)}`, payload),
+  clonePipelineRecipe: (pipelineId: string, recipeId: string, payload?: { name?: string | null; recipe_id?: string | null }) =>
+    post<PipelineRecipe>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/${encodeURIComponent(recipeId)}/clone`, payload ?? {}),
+  archivePipelineRecipe: (pipelineId: string, recipeId: string) =>
+    post<PipelineRecipe>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/${encodeURIComponent(recipeId)}/archive`, {}),
+  validatePipelineRecipe: (
+    pipelineId: string,
+    payload: { recipe_id?: string | null; parameters_by_unit?: Record<string, unknown> | null; stage_params?: Record<string, unknown> | null },
+  ) => post<{
+    pipeline_id: string;
+    recipe_id?: string | null;
+    compatibility: string;
+    errors: string[];
+    warnings: string[];
+    normalized_parameters_by_unit?: Record<string, Record<string, unknown>>;
+  }>(`/api/pipelines/${encodeURIComponent(pipelineId)}/recipes/validate`, payload),
+  comparePipeline: (
+    pipelineId: string,
+    payload: {
+      left: {
+        type: "run" | "recipe" | "current" | string;
+        label?: string | null;
+        take_id?: string | null;
+        run_id?: string | null;
+        recipe_id?: string | null;
+        version?: number | null;
+        stage_params?: Record<string, unknown> | null;
+        parameters_by_unit?: Record<string, unknown> | null;
+      };
+      right: {
+        type: "run" | "recipe" | "current" | string;
+        label?: string | null;
+        take_id?: string | null;
+        run_id?: string | null;
+        recipe_id?: string | null;
+        version?: number | null;
+        stage_params?: Record<string, unknown> | null;
+        parameters_by_unit?: Record<string, unknown> | null;
+      };
+    },
+  ) => post<PipelineComparisonResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/compare`, payload),
+  pipelineComparisons: (pipelineId: string, params?: { take_id?: string | null; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.take_id) query.set("take_id", params.take_id);
+    if (params?.limit != null) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request<{ pipeline_id: string; comparisons: PipelineComparisonIndexEntry[] }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/comparisons${suffix}`,
+    );
+  },
+  pipelineComparison: (pipelineId: string, comparisonId: string) =>
+    request<PipelineComparisonResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/comparisons/${encodeURIComponent(comparisonId)}`),
+  pipelineRuns: (pipelineId: string, params?: { take_id?: string | null; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.take_id) query.set("take_id", params.take_id);
+    if (params?.limit != null) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request<{ pipeline_id: string; runs: PipelineRunEntry[] }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs${suffix}`,
+    );
+  },
+  pipelineRunLineage: (pipelineId: string, runId: string) =>
+    request<PipelineRunLineage>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs/${encodeURIComponent(runId)}/lineage`,
+    ),
+  generateRunComparisonToParent: (pipelineId: string, runId: string) =>
+    post<PipelineComparisonResponse>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs/${encodeURIComponent(runId)}/generate-comparison`,
+      {},
+    ),
+  planPipelinePartialRerun: (
+    pipelineId: string,
+    payload: {
+      selected_unit_id: string;
+      changed_parameters?: Record<string, unknown> | null;
+      current_recipe_snapshot?: Record<string, unknown> | null;
+      parent_run_result_ref?: { take_id: string; run_id?: string | null } | null;
+      parent_run_result?: Record<string, unknown> | null;
+    },
+    persist = false,
+  ) => post<PartialRerunPlanResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/partial-rerun/plan${persist ? "?persist=true" : ""}`, payload),
+  pipelinePartialRerunPlans: (pipelineId: string, limit = 10) =>
+    request<{ pipeline_id: string; plans: PartialRerunPlanListEntry[] }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/partial-rerun/plans?limit=${encodeURIComponent(String(limit))}`,
+    ),
+  executePipelinePartialRerun: (
+    pipelineId: string,
+    payload: {
+      plan_id?: string | null;
+      plan?: Record<string, unknown> | null;
+      parent_run_ref: { take_id: string; run_id?: string | null };
+      effective_recipe_snapshot?: Record<string, unknown> | null;
+      overrides?: Record<string, unknown> | null;
+      options?: { compare_to_parent?: boolean };
+    },
+  ) => post<PartialRerunExecuteResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/partial-rerun/execute`, payload),
   createProcessingJob: (payload: ProcessingJobCreateRequest) =>
     post<{ job: ProcessingJobRecord }>("/api/processing-jobs", payload),
   processingJobs: () => request<{ jobs: ProcessingJobRecord[]; counts: Record<string, number> }>("/api/processing-jobs"),
   processingJob: (jobId: string) => request<{ job: ProcessingJobRecord }>(`/api/processing-jobs/${encodeURIComponent(jobId)}`),
   cancelProcessingJob: (jobId: string) =>
     post<{ ok: boolean; job_id: string; status: ProcessingJobStatus }>(`/api/processing-jobs/${encodeURIComponent(jobId)}/cancel`, {}),
+  createFeatureJob: (payload: FeatureJobRequest) => post<FeatureJobResponse>("/api/ml/feature-jobs", payload),
+  featureJob: (jobId: string) => request<FeatureJobResponse>(`/api/ml/feature-jobs/${encodeURIComponent(jobId)}`),
+  cancelFeatureJob: (jobId: string) =>
+    post<{ ok: boolean; job_id: string; status: FeatureJobStatus }>(`/api/ml/feature-jobs/${encodeURIComponent(jobId)}/cancel`, {}),
   pipelineDefaults25d: () => request<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d"),
   savePipelineDefaults25d: (defaults: Record<string, unknown>) =>
     put<{ defaults: Record<string, unknown> }>("/api/pipeline-defaults/25d", defaults),

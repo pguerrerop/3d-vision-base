@@ -12,10 +12,10 @@ from vision_3d_acquisition.classifiers.mining_ball_rules import (
     predict_superclass_from_rules,
 )
 from scripts.tune_25d_rules import (
-    DEFAULT_LABEL_TO_SUPERCLASS,
     compute_metrics,
     make_object_safe_splits,
 )
+from vision_3d_acquisition.ml.label_normalization import resolve_audit_superclass
 
 
 def _safe_float(value: Any) -> float | None:
@@ -33,11 +33,12 @@ def _load_csv(path: Path) -> list[dict[str, Any]]:
 
 
 def _expected_superclass(row: dict[str, Any], label_column: str, superclass_column: str) -> str | None:
-    sup = str(row.get(superclass_column) or "").strip().upper()
+    sup = str(row.get(superclass_column) or "").strip()
     if sup in {"BALL_GOOD", "BALL_SCRAP", "SCRAP_METAL"}:
         return sup
     lbl = str(row.get(label_column) or "").strip().lower()
-    return DEFAULT_LABEL_TO_SUPERCLASS.get(lbl)
+    resolved = resolve_audit_superclass(lbl)
+    return resolved if resolved in {"BALL_GOOD", "BALL_SCRAP", "SCRAP_METAL"} else None
 
 
 def _predict_rows(rows: list[dict[str, Any]], params: dict[str, float], *, group_column: str) -> list[dict[str, Any]]:

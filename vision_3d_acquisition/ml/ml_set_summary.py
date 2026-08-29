@@ -20,6 +20,14 @@ def _safe_read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _row_is_trainable(row: dict[str, Any], *, default: bool = False) -> bool:
+    for key in ("trainable", "default_trainable"):
+        value = row.get(key)
+        if value is not None:
+            return bool(value)
+    return default
+
+
 class MLSetSummaryService:
     def __init__(self, settings: ApiSettings) -> None:
         self.settings = settings
@@ -56,11 +64,7 @@ class MLSetSummaryService:
         membership_overview = self.dataset_service.summarize_ml_set_memberships(ml_set, memberships)
         kept_rows = [row for row in memberships if bool(row.get("include", True))]
         excluded_rows = [row for row in memberships if not bool(row.get("include", True))]
-        trainable_rows = [
-            row
-            for row in kept_rows
-            if bool(row.get("trainable", row.get("default_trainable", False)))
-        ]
+        trainable_rows = [row for row in kept_rows if _row_is_trainable(row)]
         object_ids = {str(row.get("physical_object_id") or "") for row in kept_rows if str(row.get("physical_object_id") or "")}
         trainable_object_ids = {str(row.get("physical_object_id") or "") for row in trainable_rows if str(row.get("physical_object_id") or "")}
         review_required_object_ids = {
@@ -96,7 +100,7 @@ class MLSetSummaryService:
             superclass = str(row.get("expected_subclass") or (take_meta.get("superclass_labels") or [""])[0] or "UNKNOWN").strip() or "UNKNOWN"
             raw_label = str(row.get("raw_label") or row.get("expected_label") or "").strip() or "UNKNOWN"
             split = str(row.get("split") or "unassigned")
-            is_trainable = bool(row.get("trainable", row.get("default_trainable", False)))
+            is_trainable = _row_is_trainable(row)
             session_id = str(take_meta.get("session_id") or take_summary.get("experiment_session_id") or "")
             label_schema_version = str(take_meta.get("normalization_version") or label_schema_version or "unknown")
             validation_state = str(take_meta.get("validation_status") or "unreviewed")
@@ -144,7 +148,7 @@ class MLSetSummaryService:
                     "session_id": session_id,
                 })
 
-        split_integrity = self._build_split_integrity(trainable_rows)
+        split_integrity = self._build_split_integrity(kept_rows)
         warnings.extend(split_integrity["warnings"])
         warnings.extend(self._build_balance_warnings(classes, uncertain_count, len(trainable_rows), splits))
 
@@ -223,6 +227,360 @@ class MLSetSummaryService:
             },
             "exports": self._export_manifest(resolved_dataset_id, ml_set_id),
         }
+
+    def list_members(
+        self,
+        ml_set_id: str,
+        dataset_id: str | None = None,
+        *,
+        physical_object_id: str | None = None,
+        raw_label: str | None = None,
+        normalized_class: str | None = None,
+        superclass: str | None = None,
+        membership_status: str | None = None,
+        split: str | None = None,
+        session_id: str | None = None,
+        search: str | None = None,
+        validation_status: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        ml_set, resolved_dataset_id, memberships = self._memberships_with_metadata(ml_set_id, dataset_id)
+        dataset = self.dataset_service.get_dataset(resolved_dataset_id) or {"id": resolved_dataset_id, "name": resolved_dataset_id}
+        items = [self._build_member_row(resolved_dataset_id, row) for row in memberships]
+        filtered = self._filter_member_items(
+            items,
+            physical_object_id=physical_object_id,
+            raw_label=raw_label,
+            normalized_class=normalized_class,
+            superclass=superclass,
+            membership_status=membership_status,
+            split=split,
+            session_id=session_id,
+            search=search,
+            validation_status=validation_status,
+        )
+        filtered.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("take_id") or "")), reverse=True)
+        resolved_limit = max(1, min(int(limit), 500))
+        resolved_offset = max(0, int(offset))
+        page_items = filtered[resolved_offset : resolved_offset + resolved_limit]
+        next_offset = resolved_offset + len(page_items)
+        object_ids = {
+            str(item.get("physical_object_id") or "").strip()
+            for item in filtered
+            if str(item.get("physical_object_id") or "").strip()
+        }
+        review_required_count = sum(1 for item in filtered if bool(item.get("review_required")))
+        return {
+            "ml_set": ml_set,
+            "dataset": dataset,
+            "items": page_items,
+            "filtered_count": len(filtered),
+            "total_count": len(items),
+            "limit": resolved_limit,
+            "offset": resolved_offset,
+            "has_more": next_offset < len(filtered),
+            "next_offset": next_offset if next_offset < len(filtered) else None,
+            "stats": {
+                "member_count": len(filtered),
+                "object_count": len(object_ids),
+                "review_required_count": review_required_count,
+            },
+        }
+
+    def build_member_facets(
+        self,
+        ml_set_id: str,
+        dataset_id: str | None = None,
+        *,
+        physical_object_id: str | None = None,
+        raw_label: str | None = None,
+        normalized_class: str | None = None,
+        superclass: str | None = None,
+        membership_status: str | None = None,
+        split: str | None = None,
+        session_id: str | None = None,
+        search: str | None = None,
+        validation_status: str | None = None,
+    ) -> dict[str, Any]:
+        ml_set, resolved_dataset_id, memberships = self._memberships_with_metadata(ml_set_id, dataset_id)
+        dataset = self.dataset_service.get_dataset(resolved_dataset_id) or {"id": resolved_dataset_id, "name": resolved_dataset_id}
+        items = [self._build_member_row(resolved_dataset_id, row) for row in memberships]
+        fully_filtered = self._filter_member_items(
+            items,
+            physical_object_id=physical_object_id,
+            raw_label=raw_label,
+            normalized_class=normalized_class,
+            superclass=superclass,
+            membership_status=membership_status,
+            split=split,
+            session_id=session_id,
+            search=search,
+            validation_status=validation_status,
+        )
+
+        # Picker facets (object/split/membership-status/session) always cover
+        # the full, unfiltered member list so the UI can navigate to any
+        # value regardless of the currently active filters. Descriptive
+        # facets (raw label, normalized class, superclass) summarize the
+        # currently filtered result set instead.
+        object_scope = items
+        raw_label_scope = fully_filtered
+        normalized_scope = fully_filtered
+        superclass_scope = fully_filtered
+        split_scope = items
+        membership_scope = items
+        session_scope = items
+
+        object_rows: dict[str, dict[str, Any]] = {}
+        for item in object_scope:
+            value = str(item.get("physical_object_id") or "").strip()
+            if not value:
+                continue
+            bucket = object_rows.setdefault(value, {
+                "value": value,
+                "take_count": 0,
+                "normalized_class": str(item.get("normalized_class") or ""),
+                "superclass": str(item.get("superclass") or ""),
+            })
+            bucket["take_count"] = int(bucket["take_count"]) + 1
+            if not bucket["normalized_class"] and item.get("normalized_class"):
+                bucket["normalized_class"] = str(item.get("normalized_class") or "")
+            if not bucket["superclass"] and item.get("superclass"):
+                bucket["superclass"] = str(item.get("superclass") or "")
+
+        def count_values(rows: list[dict[str, Any]], field: str) -> list[dict[str, Any]]:
+            counts: dict[str, int] = defaultdict(int)
+            for item in rows:
+                value = str(item.get(field) or "").strip()
+                if not value:
+                    continue
+                counts[value] += 1
+            return [{"value": value, "count": count} for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+
+        session_rows: dict[str, dict[str, Any]] = {}
+        for item in session_scope:
+            value = str(item.get("session_id") or "").strip()
+            if not value:
+                continue
+            bucket = session_rows.setdefault(value, {"value": value, "name": str(item.get("session_name") or value), "count": 0})
+            bucket["count"] = int(bucket["count"]) + 1
+
+        membership_counts: dict[str, int] = {
+            "all": len(membership_scope),
+            "default_trainable": 0,
+            "review_required": 0,
+            "excluded": 0,
+            "uncertain": 0,
+        }
+        for item in membership_scope:
+            if bool(item.get("default_trainable")):
+                membership_counts["default_trainable"] += 1
+            if bool(item.get("review_required")):
+                membership_counts["review_required"] += 1
+            if not bool(item.get("include", True)):
+                membership_counts["excluded"] += 1
+            if bool(item.get("is_uncertain")):
+                membership_counts["uncertain"] += 1
+
+        object_id_options = sorted(object_rows.values(), key=lambda item: _natural_sort_key(str(item["value"])))
+        return {
+            "ml_set": ml_set,
+            "dataset": dataset,
+            "stats": {
+                "member_count": len(fully_filtered),
+                "object_count": len({str(item.get("physical_object_id") or "").strip() for item in fully_filtered if str(item.get("physical_object_id") or "").strip()}),
+            },
+            "object_ids": object_id_options,
+            "raw_labels": count_values(raw_label_scope, "raw_label"),
+            "normalized_classes": count_values(normalized_scope, "normalized_class"),
+            "superclasses": count_values(superclass_scope, "superclass"),
+            "splits": count_values(split_scope, "split"),
+            "membership_statuses": [{"value": value, "count": count} for value, count in membership_counts.items() if count > 0 or value == "all"],
+            "sessions": sorted(session_rows.values(), key=lambda item: (-int(item["count"]), str(item["name"]))),
+        }
+
+    def _build_member_row(self, dataset_id: str, row: dict[str, Any]) -> dict[str, Any]:
+        take_meta = row.get("take_metadata") if isinstance(row.get("take_metadata"), dict) else {}
+        take_summary = row.get("take_summary") if isinstance(row.get("take_summary"), dict) else {}
+        physical_object_id = str(row.get("physical_object_id") or take_meta.get("physical_object_id") or "").strip()
+        normalized = str(
+            row.get("expected_class")
+            or take_meta.get("expected_class")
+            or take_meta.get("normalized_class")
+            or ((take_meta.get("semantic_labels") or [""])[0] if isinstance(take_meta.get("semantic_labels"), list) else "")
+            or ""
+        ).strip()
+        resolved_superclass = str(
+            row.get("expected_subclass")
+            or ((take_meta.get("superclass_labels") or [""])[0] if isinstance(take_meta.get("superclass_labels"), list) else "")
+            or "UNKNOWN"
+        ).strip() or "UNKNOWN"
+        raw_label = str(
+            row.get("raw_label")
+            or row.get("expected_label")
+            or take_meta.get("raw_operator_label")
+            or ""
+        ).strip()
+        include = bool(row.get("include", True))
+        default_trainable = bool(row.get("default_trainable", False))
+        trainable = _row_is_trainable(row, default=include)
+        review_required = bool(row.get("review_required", False))
+        split = str(row.get("split") or "unassigned").strip() or "unassigned"
+        validation_state = str(take_meta.get("validation_status") or take_summary.get("validation_status") or "unreviewed").strip() or "unreviewed"
+        notes = str(row.get("notes") or "").strip()
+        source_row = str(row.get("source_row") or "").strip()
+        is_uncertain = review_required or validation_state == "needs_review" or normalized.upper().endswith("UNCERTAIN")
+        warnings: list[str] = []
+        if review_required:
+            warnings.append("review_required")
+        if not physical_object_id:
+            warnings.append("missing_physical_object_id")
+        if split == "unassigned":
+            warnings.append("missing_split")
+        if not include:
+            warnings.append("excluded_from_training")
+        if validation_state not in {"valid", "validated"}:
+            warnings.append("not_validated")
+        processing_by_family = take_summary.get("processing_by_family") if isinstance(take_summary.get("processing_by_family"), list) else []
+        feature_ready = bool(take_summary.get("processed_class_label")) or any(
+            isinstance(item, dict) and bool(item.get("hasCompletedOutput")) for item in processing_by_family
+        )
+        return {
+            "dataset_id": dataset_id,
+            "ml_set_id": str(row.get("ml_set_id") or ""),
+            "take_id": str(row.get("take_id") or ""),
+            "take_name": str(take_summary.get("friendly_name") or row.get("take_id") or ""),
+            "created_at": take_summary.get("created_at"),
+            "thumbnail_path": take_summary.get("thumbnail_path"),
+            "physical_object_id": physical_object_id or None,
+            "raw_label": raw_label or None,
+            "normalized_class": normalized or None,
+            "superclass": resolved_superclass,
+            "review_required": review_required,
+            "default_trainable": default_trainable,
+            "trainable": trainable,
+            "include": include,
+            "split": split,
+            "validation_status": validation_state,
+            "session_id": str(take_summary.get("experiment_session_id") or take_meta.get("session_id") or "") or None,
+            "session_name": str(take_summary.get("experiment_session_name") or "") or None,
+            "notes": notes or None,
+            "source_row": source_row or None,
+            "is_uncertain": is_uncertain,
+            "processing_ready": bool(take_summary.get("has_done") or take_summary.get("has_ready")),
+            "feature_ready": feature_ready,
+            "processed_class_label": str(take_summary.get("processed_class_label") or "") or None,
+            "processed_superclass": str(take_summary.get("processed_superclass") or "") or None,
+            "warnings": warnings,
+            "warning_count": len(warnings),
+            "label_provenance": {
+                "raw_label": raw_label or None,
+                "expected_label": row.get("expected_label"),
+                "normalized_class": normalized or None,
+                "superclass": resolved_superclass,
+                "normalization_version": row.get("normalization_version") or take_meta.get("normalization_version"),
+                "source_row": row.get("source_row"),
+                "label_policy": row.get("label_policy"),
+            },
+            "feature_summary": {
+                "processed_class_label": str(take_summary.get("processed_class_label") or "") or None,
+                "processed_superclass": str(take_summary.get("processed_superclass") or "") or None,
+                "processing_by_family": processing_by_family,
+            },
+        }
+
+    @staticmethod
+    def _matches_member_filters(
+        item: dict[str, Any],
+        *,
+        physical_object_id: str | None = None,
+        raw_label: str | None = None,
+        normalized_class: str | None = None,
+        superclass: str | None = None,
+        membership_status: str | None = None,
+        split: str | None = None,
+        session_id: str | None = None,
+        search: str | None = None,
+        validation_status: str | None = None,
+    ) -> bool:
+        if physical_object_id and str(item.get("physical_object_id") or "").strip().lower() != physical_object_id.strip().lower():
+            return False
+        if raw_label and raw_label.strip().lower() != str(item.get("raw_label") or "").strip().lower():
+            return False
+        if normalized_class and normalized_class.strip().lower() != str(item.get("normalized_class") or "").strip().lower():
+            return False
+        if superclass and superclass.strip().lower() != str(item.get("superclass") or "").strip().lower():
+            return False
+        if split and split.strip().lower() != str(item.get("split") or "").strip().lower():
+            return False
+        if session_id and session_id.strip().lower() != str(item.get("session_id") or "").strip().lower():
+            return False
+        if validation_status and validation_status.strip().lower() != str(item.get("validation_status") or "").strip().lower():
+            return False
+        if search:
+            query = search.strip().lower()
+            haystack = " ".join(
+                [
+                    str(item.get("take_id") or ""),
+                    str(item.get("take_name") or ""),
+                    str(item.get("physical_object_id") or ""),
+                    str(item.get("raw_label") or ""),
+                    str(item.get("normalized_class") or ""),
+                    str(item.get("superclass") or ""),
+                    str(item.get("session_name") or ""),
+                    str(item.get("notes") or ""),
+                    str(item.get("source_row") or ""),
+                ]
+            ).lower()
+            if query not in haystack:
+                return False
+        if membership_status:
+            value = membership_status.strip().lower()
+            if value == "review_required" and not bool(item.get("review_required")):
+                return False
+            if value == "default_trainable" and not bool(item.get("default_trainable")):
+                return False
+            if value == "trainable" and not bool(item.get("trainable")):
+                return False
+            if value == "excluded" and bool(item.get("include", True)):
+                return False
+            if value == "non_trainable" and bool(item.get("trainable")):
+                return False
+            if value == "uncertain" and not bool(item.get("is_uncertain")):
+                return False
+        return True
+
+    def _filter_member_items(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        physical_object_id: str | None = None,
+        raw_label: str | None = None,
+        normalized_class: str | None = None,
+        superclass: str | None = None,
+        membership_status: str | None = None,
+        split: str | None = None,
+        session_id: str | None = None,
+        search: str | None = None,
+        validation_status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in items
+            if self._matches_member_filters(
+                item,
+                physical_object_id=physical_object_id,
+                raw_label=raw_label,
+                normalized_class=normalized_class,
+                superclass=superclass,
+                membership_status=membership_status,
+                split=split,
+                session_id=session_id,
+                search=search,
+                validation_status=validation_status,
+            )
+        ]
 
     def _export_manifest(self, dataset_id: str, ml_set_id: str) -> dict[str, str]:
         base = self.settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "ml_sets" / f"ml_set_{ml_set_id}"
@@ -344,3 +702,25 @@ class MLSetSummaryService:
             candidate = materialized / "ml_set.json"
             return candidate if candidate.is_file() else base / "ml_set.json"
         raise ValueError(f"Unknown export kind: {kind}")
+
+
+def _natural_sort_key(value: str) -> tuple[Any, ...]:
+    output: list[Any] = []
+    token = ""
+    is_digit = False
+    for char in value:
+        if char.isdigit():
+            if token and not is_digit:
+                output.append(token.lower())
+                token = ""
+            token += char
+            is_digit = True
+            continue
+        if token and is_digit:
+            output.append(int(token))
+            token = ""
+        token += char
+        is_digit = False
+    if token:
+        output.append(int(token) if is_digit else token.lower())
+    return tuple(output)

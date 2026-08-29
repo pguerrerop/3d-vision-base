@@ -18,9 +18,11 @@ type Props = {
   dataset: DatasetSummary | null;
   onClose: () => void;
   onSelectSession?: (sessionId: string) => void;
+  onReviewClass?: (value: string) => void;
+  onReviewSuperclass?: (value: string) => void;
 };
 
-export default function MLSetDetailDrawer({ open, mlSet, dataset, onClose, onSelectSession }: Props) {
+export default function MLSetDetailDrawer({ open, mlSet, dataset, onClose, onSelectSession, onReviewClass, onReviewSuperclass }: Props) {
   const [summary, setSummary] = useState<MLSetSummaryResponse | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -88,7 +90,12 @@ export default function MLSetDetailDrawer({ open, mlSet, dataset, onClose, onSel
             <h4>Raw Label Distribution</h4>
             <pre className="datasets-inline-state">{JSON.stringify(summary.raw_label_distribution, null, 2)}</pre>
           </section>
-          <MLSetClassDistribution classDistribution={summary.class_distribution} superclassDistribution={summary.superclass_distribution} />
+          <MLSetClassDistribution
+            classDistribution={summary.class_distribution}
+            superclassDistribution={summary.superclass_distribution}
+            onSelectClass={onReviewClass}
+            onSelectSuperclass={onReviewSuperclass}
+          />
           <MLSetRepresentativeSamples samples={summary.representative_samples} />
           <MLSetSplitVisualization splitSummary={summary.split_summary} />
           <MLSetSessionCoverage coverage={summary.source_session_coverage} onSelectSession={onSelectSession} />

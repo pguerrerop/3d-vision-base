@@ -5,12 +5,22 @@ import { visibleStageParameterKeys } from "./stageParameterModel";
 type FieldMeta = {
   type?: string;
   label?: string;
+  default?: unknown;
   enum?: Array<string | number>;
   minimum?: number;
   maximum?: number;
+  step?: number;
+  help?: string;
+  unit?: string;
   nullable?: boolean;
   group?: string;
+  advanced?: boolean;
   visible_when?: Record<string, unknown>;
+};
+
+type GroupMeta = {
+  id: string;
+  label?: string;
 };
 
 type Props = {
@@ -29,12 +39,13 @@ type Props = {
 };
 
 export default function StageParameterPanel(props: Props) {
-  const schema = (props.stage?.parameter_schema ?? {}) as { fields?: Record<string, FieldMeta> };
+  const schema = (props.stage?.parameter_schema ?? {}) as { fields?: Record<string, FieldMeta>; groups?: GroupMeta[] };
   const fields = schema.fields ?? {};
+  const groupLabels = new Map((schema.groups ?? []).map((group) => [group.id, group.label ?? group.id]));
   const keys = Object.keys(fields);
   if (!props.stage || !keys.length || !props.values) return null;
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const hasAdvanced = keys.some((key) => (fields[key]?.group ?? "") === "advanced");
+  const hasAdvanced = keys.some((key) => (fields[key]?.group ?? "") === "advanced" || fields[key]?.advanced === true);
   const visibleKeys = useMemo(
     () => visibleStageParameterKeys(fields, props.values ?? {}, showAdvanced),
     [fields, props.values, showAdvanced]
@@ -42,39 +53,68 @@ export default function StageParameterPanel(props: Props) {
 
   return (
     <section className="segmentation-controls-strip">
-      {visibleKeys.map((key) => {
+      {visibleKeys.map((key, index) => {
         const meta = fields[key] ?? {};
         const value = props.values?.[key];
+        const groupLabel = meta.group ? (groupLabels.get(meta.group) ?? meta.group) : null;
+        const previousKey = index > 0 ? visibleKeys[index - 1] : null;
+        const startsGroup = Boolean(groupLabel) && (previousKey == null || fields[previousKey]?.group !== meta.group);
+        const rawNumberValue = value == null || value === "" ? "" : Number(value);
         if (Array.isArray(meta.enum)) {
           return (
-            <label key={key} className="field-label">
-              {meta.label ?? key}
-              <select value={String(value ?? meta.enum[0] ?? "")} onChange={(event) => props.onChange(key, event.target.value)}>
-                {meta.enum.map((item) => <option key={String(item)} value={String(item)}>{String(item)}</option>)}
-              </select>
-            </label>
+            <div key={key}>
+              {startsGroup && (
+                <div className="stage-parameter-panel-header">
+                  <strong>{groupLabel}</strong>
+                </div>
+              )}
+              <label className="field-label">
+                {meta.label ?? key}
+                <select value={String(value ?? meta.default ?? meta.enum[0] ?? "")} onChange={(event) => props.onChange(key, event.target.value)}>
+                  {meta.enum.map((item) => <option key={String(item)} value={String(item)}>{String(item)}</option>)}
+                </select>
+              </label>
+              {meta.help && <small className="section-note">{meta.help}</small>}
+            </div>
           );
         }
         if (meta.type === "boolean") {
           return (
-            <label key={key}>
-              <input checked={Boolean(value)} type="checkbox" onChange={(event) => props.onChange(key, event.target.checked)} />
-              {meta.label ?? key}
-            </label>
+            <div key={key}>
+              {startsGroup && (
+                <div className="stage-parameter-panel-header">
+                  <strong>{groupLabel}</strong>
+                </div>
+              )}
+              <label>
+                <input checked={Boolean(value)} type="checkbox" onChange={(event) => props.onChange(key, event.target.checked)} />
+                {meta.label ?? key}
+              </label>
+              {meta.help && <small className="section-note">{meta.help}</small>}
+            </div>
           );
         }
-        const numeric = Number(value ?? 0);
         return (
-          <label key={key} className="field-label">
-            {meta.label ?? key}
-            <input
-              type="number"
-              min={meta.minimum}
-              max={meta.maximum}
-              value={Number.isFinite(numeric) ? numeric : ""}
-              onChange={(event) => props.onChange(key, event.target.value === "" && meta.nullable ? null : Number(event.target.value))}
-            />
-          </label>
+          <div key={key}>
+            {startsGroup && (
+              <div className="stage-parameter-panel-header">
+                <strong>{groupLabel}</strong>
+              </div>
+            )}
+            <label className="field-label">
+              {meta.label ?? key}
+              <input
+                type="number"
+                min={meta.minimum}
+                max={meta.maximum}
+                step={meta.step}
+                value={rawNumberValue === "" ? "" : (Number.isFinite(rawNumberValue) ? rawNumberValue : "")}
+                onChange={(event) => props.onChange(key, event.target.value === "" && meta.nullable ? null : Number(event.target.value))}
+              />
+              {meta.unit && <small>{meta.unit}</small>}
+            </label>
+            {meta.help && <small className="section-note">{meta.help}</small>}
+          </div>
         );
       })}
       {hasAdvanced && (

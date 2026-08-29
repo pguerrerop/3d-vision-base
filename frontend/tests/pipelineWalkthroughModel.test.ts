@@ -74,11 +74,77 @@ test("walkthrough artifacts retain their contract provenance for the full-size i
   assert.ok(source.includes("provenance: artifactProvenance(provenanceUnit, artifact, provenanceParameters)"));
 });
 
-test("walkthrough root artifacts treat downstream-used diagnostics as outputs", () => {
+test("resolveIoRole marks a diagnostic OUT only when it transitively reaches a real final/input artifact outside its own unit", () => {
   const source = readSource();
-  assert.ok(source.includes('artifact.role === "input"'));
-  assert.ok(source.includes('(artifact.role === "final" || (artifact.role === "diagnostic" && (artifact.feeds_into?.length ?? 0) > 0))'));
-  assert.ok(source.includes('? "output"'));
+  assert.ok(source.includes("function reachesExternalOutput("));
+  assert.ok(source.includes('if (role === "input") return "input";'));
+  assert.ok(source.includes('if (role === "final") return "output";'));
+  assert.ok(source.includes('if (role === "diagnostic" && reachesExternalOutput(artifactId, unitId, artifactGraph, reachabilityMemo)) return "output";'));
+  // the walk must actually cross unit boundaries and follow multi-hop chains, not just check the
+  // artifact's own first-hop feeds_into list -- a diagnostic pointing only at another dead-end
+  // diagnostic must not qualify.
+  assert.ok(source.includes('next.unitId !== originUnitId && (next.role === "final" || next.role === "input")'));
+  assert.ok(source.includes("reachesExternalOutput(nextId, originUnitId, graph, memo, visiting)"));
+});
+
+test("reachesExternalOutput is used consistently for both the root unit and every substage's artifacts", () => {
+  const source = readSource();
+  assert.ok(source.includes("ioRole: resolveIoRole(artifact.role, root.id, artifact.artifact_id),"));
+  assert.ok(source.includes("ioRole: unit && declared ? resolveIoRole(declared.role, unit.id, declared.artifact_id) : entry.ioRole,"));
+});
+
+test("reachesExternalOutput does not mark a diagnostic OUT when its chain only reaches other dead-end diagnostics", () => {
+  // Self-contained behavioral check of the reachability walk, copied verbatim from the source
+  // (pipelineWalkthroughModel.ts can't be imported directly here -- see file header).
+  type Node = { role: string; unitId: string; feedsInto: string[] };
+  function reachesExternalOutput(
+    artifactId: string,
+    originUnitId: string,
+    graph: Map<string, Node>,
+    memo: Map<string, boolean>,
+    visiting: Set<string> = new Set(),
+  ): boolean {
+    const cacheKey = `${originUnitId}::${artifactId}`;
+    const cached = memo.get(cacheKey);
+    if (cached !== undefined) return cached;
+    if (visiting.has(artifactId)) return false;
+    visiting.add(artifactId);
+    let result = false;
+    for (const nextId of graph.get(artifactId)?.feedsInto ?? []) {
+      const next = graph.get(nextId);
+      if (!next) continue;
+      if (next.unitId !== originUnitId && (next.role === "final" || next.role === "input")) {
+        result = true;
+        break;
+      }
+      if (reachesExternalOutput(nextId, originUnitId, graph, memo, visiting)) {
+        result = true;
+        break;
+      }
+    }
+    visiting.delete(artifactId);
+    memo.set(cacheKey, result);
+    return result;
+  }
+
+  // dead_end_diag (unit A) -> other_diag (unit A, itself a dead end) : must NOT be OUT.
+  // real_diag (unit A) -> intermediate_diag (unit B, still diagnostic) -> final_elsewhere (unit C,
+  // role=final) : must be OUT, even though the first hop lands on another diagnostic.
+  const graph = new Map<string, Node>([
+    ["dead_end_diag", { role: "diagnostic", unitId: "unitA", feedsInto: ["other_diag"] }],
+    ["other_diag", { role: "diagnostic", unitId: "unitA", feedsInto: [] }],
+    ["real_diag", { role: "diagnostic", unitId: "unitA", feedsInto: ["intermediate_diag"] }],
+    ["intermediate_diag", { role: "diagnostic", unitId: "unitB", feedsInto: ["final_elsewhere"] }],
+    ["final_elsewhere", { role: "final", unitId: "unitC", feedsInto: [] }],
+    ["local_final", { role: "final", unitId: "unitA", feedsInto: [] }],
+    ["same_unit_diag", { role: "diagnostic", unitId: "unitA", feedsInto: ["local_final"] }],
+  ]);
+  const memo = new Map<string, boolean>();
+  assert.equal(reachesExternalOutput("dead_end_diag", "unitA", graph, memo), false);
+  assert.equal(reachesExternalOutput("real_diag", "unitA", graph, memo), true);
+  // reaching a role=final artifact declared by the *same* unit doesn't count -- that's not leaving
+  // the substage, it's just this unit's own (already-handled-by-role) output.
+  assert.equal(reachesExternalOutput("same_unit_diag", "unitA", graph, memo), false);
 });
 
 test("buildPipelineWalkthrough surfaces downstream_effects and tuning_hints verbatim from the contract unit", () => {

@@ -245,14 +245,14 @@ def list_2d_captures(source_id: str | None = None, settings: ApiSettings = Depen
 def capture_2d_image(capture_id: str, settings: ApiSettings = Depends(get_settings)) -> FileResponse:
     record = _load_capture_record(settings, capture_id)
     image_path = Path(str(record.get("image_path") or ""))
-    if not image_path.is_file():
-        raise HTTPException(status_code=404, detail={"code": "NO_PREVIEW_FRAME_AVAILABLE", "message": f"Capture image missing: {capture_id}"})
     base = _captures_dir(settings).resolve()
     resolved = image_path.resolve()
     try:
         resolved.relative_to(base)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail={"code": "SOURCE_NOT_AVAILABLE", "message": "Capture image path is outside calibration captures directory"}) from exc
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail={"code": "NO_PREVIEW_FRAME_AVAILABLE", "message": f"Capture image missing: {capture_id}"})
     suffix = resolved.suffix.lower()
     media_type = "image/png" if suffix == ".png" else "image/jpeg" if suffix in {".jpg", ".jpeg"} else None
     return FileResponse(resolved, media_type=media_type)

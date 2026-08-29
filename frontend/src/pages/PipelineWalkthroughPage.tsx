@@ -8,8 +8,12 @@ import {
 } from "../components/binaryMaskArtifacts";
 import { artifactRelevanceLabel, artifactRelevanceTone } from "../components/referenceArtifactRelevance";
 import { sourceArtifactsForTake } from "../components/stage_sources";
+import { stageSemanticDefinition } from "../components/stageSemantics";
 import { preferredViewportModeForArtifact, type ViewportMode } from "../components/studioViewState";
 import { artifactList, artifactsForStage, type StudioArtifact } from "../components/studioWorkspaceModel";
+import BlobSetViewer from "../components/BlobSetViewer";
+import { normalizeBlobDetectionArtifacts, resolveBlobSetSourceImage } from "../studio/blobDetectionModel";
+import { useLowGradientComponents } from "../studio/lowGradientComponentModel";
 import { buildStudioDeepLink } from "../studioDeepLink";
 import {
   buildPipelineWalkthrough,
@@ -52,9 +56,16 @@ function RelevanceBadge({ relevance, feedsInto }: { relevance: WalkthroughArtifa
   return <span className={`artifact-relevance-badge tone-${tone}`} title={title}>{artifactRelevanceLabel(relevance)}</span>;
 }
 
-function IoRoleTag({ ioRole }: { ioRole: WalkthroughArtifact["ioRole"] }) {
+function IoRoleTag({ ioRole, feedsInto }: { ioRole: WalkthroughArtifact["ioRole"]; feedsInto?: WalkthroughArtifact["feedsInto"] }) {
   if (ioRole !== "input" && ioRole !== "output") return null;
-  const title = ioRole === "input" ? "Consumed from an earlier substage" : "Used by a later step";
+  // OUT covers two cases with one badge: a declared role="final" hand-off, or a diagnostic verified
+  // to transitively reach a real final/input artifact outside this substage. feedsInto is only ever
+  // populated for the second case, so use it to say exactly where when we have it.
+  const title = ioRole === "input"
+    ? "Consumed from an earlier substage"
+    : feedsInto && feedsInto.length > 0
+      ? `Reaches: ${feedsInto.map((entry) => entry.label).join(", ")}`
+      : "Used by a later step";
   return <span className={`artifact-io-role-tag role-${ioRole}`} title={title}>{ioRole === "input" ? "in" : "out"}</span>;
 }
 
@@ -155,6 +166,8 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
   const [referenceOpacity, setReferenceOpacity] = useState(1);
   const [selectedReferenceId, setSelectedReferenceId] = useState<string | null>(null);
   const [binaryMaskMode, setBinaryMaskMode] = useState<"mask" | "overlay" | "boundary" | "side_by_side">("mask");
+  const [selectedBlobId, setSelectedBlobId] = useState<number | null>(null);
+  const [hoveredBlobId, setHoveredBlobId] = useState<number | null>(null);
   const initializedArtifactIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -204,6 +217,48 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
     [selectedArtifact, state?.src, takeId],
   );
   const useBinaryMaskView = Boolean(selectedArtifact && shouldUseBinaryMaskRenderer(selectedArtifact, allArtifacts));
+  const blobSetData = useMemo(
+    () => (selectedArtifact && stageSemanticDefinition(selectedArtifact.stage_id).category === "geometry"
+      ? normalizeBlobDetectionArtifacts(stageArtifacts)
+      : null),
+    [selectedArtifact, stageArtifacts],
+  );
+  const useBlobSetView = Boolean(selectedArtifact?.kind === "image" && blobSetData && blobSetData.candidates.length > 0);
+  const blobSetSourceUrl = useMemo(
+    () => (useBlobSetView ? resolveArtifactUrl(takeId, resolveBlobSetSourceImage(stageArtifacts)) ?? previewUrl : null),
+    [useBlobSetView, stageArtifacts, takeId, previewUrl],
+  );
+  const surfaceCandidatesArtifact = useMemo(
+    () => stageArtifacts.find((item) => item.artifact_id === "reference_surface_candidates") ?? null,
+    [stageArtifacts],
+  );
+  const lowGradientComponents = useLowGradientComponents(surfaceCandidatesArtifact?.path ? fileUrl(takeId, surfaceCandidatesArtifact.path) : null);
+  const useLowGradientComponentView = Boolean(
+    selectedArtifact?.kind === "image"
+    && selectedArtifact.stage_id
+    && stageSemanticDefinition(selectedArtifact.stage_id).category === "plane_qa"
+    && surfaceCandidatesArtifact
+    && !lowGradientComponents.loading
+    && !lowGradientComponents.error
+    && [...lowGradientComponents.components, ...lowGradientComponents.rejected].some((row) => row.bbox && row.centroid),
+  );
+  const lowGradientComponentsSourceUrl = useMemo(
+    () => (useLowGradientComponentView
+      ? resolveArtifactUrl(
+        takeId,
+        stageArtifacts.find((item) => item.artifact_id === "raw_heightmap_preview" && item.path)
+          ?? stageArtifacts.find((item) => item.artifact_id === "low_gradient_components_overlay" && item.path)
+          ?? null,
+      ) ?? previewUrl
+      : null),
+    [useLowGradientComponentView, stageArtifacts, takeId, previewUrl],
+  );
+  const lowGradientComponentsMaskSourceUrl = useMemo(
+    () => (useLowGradientComponentView
+      ? resolveArtifactUrl(takeId, stageArtifacts.find((item) => item.artifact_id === "low_gradient_blob_id_mask" && item.path) ?? null)
+      : null),
+    [useLowGradientComponentView, stageArtifacts, takeId],
+  );
 
   useEffect(() => {
     if (!state) return;
@@ -213,6 +268,8 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
     setOverlayOpacity(0.52);
     setReferenceOpacity(1);
     setSelectedReferenceId(null);
+    setSelectedBlobId(null);
+    setHoveredBlobId(null);
   }, [state?.artifact.artifactId]);
 
   useEffect(() => {
@@ -248,7 +305,28 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
           <div className="walkthrough-lightbox-visual-shell">
             {selectedArtifact?.kind === "image" ? (
               <>
-                {useBinaryMaskView ? (
+                {useLowGradientComponentView ? (
+                  <BlobSetViewer
+                    src={lowGradientComponentsSourceUrl}
+                    maskSourceSrc={lowGradientComponentsMaskSourceUrl}
+                    candidates={lowGradientComponents.components}
+                    rejected={lowGradientComponents.rejected}
+                    selectedCandidateId={selectedBlobId}
+                    hoveredCandidateId={hoveredBlobId}
+                    onSelectCandidate={setSelectedBlobId}
+                    onHoverCandidate={setHoveredBlobId}
+                  />
+                ) : useBlobSetView && blobSetData ? (
+                  <BlobSetViewer
+                    src={blobSetSourceUrl}
+                    candidates={blobSetData.candidates}
+                    rejected={blobSetData.rejected}
+                    selectedCandidateId={selectedBlobId}
+                    hoveredCandidateId={hoveredBlobId}
+                    onSelectCandidate={setSelectedBlobId}
+                    onHoverCandidate={setHoveredBlobId}
+                  />
+                ) : useBinaryMaskView ? (
                   <BinaryMaskRenderer
                     artifact={selectedArtifact}
                     artifacts={allArtifacts}
@@ -353,6 +431,7 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
           <div className="walkthrough-lightbox-heading">
             <div>
               <h2>{state.label}</h2>
+              <IoRoleTag ioRole={state.artifact.ioRole} feedsInto={state.artifact.feedsInto} />
               <RelevanceBadge relevance={state.artifact.relevance} feedsInto={state.artifact.feedsInto} />
             </div>
             <button type="button" onClick={onClose} aria-label="Close">✕</button>
@@ -380,7 +459,7 @@ function ArtifactChip({ takeId, entry, tuneHref, onOpen }: { takeId: string; ent
       ) : null}
       <div className="walkthrough-artifact-chip-label">
         <span>{entry.label}</span>
-        <IoRoleTag ioRole={entry.ioRole} />
+        <IoRoleTag ioRole={entry.ioRole} feedsInto={entry.feedsInto} />
         <RelevanceBadge relevance={entry.relevance} feedsInto={entry.feedsInto} />
       </div>
     </div>

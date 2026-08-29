@@ -507,6 +507,45 @@ function strategySummaryForStage(
   return summary.filter((entry) => entry.value !== "Unknown");
 }
 
+type ArtifactGraphNode = { role: string; unitId: string; feedsInto: string[] };
+
+// Whether a diagnostic artifact "really" leaves its substage is a transitive-reachability question,
+// not a first-hop one: a diagnostic can point at another diagnostic that itself goes nowhere (still
+// a dead end -- must not be marked OUT), or at another diagnostic that *does* eventually reach a real
+// final/input artifact in a different unit (genuinely OUT, even though the immediate hop looks the
+// same). Memoized per (originUnitId, artifactId) since multiple diagnostics in one substage often
+// converge on the same downstream node -- cheap either way at this graph's size (tens of nodes,
+// mostly 0-1 edges each), but avoids repeating the same walk.
+function reachesExternalOutput(
+  artifactId: string,
+  originUnitId: string,
+  graph: Map<string, ArtifactGraphNode>,
+  memo: Map<string, boolean>,
+  visiting: Set<string> = new Set(),
+): boolean {
+  const cacheKey = `${originUnitId}::${artifactId}`;
+  const cached = memo.get(cacheKey);
+  if (cached !== undefined) return cached;
+  if (visiting.has(artifactId)) return false;
+  visiting.add(artifactId);
+  let result = false;
+  for (const nextId of graph.get(artifactId)?.feedsInto ?? []) {
+    const next = graph.get(nextId);
+    if (!next) continue;
+    if (next.unitId !== originUnitId && (next.role === "final" || next.role === "input")) {
+      result = true;
+      break;
+    }
+    if (reachesExternalOutput(nextId, originUnitId, graph, memo, visiting)) {
+      result = true;
+      break;
+    }
+  }
+  visiting.delete(artifactId);
+  memo.set(cacheKey, result);
+  return result;
+}
+
 /**
  * Walks every stage of the pipeline for a given take, producing a flat, relevance-tagged
  * report of every substage's artifacts and parameters -- the same contract data that drives
@@ -517,17 +556,33 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
   const stageParams = allStageParams(detail);
   const takeArtifacts = artifactList(detail);
   // feeds_into targets can live on any unit in any stage (e.g. a detect_belt_plane diagnostic
-  // feeding Segment's final mask), so the id -> label lookup has to span the whole pipeline, not
-  // just the current stage's own units.
+  // feeding Segment's final mask), so both the id -> label lookup and the reachability graph have
+  // to span the whole pipeline, not just the current stage's own units.
   const allArtifactLabels = new Map<string, string>();
+  const artifactGraph = new Map<string, ArtifactGraphNode>();
   for (const unit of processingUnitsForPipeline(pipeline, detail)) {
     for (const artifact of unit.artifacts) {
       if (!allArtifactLabels.has(artifact.artifact_id)) allArtifactLabels.set(artifact.artifact_id, artifact.label);
+      if (!artifactGraph.has(artifact.artifact_id)) {
+        artifactGraph.set(artifact.artifact_id, { role: artifact.role, unitId: unit.id, feedsInto: artifact.feeds_into ?? [] });
+      }
     }
   }
+  const reachabilityMemo = new Map<string, boolean>();
   const resolveFeedsInto = (ids: string[] | undefined): WalkthroughFeedsInto[] | undefined => {
     if (!ids || ids.length === 0) return undefined;
     return ids.map((artifactId) => ({ artifactId, label: allArtifactLabels.get(artifactId) ?? artifactId.replace(/_/g, " ") }));
+  };
+  // Unifies the two ways an artifact earns "OUT": a declared role="final"/"input" (the substage's own
+  // intentional hand-off), or a role="diagnostic" whose feeds_into chain is verified to transitively
+  // reach a real final/input artifact outside this unit -- data that leaves the substage in practice
+  // even though the contract never labeled it a deliverable. A diagnostic whose chain only reaches
+  // other diagnostics (or nothing) does not qualify and stays plain DEBUG.
+  const resolveIoRole = (role: string, unitId: string, artifactId: string): ArtifactIoRole | undefined => {
+    if (role === "input") return "input";
+    if (role === "final") return "output";
+    if (role === "diagnostic" && reachesExternalOutput(artifactId, unitId, artifactGraph, reachabilityMemo)) return "output";
+    return undefined;
   };
 
   return pipeline.stages.map((stage): WalkthroughStage => {
@@ -551,11 +606,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
           label: artifact.label,
           relevance: found ? (artifact.role === "diagnostic" ? "debug" : "active") : "missing",
           reason: artifact.description ?? undefined,
-          ioRole: artifact.role === "input"
-            ? "input"
-            : (artifact.role === "final" || (artifact.role === "diagnostic" && (artifact.feeds_into?.length ?? 0) > 0))
-              ? "output"
-              : undefined,
+          ioRole: resolveIoRole(artifact.role, root.id, artifact.artifact_id),
           artifact: found,
           feedsInto: resolveFeedsInto(artifact.feeds_into),
         };
@@ -570,15 +621,18 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
 
     for (const resolved of resolution.substages) {
       const unit = units.find((item) => item.id === resolved.unitId);
-      const artifacts: WalkthroughArtifact[] = resolved.supportingArtifacts.map((entry) => ({
-        artifactId: entry.artifactId,
-        label: entry.artifact?.title ?? entry.artifactId,
-        relevance: entry.category,
-        reason: entry.reason,
-        ioRole: entry.ioRole,
-        artifact: entry.artifact,
-        feedsInto: resolveFeedsInto(unit?.artifacts.find((a) => a.artifact_id === entry.artifactId)?.feeds_into),
-      }));
+      const artifacts: WalkthroughArtifact[] = resolved.supportingArtifacts.map((entry) => {
+        const declared = unit?.artifacts.find((a) => a.artifact_id === entry.artifactId);
+        return {
+          artifactId: entry.artifactId,
+          label: entry.artifact?.title ?? entry.artifactId,
+          relevance: entry.category,
+          reason: entry.reason,
+          ioRole: unit && declared ? resolveIoRole(declared.role, unit.id, declared.artifact_id) : entry.ioRole,
+          artifact: entry.artifact,
+          feedsInto: resolveFeedsInto(declared?.feeds_into),
+        };
+      });
       const relevance = substageRelevance(resolved);
       if (unit) {
         substages.push(buildUnitEntry(unit, resolved.substageId, relevance, artifacts, values, units));

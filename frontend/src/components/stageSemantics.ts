@@ -10,12 +10,12 @@ export function canonicalStageId(stageId: string, stageLabel?: string | null): s
   if (raw.includes("normalizeheightstoplane") || raw.includes("normalizeheightrelativetoplane") || raw.includes("normalized height")) return "normalize_heights_to_plane";
   if (raw.includes("removebeltandsegmentobjects") || raw.includes("heightsegmentation")) return "remove_belt_segment_objects";
   if (raw.includes("extractconnectedcomponents")) return "connected_components";
-  if (raw.includes("fitobjectgeometry") || raw.includes("footprint geometry") || raw === "geometry") return "fit_object_geometry";
-  if (raw.includes("computeheightmetrics") || raw.includes("height + volume") || raw === "measurement") return "compute_height_metrics";
-  if (raw.includes("computemeasurementdiagnostics") || raw.includes("measurement diagnostics")) return "measurement_diagnostics";
+  if (raw.includes("fitobjectgeometry") || raw.includes("footprint geometry") || raw.trim() === "geometry") return "fit_object_geometry";
+  if (raw.includes("computeheightmetrics") || raw.includes("height + volume") || raw.includes("compute_height_metrics") || raw.trim() === "measurement") return "compute_height_metrics";
+  if (raw.includes("computemeasurementdiagnostics") || raw.includes("measurement diagnostics") || raw.includes("measurement_diagnostics")) return "measurement_diagnostics";
   if (raw.includes("classify_25d")) return "classify_25d";
   if (raw.includes("classifyminingball25d")) return "classify_25d";
-  if (raw.includes("generate25doverlays")) return "overlays_25d";
+  if (raw.includes("generate25doverlays") || raw.trim() === "overlay") return "overlays_25d";
   if (
     raw.includes("blob_detection")
     || raw.includes("blob/contour")
@@ -34,7 +34,21 @@ export function canonicalStageId(stageId: string, stageLabel?: string | null): s
   return (stageId || "").toLowerCase();
 }
 
-export type StageViewRendererType = "image" | "overlay" | "table" | "metrics" | "json" | "gallery" | "histogram";
+export type StageMaskViewSpec = {
+  maskArtifactId?: string;
+  maskArtifactIds?: string[];
+  maskSemanticTypes?: string[];
+  preferredReferenceArtifactIds?: string[];
+  preferredReferenceSemanticTypes?: string[];
+  defaultMode?: "mask" | "overlay" | "boundary" | "side_by_side";
+  defaultReferenceRole?: "source" | "raw" | "normalized" | "computed_from" | "diagnostic";
+  maskOnLabel?: string;
+  maskOffLabel?: string;
+  diagnosticsLabel?: string;
+  description?: string;
+};
+
+export type StageViewRendererType = "image" | "overlay" | "table" | "metrics" | "json" | "gallery" | "histogram" | "mask";
 
 export type StageViewDefinition = {
   id: string;
@@ -45,6 +59,7 @@ export type StageViewDefinition = {
   priority?: number;
   emptyState?: { title: string; description?: string };
   rendererType: StageViewRendererType;
+  maskViewSpec?: StageMaskViewSpec;
 };
 
 export type StageSemanticCategory = "input" | "plane_qa" | "segmentation" | "geometry" | "measurement" | "classification" | "fusion";
@@ -61,6 +76,17 @@ export type StageSemanticDefinition = {
     json?: boolean;
   };
 };
+
+/*
+Renderer choice convention:
+- Use `rendererType: "mask"` for binary spatial inclusion/exclusion artifacts.
+- Use `rendererType: "image"` for scalar rasters and heatmaps such as residuals, gradients, and height previews.
+- Use `rendererType: "overlay"` for contours, labels, and classification overlays.
+*/
+
+function stageMaskViewSpec(spec: StageMaskViewSpec): StageMaskViewSpec {
+  return spec;
+}
 
 function stageKind(stageId: string): StageSemanticCategory {
   const id = canonicalStageId(stageId).toLowerCase();
@@ -151,8 +177,28 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
         { id: "normalized_height", label: "Normalized height", rendererType: "image", priority: 1, emptyState: { title: "No normalized height preview available yet." } },
         { id: "residuals", label: "Residuals", rendererType: "image", priority: 3, emptyState: { title: "No residual visualization available yet." } },
         { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 4, emptyState: { title: "No normalization diagnostics available yet." } },
-        { id: "below_reference", label: "Below/equal reference", rendererType: "image", priority: 4, emptyState: { title: "No below-reference mask available yet." } },
-        { id: "above_threshold", label: "Above threshold", rendererType: "image", priority: 5, emptyState: { title: "No above-threshold mask available yet." } },
+        {
+          id: "below_reference",
+          label: "Below/equal reference",
+          rendererType: "mask",
+          priority: 4,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "below_reference_mask",
+            diagnosticsLabel: "Normalization mask",
+          }),
+          emptyState: { title: "No below-reference mask available yet." },
+        },
+        {
+          id: "above_threshold",
+          label: "Above threshold",
+          rendererType: "mask",
+          priority: 5,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "above_threshold_mask",
+            diagnosticsLabel: "Normalization mask",
+          }),
+          emptyState: { title: "No above-threshold mask available yet." },
+        },
         { id: "histogram", label: "Histogram", rendererType: "histogram", priority: 6, emptyState: { title: "No normalized-height histogram available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
@@ -165,26 +211,331 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       defaultViewId: "selected_surface",
       views: [
         { id: "raw_heightmap", label: "Raw heightmap", rendererType: "image", priority: 1, emptyState: { title: "No raw heightmap preview available yet." } },
-        { id: "valid_mask", label: "Valid mask", rendererType: "image", priority: 2, emptyState: { title: "No valid mask available yet." } },
+        {
+          id: "valid_mask",
+          label: "Valid mask",
+          rendererType: "mask",
+          priority: 2,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "valid_mask",
+            maskOnLabel: "Valid sample",
+            maskOffLabel: "Invalid sample",
+            diagnosticsLabel: "Input validity",
+            description: "Pixels with valid source data before reference-surface filtering.",
+          }),
+          emptyState: { title: "No valid mask available yet." },
+        },
         { id: "depth_gradient", label: "Depth gradient", rendererType: "image", priority: 3, emptyState: { title: "No depth gradient preview available yet." } },
-        { id: "low_gradient_mask", label: "Low-gradient mask", rendererType: "image", priority: 4, emptyState: { title: "No low-gradient mask available yet." } },
+        {
+          id: "low_gradient_mask",
+          label: "Low-gradient mask",
+          rendererType: "mask",
+          priority: 4,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "low_gradient_mask",
+            preferredReferenceArtifactIds: ["raw_heightmap", "raw_heightmap_preview", "heightmap_input_preview", "source_heightmap_preview", "take_thumbnail"],
+            defaultMode: "overlay",
+            defaultReferenceRole: "raw",
+          }),
+          emptyState: { title: "No low-gradient mask available yet." },
+        },
         { id: "surface_candidates", label: "Surface candidates", rendererType: "json", priority: 5, emptyState: { title: "No reference-surface candidates available yet." } },
-        { id: "selected_surface", label: "Selected surface", rendererType: "image", priority: 6, emptyState: { title: "No selected surface mask available yet." } },
-        { id: "plane_inliers", label: "Plane inliers", rendererType: "image", priority: 7, emptyState: { title: "No plane inlier mask available yet." } },
+        {
+          id: "background_candidates",
+          label: "Background candidates",
+          rendererType: "mask",
+          priority: 5,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "background_candidate_mask",
+            diagnosticsLabel: "Candidate support",
+          }),
+          emptyState: { title: "No background candidate mask available yet." },
+        },
+        {
+          id: "background_seeds",
+          label: "Background seeds",
+          rendererType: "mask",
+          priority: 5,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "background_seed_mask",
+            diagnosticsLabel: "Seed support",
+          }),
+          emptyState: { title: "No background seed mask available yet." },
+        },
+        {
+          id: "plane_fit_roi",
+          label: "Plane-fit ROI",
+          rendererType: "mask",
+          priority: 5,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "plane_fit_roi_mask",
+            diagnosticsLabel: "ROI mask",
+          }),
+          emptyState: { title: "No plane-fit ROI mask available yet." },
+        },
+        {
+          id: "height_gate",
+          label: "Height gate",
+          rendererType: "mask",
+          priority: 5,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "height_gate_mask",
+            diagnosticsLabel: "Height gate",
+          }),
+          emptyState: { title: "No height-gate mask available yet." },
+        },
+        {
+          id: "selected_surface",
+          label: "Selected surface",
+          rendererType: "mask",
+          priority: 6,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactIds: ["selected_reference_support_mask", "reference_surface_selected_mask", "expanded_plane_mask"],
+            preferredReferenceArtifactIds: ["raw_heightmap", "raw_heightmap_preview", "heightmap_input_preview", "source_heightmap_preview", "normalized_heightmap", "take_thumbnail"],
+            diagnosticsLabel: "Reference support",
+          }),
+          emptyState: { title: "No selected surface mask available yet." },
+        },
+        {
+          id: "expanded_plane",
+          label: "Expanded plane",
+          rendererType: "mask",
+          priority: 6,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "expanded_plane_mask",
+            diagnosticsLabel: "Residual expansion",
+          }),
+          emptyState: { title: "No expanded-plane mask available yet." },
+        },
+        {
+          id: "plane_inliers",
+          label: "Plane inliers",
+          rendererType: "mask",
+          priority: 7,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactIds: ["reference_model_inlier_mask", "final_plane_inlier_mask", "plane_inlier_mask", "expanded_plane_mask"],
+            preferredReferenceArtifactIds: ["raw_heightmap", "raw_heightmap_preview", "heightmap_input_preview", "source_heightmap_preview", "reference_surface_selected_mask", "expanded_plane_mask"],
+            diagnosticsLabel: "Fit support",
+          }),
+          emptyState: { title: "No plane inlier mask available yet." },
+        },
         { id: "residual_heatmap", label: "Residual heatmap", rendererType: "image", priority: 8, emptyState: { title: "No residual heatmap available yet." } },
         { id: "residual_histogram", label: "Residual histogram", rendererType: "table", priority: 9, emptyState: { title: "No residual histogram available yet." } },
         { id: "diagnostics", label: "Diagnostics", rendererType: "table", priority: 10, emptyState: { title: "No plane diagnostics available yet." } },
         { id: "depth_plot", label: "Depth plot", rendererType: "image", priority: 9, emptyState: { title: "No depth plot available yet." } },
         { id: "plateau_plot", label: "Plateau plot", rendererType: "image", priority: 10, emptyState: { title: "Plateau plot not available.", description: "Run the stage with strategy=low_gradient_depth_plateaus to populate this view." } },
         { id: "filtered_depth_plot", label: "Filtered depth plot", rendererType: "image", priority: 10, emptyState: { title: "Filtered depth plot not available.", description: "Run the stage with strategy=low_gradient_depth_plateaus to see the sorted-z distribution of low-gradient candidates only." } },
-        { id: "belt_base", label: "Belt base", rendererType: "image", priority: 11, emptyState: { title: "Belt base mask not available.", description: "Run the stage with strategy=low_gradient_depth_plateaus to see the belt base after stripe suppression." } },
-        { id: "belt_stripes", label: "Belt stripes", rendererType: "image", priority: 11, emptyState: { title: "Belt stripes mask not available.", description: "Belt-stripe filter only runs for strategy=low_gradient_depth_plateaus." } },
-        { id: "belt_stripes_tophat", label: "Stripes — top-hat", rendererType: "image", priority: 12, emptyState: { title: "Top-hat stripe pass not available.", description: "Belt-stripe filter only runs for strategy=low_gradient_depth_plateaus." } },
-        { id: "belt_stripes_shape", label: "Stripes — shape pass", rendererType: "image", priority: 12, emptyState: { title: "Shape stripe pass not available.", description: "Enable belt_stripe_filter_z_floor_enabled for the shape-based pass that catches wide stripes / object-adjacent stripes." } },
-        { id: "belt_above_belt", label: "Above belt mask", rendererType: "image", priority: 12, emptyState: { title: "Above-belt mask not available.", description: "Enable belt_stripe_filter_z_floor_enabled to populate this view." } },
-        { id: "belt_wide_object", label: "Wide-object mask", rendererType: "image", priority: 12, emptyState: { title: "Wide-object mask not available.", description: "Enable belt_stripe_filter_z_floor_enabled to populate this view." } },
-        { id: "belt_altitude_plot", label: "Stripe altitude", rendererType: "image", priority: 11, emptyState: { title: "Belt-stripe altitude histogram not available.", description: "Belt-stripe filter only runs for strategy=low_gradient_depth_plateaus." } },
-        { id: "belt_baseline", label: "Local-min baseline", rendererType: "image", priority: 11, emptyState: { title: "Local-min baseline not available.", description: "Belt-stripe filter only runs for strategy=low_gradient_depth_plateaus." } },
+        { id: "blob_components", label: "Blob components", rendererType: "image", priority: 10, emptyState: { title: "Blob components not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect low-gradient connected blobs." } },
+        { id: "height_aware_blob_components", label: "XY-only components", rendererType: "image", priority: 10, emptyState: { title: "XY-only components not available.", description: "Classic XY-only blob components were not emitted for this run or are unavailable as a height_aware comparison artifact." } },
+        { id: "height_aware_connectivity_rejected_edges", label: "Rejected Z-connections", rendererType: "image", priority: 10, emptyState: { title: "Rejected Z-connections not available.", description: "Run the blob strategy with blob_component_mode=height_aware to inspect neighboring low-gradient pixels blocked from joining the same blob because of Z incompatibility." } },
+        { id: "height_borders", label: "Height borders", rendererType: "image", priority: 10, emptyState: { title: "Height borders not available.", description: "Run the blob strategy with height-border splitting to inspect internal height-boundary strength and cut masks." } },
+        { id: "height_border_fragments", label: "Height-border fragments", rendererType: "image", priority: 10, emptyState: { title: "Height-border fragments not available.", description: "Run the blob strategy with height-border splitting to inspect the spatial fragments before any optional histogram refinement." } },
+        { id: "height_split_blobs", label: "Height-split blobs", rendererType: "image", priority: 10, emptyState: { title: "Height-split blobs not available.", description: "Run the blob strategy to inspect height-consistent fragments and split diagnostics." } },
+        { id: "blob_clusters", label: "Blob clusters", rendererType: "table", priority: 10, emptyState: { title: "Blob clusters not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect height-cluster summaries." } },
+        { id: "selected_blob_cluster", label: "Selected blob cluster", rendererType: "image", priority: 10, emptyState: { title: "Selected blob cluster not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect the chosen support cluster." } },
+        { id: "selected_cluster_pre_refine", label: "Selected cluster pre-refine", rendererType: "image", priority: 10, emptyState: { title: "Selected cluster pre-refine mask not available.", description: "Run the blob strategy to inspect the selected cluster before candidate refinement." } },
+        { id: "selected_cluster_refined", label: "Selected cluster refined", rendererType: "image", priority: 10, emptyState: { title: "Selected cluster refined mask not available.", description: "Run the blob strategy to inspect the selected cluster after candidate refinement." } },
+        { id: "pre_stripe_support", label: "Pre-stripe support", rendererType: "image", priority: 10, emptyState: { title: "Pre-stripe support mask not available.", description: "Selected reference support before stripe suppression." } },
+        { id: "removed_by_refinement", label: "Removed by refinement", rendererType: "image", priority: 10, emptyState: { title: "Removed-by-refinement mask not available.", description: "Run the blob strategy to inspect what candidate refinement removed from the selected cluster." } },
+        { id: "rejected_blob_clusters", label: "Rejected blob clusters", rendererType: "image", priority: 10, emptyState: { title: "Rejected blob clusters not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect rejected support clusters." } },
+        { id: "blob_cluster_scores", label: "Cluster score table", rendererType: "table", priority: 10, emptyState: { title: "Blob cluster score table not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect cluster ranking." } },
+        { id: "selection_bridge", label: "Selection bridge", rendererType: "table", priority: 10, emptyState: { title: "Selection bridge not available.", description: "Run the stage with strategy=low_gradient_blob_height_clusters to inspect how components/fragments map to clusters and the selected support." } },
+        { id: "selected_support_lineage", label: "Selected support lineage", rendererType: "table", priority: 10, emptyState: { title: "Selected support lineage not available.", description: "Run the blob-cluster strategy to inspect how the selected cluster becomes selected support, model support, and suppression." } },
+        {
+          id: "belt_bg",
+          label: "Belt background",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_bg_mask",
+            maskOnLabel: "Belt background",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Background support",
+            description: "Stable belt/background pixels used to estimate the height reference.",
+          }),
+          emptyState: { title: "Belt background mask not available.", description: "Stable belt/background pixels used to estimate the height reference." },
+        },
+        {
+          id: "belt_base",
+          label: "Belt base",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_base_mask",
+            maskOnLabel: "Belt base",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Stripe suppression",
+            description: "Support classified as stable belt/base after stripe reasoning.",
+          }),
+          emptyState: { title: "Belt base mask not available.", description: "Support classified as stable belt/base after stripe reasoning." },
+        },
+        {
+          id: "stripe_filtered_support",
+          label: "Stripe-filtered support",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "stripe_filtered_reference_support_mask",
+            maskOnLabel: "Support kept",
+            maskOffLabel: "Suppressed",
+            diagnosticsLabel: "Stripe suppression",
+            description: "Cleaned reference support passed to later reference fitting and support selection.",
+          }),
+          emptyState: { title: "Stripe-filtered support mask not available.", description: "Cleaned reference support passed to later reference fitting and support selection." },
+        },
+        {
+          id: "belt_stripes",
+          label: "Belt stripes",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_stripes_mask",
+            preferredReferenceArtifactIds: ["raw_heightmap", "raw_heightmap_preview", "heightmap_input_preview", "source_heightmap_preview", "normalized_heightmap", "take_thumbnail"],
+            diagnosticsLabel: "Stripe suppression",
+            description: "Final stripe mask detected by the stripe filter.",
+          }),
+          emptyState: { title: "Belt stripes mask not available.", description: "Final stripe mask detected by the stripe filter." },
+        },
+        {
+          id: "unknown_low_gradient",
+          label: "Unknown low-gradient",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "unknown_low_gradient_mask",
+            maskOnLabel: "Unknown low-gradient",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Preserved candidates",
+            description: "Low-gradient components preserved for object detection because they were neither accepted belt background nor stripe surfaces.",
+          }),
+          emptyState: { title: "Unknown low-gradient mask not available.", description: "Low-gradient components preserved for object detection because they were neither accepted belt background nor stripe surfaces." },
+        },
+        {
+          id: "surface_suppression",
+          label: "Surface suppression",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "surface_suppression_mask",
+            maskOnLabel: "Suppressed surface",
+            maskOffLabel: "Available",
+            diagnosticsLabel: "Segmentation suppression",
+            description: "Explicit suppression mask used downstream: belt background plus accepted belt stripes.",
+          }),
+          emptyState: { title: "Surface suppression mask not available.", description: "Explicit suppression mask used downstream: belt background plus accepted belt stripes." },
+        },
+        {
+          id: "object_search_domain",
+          label: "Object search domain",
+          rendererType: "mask",
+          priority: 11,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "object_search_domain_mask",
+            maskOnLabel: "Object search",
+            maskOffLabel: "Suppressed surface",
+            diagnosticsLabel: "Object search domain",
+            description: "Remaining domain passed to object segmentation after explicit surface suppression.",
+          }),
+          emptyState: { title: "Object search domain mask not available.", description: "Remaining domain passed to object segmentation after explicit surface suppression." },
+        },
+        {
+          id: "belt_stripes_tophat",
+          label: "Stripes — top-hat",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_stripes_tophat_mask",
+            maskOnLabel: "Top-hat stripe",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Stripe pass",
+            description: "Morphology/top-hat response highlighting narrow raised stripe candidates.",
+          }),
+          emptyState: { title: "Top-hat stripe pass not available.", description: "Morphology/top-hat response highlighting narrow raised stripe candidates." },
+        },
+        {
+          id: "belt_stripes_shape",
+          label: "Stripes — shape pass",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_stripes_shape_mask",
+            maskOnLabel: "Shape stripe",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Stripe pass",
+            description: "Stripe candidates that passed shape/geometry constraints.",
+          }),
+          emptyState: { title: "Shape stripe pass not available.", description: "Stripe candidates that passed shape/geometry constraints." },
+        },
+        {
+          id: "belt_above_belt",
+          label: "Above belt mask",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_above_belt_mask",
+            maskOnLabel: "Above belt",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Stripe pass",
+            description: "Pixels considered above the belt/reference baseline.",
+          }),
+          emptyState: { title: "Above-belt mask not available.", description: "Pixels considered above the belt/reference baseline." },
+        },
+        {
+          id: "belt_wide_object",
+          label: "Wide-object mask",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "belt_wide_object_mask",
+            maskOnLabel: "Wide object",
+            maskOffLabel: "Other",
+            diagnosticsLabel: "Stripe pass",
+            description: "Mask used to avoid treating wide object-like structures as belt stripes.",
+          }),
+          emptyState: { title: "Wide-object mask not available.", description: "Mask used to avoid treating wide object-like structures as belt stripes." },
+        },
+        {
+          id: "removed_by_stripe_filter",
+          label: "Removed by stripe suppression",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "support_removed_by_stripe_filter",
+            maskOnLabel: "Suppressed",
+            maskOffLabel: "Kept",
+            diagnosticsLabel: "Stripe suppression",
+            description: "Pixels removed from support due to stripe suppression.",
+          }),
+          emptyState: { title: "Removed-by-stripe mask not available.", description: "Pixels removed from support due to stripe suppression." },
+        },
+        { id: "belt_altitude_plot", label: "Stripe altitude", rendererType: "image", priority: 11, emptyState: { title: "Belt-stripe altitude histogram not available.", description: "Height/altitude evidence above the local belt baseline." } },
+        { id: "belt_baseline", label: "Local-min baseline", rendererType: "image", priority: 11, emptyState: { title: "Local-min baseline not available.", description: "Estimated local belt baseline used to detect raised stripe-like structures." } },
+        {
+          id: "reference_model_support",
+          label: "Selected support / fit mask",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactIds: ["reference_model_support_mask", "selected_reference_support_mask"],
+            diagnosticsLabel: "Reference support",
+          }),
+          emptyState: { title: "Reference-model support mask not available.", description: "Run the stage to inspect the actual pixels used as fit support for the reference model." },
+        },
+        {
+          id: "reference_suppression_mask",
+          label: "Suppression mask",
+          rendererType: "mask",
+          priority: 12,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "reference_suppression_mask",
+            maskOnLabel: "Suppressed reference",
+            maskOffLabel: "Kept",
+            diagnosticsLabel: "Suppression mask",
+            description: "Reference-derived pixels removed before foreground segmentation.",
+          }),
+          emptyState: { title: "Reference suppression mask not available.", description: "Run the stage to inspect which support-derived pixels will be removed downstream from segmentation." },
+        },
+        { id: "support_loss_waterfall", label: "Support-loss waterfall", rendererType: "table", priority: 12, emptyState: { title: "Support-loss waterfall not available.", description: "Reprocess this take with the current detect-reference diagnostics to inspect where support was lost." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },
       ],
     };
@@ -195,8 +546,65 @@ export function stageSemanticDefinition(stageId: string): StageSemanticDefinitio
       category: "segmentation",
       defaultViewId: "overlay",
       views: [
-        { id: "threshold_mask", label: "Threshold mask", rendererType: "image", priority: 1, emptyState: { title: "No threshold mask generated yet." } },
-        { id: "cleaned_mask", label: "Cleaned mask", rendererType: "image", priority: 2, emptyState: { title: "No cleaned object mask generated yet." } },
+        {
+          id: "threshold_mask",
+          label: "Threshold mask",
+          rendererType: "mask",
+          priority: 1,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactIds: ["foreground_before_plane_suppression", "normalized_height_threshold_mask", "threshold_mask", "above_threshold_mask"],
+            maskOnLabel: "Foreground candidate",
+            maskOffLabel: "Background",
+            diagnosticsLabel: "Segmentation threshold",
+            description: "Foreground candidate pixels before reference suppression cleanup.",
+          }),
+          emptyState: { title: "No threshold mask generated yet." },
+        },
+        {
+          id: "cleaned_mask",
+          label: "Cleaned mask",
+          rendererType: "mask",
+          priority: 2,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactIds: ["final_object_mask", "cleaned_object_mask", "cleaned_mask", "plane_suppressed_mask"],
+            preferredReferenceArtifactIds: ["normalized_heightmap", "normalized_height", "raw_heightmap", "raw_heightmap_preview", "take_thumbnail"],
+            diagnosticsLabel: "Final object mask",
+          }),
+          emptyState: { title: "No cleaned object mask generated yet." },
+        },
+        {
+          id: "plane_suppressed_mask",
+          label: "Plane-suppressed mask",
+          rendererType: "mask",
+          priority: 3,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "plane_suppressed_mask",
+            diagnosticsLabel: "Reference suppression",
+          }),
+          emptyState: { title: "No plane-suppressed mask generated yet." },
+        },
+        {
+          id: "rejected_background_residuals",
+          label: "Rejected background residuals",
+          rendererType: "mask",
+          priority: 3,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "rejected_background_residuals",
+            diagnosticsLabel: "Foreground cleanup",
+          }),
+          emptyState: { title: "No rejected-background residual mask generated yet." },
+        },
+        {
+          id: "rejected_belt_stripes",
+          label: "Rejected belt stripes",
+          rendererType: "mask",
+          priority: 3,
+          maskViewSpec: stageMaskViewSpec({
+            maskArtifactId: "rejected_belt_stripes",
+            diagnosticsLabel: "Foreground cleanup",
+          }),
+          emptyState: { title: "No rejected-belt-stripes mask generated yet." },
+        },
         { id: "segmentation", label: "Connected components", rendererType: "table", priority: 3, emptyState: { title: "No connected components found yet." } },
         { id: "overlay", label: "Overlay", rendererType: "overlay", priority: 4, emptyState: { title: "No segmentation overlay available yet." } },
         { id: "json", label: "JSON", rendererType: "json", priority: 99 },

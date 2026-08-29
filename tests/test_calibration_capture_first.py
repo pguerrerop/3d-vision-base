@@ -29,6 +29,7 @@ def make_settings(data_dir: Path) -> ApiSettings:
         state_dir=data_dir / "state",
         events_dir=data_dir / "events",
         sessions_dir=data_dir / "sessions",
+        datasets_dir=data_dir / "datasets",
     )
     settings.ensure_directories()
     return settings
@@ -46,6 +47,7 @@ def test_capture_works_even_when_preview_would_be_stale(tmp_path: Path, monkeypa
             "acquisition_mode": "direct_source",
             "frame_timestamp": "2026-01-01T00:00:00+00:00",
             "frame_age_seconds": 0.0,
+            "freshness_status": "fresh",
         }
 
     monkeypatch.setattr("vision_3d_acquisition.api.calibration._acquire_capture_frame", fake_acquire)
@@ -68,9 +70,16 @@ def test_detect_enabled_after_capture_and_captures_persist(tmp_path: Path, monke
             "acquisition_mode": "preview_cache_fallback",
             "frame_timestamp": "2026-01-01T00:00:00+00:00",
             "frame_age_seconds": 2.5,
+            "freshness_status": "fresh",
         },
     )
     monkeypatch.setattr("vision_3d_acquisition.api.calibration._update_preview_from_capture", lambda *_args, **_kwargs: {"status": "live"})
+
+    def fake_detect(path: Path, _target):
+        from vision_3d_acquisition.calibration.camera_2d import DetectedFrame
+        return DetectedFrame(str(path), 60, 40, True, 4, None, None, np.zeros((40, 60, 3), dtype=np.uint8), [], success=True, error_code=None)
+
+    monkeypatch.setattr("vision_3d_acquisition.api.calibration.detect_target_in_image", fake_detect)
 
     capture = capture_2d_frame(Capture2DFrameRequest(source_id="usb_camera_0"), settings)
     listed = list_2d_captures("usb_camera_0", settings)
@@ -223,12 +232,13 @@ def test_capture_image_route_returns_file(tmp_path: Path, monkeypatch) -> None:
             "acquisition_mode": "preview_cache",
             "frame_timestamp": "2026-01-01T00:00:00+00:00",
             "frame_age_seconds": 0.0,
+            "freshness_status": "fresh",
         },
     )
     monkeypatch.setattr("vision_3d_acquisition.api.calibration._update_preview_from_capture", lambda *_args, **_kwargs: {"status": "live"})
     payload = capture_2d_frame(Capture2DFrameRequest(source_id="usb_camera_0"), settings)
     response = capture_2d_image(payload["capture_id"], settings)
-    assert response.path.endswith(".png")
+    assert str(response.path).endswith(".png")
 
 
 def test_capture_image_route_rejects_invalid_id(tmp_path: Path) -> None:
@@ -247,6 +257,7 @@ def test_capture_image_route_rejects_path_outside_captures_dir(tmp_path: Path, m
             "acquisition_mode": "preview_cache",
             "frame_timestamp": "2026-01-01T00:00:00+00:00",
             "frame_age_seconds": 0.0,
+            "freshness_status": "fresh",
         },
     )
     monkeypatch.setattr("vision_3d_acquisition.api.calibration._update_preview_from_capture", lambda *_args, **_kwargs: {"status": "live"})

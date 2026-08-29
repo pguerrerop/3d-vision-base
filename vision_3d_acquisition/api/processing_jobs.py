@@ -463,7 +463,9 @@ def resolve_processing_job_take_ids(
         if not page.get("has_more"):
             break
         page_offset = int(page.get("next_offset") or (page_offset + len(items)))
-    return list(dict.fromkeys(take_ids))
+    # `list_takes_paged` orders newest-first for browsing UX; job execution
+    # wants a stable, reproducible order independent of that, so sort here.
+    return sorted(dict.fromkeys(take_ids))
 
 
 def _summarize_items(items: list[ProcessingJobItem]) -> dict[str, int]:

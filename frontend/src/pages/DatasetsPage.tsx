@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, fileUrl, type DatasetMlSet, type DatasetSessionDetailSummary, type DatasetSessionSummary, type DatasetSummary, type MaterializeMlIngestionResponse, type PhysicalObjectSummary, type TakeDetail, type TakeSummary } from "../api/client";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { api, fileUrl, type DatasetMlSet, type DatasetSessionDetailSummary, type DatasetSessionSummary, type DatasetSummary, type MLSetMemberRow, type MLSetReviewFacetsResponse, type MLSetSummaryResponse, type MaterializeMlIngestionResponse, type PhysicalObjectSummary, type TakeDetail, type TakeSummary } from "../api/client";
 import DatasetSessionDrawer from "../components/datasets/DatasetSessionDrawer";
 import MLSetDetailDrawer from "../components/datasets/MLSetDetailDrawer";
 import PhysicalObjectDetailDrawer from "../components/datasets/PhysicalObjectDetailDrawer";
 import MLSetIngestionWizard from "../components/ingestion/MLSetIngestionWizard";
+import { buildStudioDeepLink } from "../studioDeepLink";
 
 type SplitBucket = "training" | "validation" | "test" | "benchmark" | "production-shadow" | "cross-site";
 type DatasetTab = "overview" | "takes" | "physical_objects" | "objects" | "labels" | "ml_sets" | "splits";
@@ -80,6 +81,27 @@ type DatasetsPageProfilerSnapshot = {
   backend_profile: NonNullable<Awaited<ReturnType<typeof api.pagedTakes>>["profile"]> | null;
 };
 
+type MlSetScopedView = "takes" | "object_groups";
+type MlSetMembershipStatusFilter = "all" | "review_required" | "default_trainable" | "excluded" | "uncertain";
+type MlSetScopeState = {
+  mlSetId: string;
+  normalizedClass: string;
+  superclass: string;
+  physicalObjectId: string;
+};
+type MlSetObjectGroup = {
+  id: string;
+  physicalObjectId: string;
+  normalizedClass: string;
+  superclass: string;
+  rawLabels: string[];
+  splitValues: string[];
+  sessions: string[];
+  warningCodes: string[];
+  takeCount: number;
+  members: MLSetMemberRow[];
+};
+
 function countFromValidation(summary: PagedSummaryCounts | null, key: string, fallback = 0): number {
   return Number(summary?.validation?.[key] ?? fallback);
 }
@@ -95,11 +117,24 @@ function formatProfilerMs(value: number | null | undefined) {
   return `${value.toFixed(1)} ms`;
 }
 
+function formatFacetCountLabel(label: string, count?: number | null) {
+  return typeof count === "number" && count >= 0 ? `${label} · ${count}` : label;
+}
+
+function formatObjectFacetLabel(option: NonNullable<MLSetReviewFacetsResponse["object_ids"]>[number]) {
+  const parts = [`${option.value} · ${option.take_count} takes`];
+  if (option.normalized_class) parts.push(option.normalized_class);
+  if (option.superclass) parts.push(option.superclass);
+  return parts.join(" · ");
+}
+
 export default function DatasetsPage() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [sessions, setSessions] = useState<DatasetSessionSummary[]>([]);
   const [mlSets, setMlSets] = useState<DatasetMlSet[]>([]);
   const [physicalObjects, setPhysicalObjects] = useState<PhysicalObjectSummary[]>([]);
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
   const [modalDatasetSessions, setModalDatasetSessions] = useState<DatasetSessionSummary[]>([]);
   const [pagedTakes, setPagedTakes] = useState<TakeSummary[]>([]);
   const [offset, setOffset] = useState(0);
@@ -112,6 +147,23 @@ export default function DatasetsPage() {
   const [selectedObjectId, setSelectedObjectId] = useState("");
   const [selectedPhysicalObjectId, setSelectedPhysicalObjectId] = useState("");
   const [selectedMlSetId, setSelectedMlSetId] = useState("");
+  const [activeMlSetScope, setActiveMlSetScope] = useState<MlSetScopeState | null>(null);
+  const [mlSetScopedView, setMlSetScopedView] = useState<MlSetScopedView>("takes");
+  const [mlSetMemberRows, setMlSetMemberRows] = useState<MLSetMemberRow[]>([]);
+  const [mlSetMemberOffset, setMlSetMemberOffset] = useState(0);
+  const [mlSetMemberHasMore, setMlSetMemberHasMore] = useState(false);
+  const [mlSetMemberFilteredCount, setMlSetMemberFilteredCount] = useState<number | null>(null);
+  const [mlSetScopeSummary, setMlSetScopeSummary] = useState<MLSetSummaryResponse | null>(null);
+  const [mlSetReviewFacets, setMlSetReviewFacets] = useState<MLSetReviewFacetsResponse | null>(null);
+  const [mlSetObjectIdFilter, setMlSetObjectIdFilter] = useState("");
+  const [mlSetRawLabelFilter, setMlSetRawLabelFilter] = useState("");
+  const [mlSetNormalizedClassFilter, setMlSetNormalizedClassFilter] = useState("");
+  const [mlSetSuperclassFilter, setMlSetSuperclassFilter] = useState("");
+  const [mlSetMembershipStatusFilter, setMlSetMembershipStatusFilter] = useState<MlSetMembershipStatusFilter>("all");
+  const [mlSetSplitFilter, setMlSetSplitFilter] = useState("");
+  const [mlSetSessionFilter, setMlSetSessionFilter] = useState("");
+  const [selectedObjectGroupId, setSelectedObjectGroupId] = useState("");
+  const [expandedObjectGroupIds, setExpandedObjectGroupIds] = useState<Set<string>>(new Set());
   const [selectedSplit, setSelectedSplit] = useState<"all" | SplitBucket>("all");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
@@ -233,6 +285,59 @@ export default function DatasetsPage() {
       .catch(() => setMlSets([]));
   }, [selectedDataset]);
 
+  useEffect(() => {
+    if (!activeMlSetScope?.mlSetId || !selectedDataset) {
+      setMlSetScopeSummary(null);
+      return;
+    }
+    void api.mlSetSummary(activeMlSetScope.mlSetId, selectedDataset)
+      .then((payload) => setMlSetScopeSummary(payload))
+      .catch(() => setMlSetScopeSummary(null));
+  }, [activeMlSetScope?.mlSetId, selectedDataset]);
+
+  useEffect(() => {
+    if (!activeMlSetScope?.mlSetId || !selectedDataset) {
+      setMlSetReviewFacets(null);
+      return;
+    }
+    let cancelled = false;
+    void api.mlSetReviewFacets(selectedDataset, activeMlSetScope.mlSetId, {
+      physical_object_id: mlSetObjectIdFilter.trim() || activeMlSetScope.physicalObjectId || undefined,
+      raw_label: mlSetRawLabelFilter.trim() || undefined,
+      normalized_class: mlSetNormalizedClassFilter.trim() || activeMlSetScope.normalizedClass || undefined,
+      superclass: mlSetSuperclassFilter.trim() || activeMlSetScope.superclass || undefined,
+      membership_status: mlSetMembershipStatusFilter === "all" ? undefined : mlSetMembershipStatusFilter,
+      split: mlSetSplitFilter.trim() || undefined,
+      session_id: mlSetSessionFilter.trim() || undefined,
+      search: search.trim() || undefined,
+      validation_status: validationFilter === "all" ? undefined : validationFilter,
+    })
+      .then((payload) => {
+        if (!cancelled) setMlSetReviewFacets(payload);
+      })
+      .catch(() => {
+        if (!cancelled) setMlSetReviewFacets(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeMlSetScope?.mlSetId,
+    activeMlSetScope?.normalizedClass,
+    activeMlSetScope?.superclass,
+    activeMlSetScope?.physicalObjectId,
+    selectedDataset,
+    mlSetObjectIdFilter,
+    mlSetRawLabelFilter,
+    mlSetNormalizedClassFilter,
+    mlSetSuperclassFilter,
+    mlSetMembershipStatusFilter,
+    mlSetSplitFilter,
+    mlSetSessionFilter,
+    search,
+    validationFilter,
+  ]);
+
   async function refreshMlSetsForDataset(datasetId: string) {
     const items = await api.datasetMlSets(datasetId);
     setMlSets(items);
@@ -271,8 +376,30 @@ export default function DatasetsPage() {
     setSelectedTakeId("");
     setSelectedObjectId("");
     setSelectedPhysicalObjectId("");
+    setSelectedObjectGroupId("");
     setDetail(null);
-  }, [selectedDataset, selectedSession, validationFilter, search, tagFilter, fromDate, toDate, datePreset, selectedSplit, expectedClassFilter, calibrationOnly, governanceFlags]);
+  }, [
+    selectedDataset,
+    selectedSession,
+    validationFilter,
+    search,
+    tagFilter,
+    fromDate,
+    toDate,
+    datePreset,
+    selectedSplit,
+    expectedClassFilter,
+    calibrationOnly,
+    governanceFlags,
+    activeMlSetScope?.mlSetId,
+    mlSetObjectIdFilter,
+    mlSetRawLabelFilter,
+    mlSetNormalizedClassFilter,
+    mlSetSuperclassFilter,
+    mlSetMembershipStatusFilter,
+    mlSetSplitFilter,
+    mlSetSessionFilter,
+  ]);
 
   useEffect(() => {
     if (datePreset === "custom" || datePreset === "this_shift") return;
@@ -314,6 +441,66 @@ export default function DatasetsPage() {
   const drawerSessionSummary = useMemo(() => sessions.find((session) => session.id === sessionDrawerId) ?? null, [sessions, sessionDrawerId]);
   const selectedPhysicalObjectSummary = useMemo(() => physicalObjects.find((item) => item.physical_object_id === selectedPhysicalObjectId) ?? null, [physicalObjects, selectedPhysicalObjectId]);
   const selectedMlSetSummary = useMemo(() => mlSets.find((item) => item.id === selectedMlSetId) ?? null, [mlSets, selectedMlSetId]);
+  const activeScopedMlSet = useMemo(() => mlSets.find((item) => item.id === activeMlSetScope?.mlSetId) ?? null, [mlSets, activeMlSetScope?.mlSetId]);
+  const mlSetSessionFacetCounts = useMemo(
+    () => new Map((mlSetReviewFacets?.sessions ?? []).map((item) => [item.value, item.count])),
+    [mlSetReviewFacets?.sessions]
+  );
+  const mlSetSessionOptions = useMemo(
+    () => {
+      const known = new Set<string>();
+      const options = sessions.map((session) => {
+        known.add(session.id);
+        return {
+          value: session.id,
+          label: formatFacetCountLabel(session.name, mlSetSessionFacetCounts.get(session.id)),
+        };
+      });
+      (mlSetReviewFacets?.sessions ?? []).forEach((item) => {
+        if (!item.value || known.has(item.value)) return;
+        options.push({
+          value: item.value,
+          label: formatFacetCountLabel(item.name || item.value, item.count),
+        });
+      });
+      return options;
+    },
+    [sessions, mlSetSessionFacetCounts, mlSetReviewFacets?.sessions]
+  );
+  const mlSetObjectOptions = useMemo(
+    () => (mlSetReviewFacets?.object_ids ?? []).map((item) => ({
+      value: item.value,
+      label: formatObjectFacetLabel(item),
+    })),
+    [mlSetReviewFacets?.object_ids]
+  );
+  const mlSetRawLabelOptions = useMemo(
+    () => (mlSetReviewFacets?.raw_labels ?? []).map((item) => ({ value: item.value, label: formatFacetCountLabel(item.value, item.count) })),
+    [mlSetReviewFacets?.raw_labels]
+  );
+  const mlSetNormalizedClassOptions = useMemo(
+    () => (mlSetReviewFacets?.normalized_classes ?? []).map((item) => ({ value: item.value, label: formatFacetCountLabel(item.value, item.count) })),
+    [mlSetReviewFacets?.normalized_classes]
+  );
+  const mlSetSuperclassOptions = useMemo(
+    () => (mlSetReviewFacets?.superclasses ?? []).map((item) => ({ value: item.value, label: formatFacetCountLabel(item.value, item.count) })),
+    [mlSetReviewFacets?.superclasses]
+  );
+  const mlSetSplitCounts = useMemo(
+    () => new Map((mlSetReviewFacets?.splits ?? []).map((item) => [item.value, item.count])),
+    [mlSetReviewFacets?.splits]
+  );
+  const mlSetSplitOptions = useMemo(
+    () => ["train", "validation", "test", "holdout", "calibration", "unassigned"].map((value) => ({
+      value,
+      label: formatFacetCountLabel(value, mlSetSplitCounts.get(value)),
+    })),
+    [mlSetSplitCounts]
+  );
+  const mlSetMembershipCounts = useMemo(
+    () => new Map((mlSetReviewFacets?.membership_statuses ?? []).map((item) => [item.value, item.count])),
+    [mlSetReviewFacets?.membership_statuses]
+  );
   const modalSessions = useMemo(
     () => (modalDatasetId === selectedDataset ? sessions : modalDatasetSessions),
     [modalDatasetId, selectedDataset, sessions, modalDatasetSessions]
@@ -347,6 +534,38 @@ export default function DatasetsPage() {
     }),
     [pagedTakes, fromDate, toDate, governanceFlags]
   );
+  const activeReviewRows = useMemo(() => (activeMlSetScope ? mlSetMemberRows : []), [activeMlSetScope, mlSetMemberRows]);
+  const objectGroupRows = useMemo<MlSetObjectGroup[]>(() => {
+    const groups = new Map<string, MlSetObjectGroup>();
+    activeReviewRows.forEach((row) => {
+      const key = String(row.physical_object_id || `unassigned:${row.take_id}`);
+      const current = groups.get(key) ?? {
+        id: key,
+        physicalObjectId: String(row.physical_object_id || ""),
+        normalizedClass: row.normalized_class || "-",
+        superclass: row.superclass || "-",
+        rawLabels: [],
+        splitValues: [],
+        sessions: [],
+        warningCodes: [],
+        takeCount: 0,
+        members: [],
+      };
+      current.takeCount += 1;
+      current.members.push(row);
+      if (row.raw_label && !current.rawLabels.includes(row.raw_label)) current.rawLabels.push(row.raw_label);
+      if (row.split && !current.splitValues.includes(row.split)) current.splitValues.push(row.split);
+      const sessionLabel = row.session_name || row.session_id || "Unassigned";
+      if (!current.sessions.includes(sessionLabel)) current.sessions.push(sessionLabel);
+      row.warnings.forEach((warning) => {
+        if (!current.warningCodes.includes(warning)) current.warningCodes.push(warning);
+      });
+      if (current.normalizedClass === "-" && row.normalized_class) current.normalizedClass = row.normalized_class;
+      if (current.superclass === "-" && row.superclass) current.superclass = row.superclass;
+      groups.set(key, current);
+    });
+    return [...groups.values()].sort((a, b) => b.takeCount - a.takeCount || a.id.localeCompare(b.id));
+  }, [activeReviewRows]);
   const hasClientOnlyFilters = useMemo(
     () => governanceFlags.size > 0,
     [governanceFlags]
@@ -365,7 +584,12 @@ export default function DatasetsPage() {
     datePreset !== "custom" ||
     hasClientOnlyFilters
   );
-  const selectedCount = selectionScope === "visible" ? selectedTakeIds.size : Math.max(0, filteredCount - excludedTakeIds.size);
+  const visibleTakeIds = useMemo(
+    () => (activeMlSetScope ? activeReviewRows.map((row) => row.take_id) : takes.map((take) => take.take_id)),
+    [activeMlSetScope, activeReviewRows, takes]
+  );
+  const activeFilteredCount = activeMlSetScope ? (mlSetMemberFilteredCount ?? activeReviewRows.length) : filteredCount;
+  const selectedCount = selectionScope === "visible" ? selectedTakeIds.size : Math.max(0, activeFilteredCount - excludedTakeIds.size);
   const selectedSessionTakeCount = selectedSessionDetailSummary?.total_takes ?? selectedSessionSummary?.take_count ?? 0;
   const selectedSessionReviewedPct = selectedSessionTakeCount ? Math.round(((selectedSessionDetailSummary?.reviewed ?? 0) / selectedSessionTakeCount) * 100) : 0;
   const selectedSessionValidatedPct = selectedSessionTakeCount
@@ -378,12 +602,12 @@ export default function DatasetsPage() {
       : "unlinked";
 
   useEffect(() => {
-    if (selectedTakeId && !takes.find((t) => t.take_id === selectedTakeId)) {
+    if (selectedTakeId && !takes.find((t) => t.take_id === selectedTakeId) && !activeReviewRows.find((row) => row.take_id === selectedTakeId)) {
       setSelectedTakeId("");
       setDetail(null);
       setSelectedObjectId("");
     }
-  }, [selectedTakeId, takes]);
+  }, [selectedTakeId, takes, activeReviewRows]);
 
   useEffect(() => {
     if (sessionDrawerId && sessionDrawerId !== selectedSession) {
@@ -392,7 +616,7 @@ export default function DatasetsPage() {
   }, [selectedSession, sessionDrawerId]);
 
   useEffect(() => {
-    const visible = new Set(takes.map((take) => take.take_id));
+    const visible = new Set(visibleTakeIds);
     if (selectionScope === "visible") {
       setSelectedTakeIds((prev) => {
         const next = new Set<string>();
@@ -410,7 +634,7 @@ export default function DatasetsPage() {
         return next;
       });
     }
-  }, [takes, selectionScope]);
+  }, [visibleTakeIds, selectionScope]);
 
   const stats = useMemo(() => {
     const next = {
@@ -464,6 +688,33 @@ export default function DatasetsPage() {
   const processingIncompleteCount = Number(pagedSummaryCounts?.processing_incomplete ?? Math.max(0, stats.total - stats.processingReady));
   const processingFailedCount = Number(pagedSummaryCounts?.processing_failed ?? 0);
   const noObjectsDetectedCount = Number(pagedSummaryCounts?.no_objects_detected ?? 0);
+  const activeReviewCounts = useMemo(() => {
+    if (!activeMlSetScope) {
+      return {
+        unreviewed: unreviewedCount,
+        needsReview: needsReviewCount,
+        validated: validatedCount,
+        missingLabels: missingLabelsCount,
+        reviewRequiredMembers: 0,
+        missingSplitMembers: 0,
+      };
+    }
+    return activeReviewRows.reduce((acc, row) => {
+      const validation = String(row.validation_status || "unreviewed");
+      if (validation === "unreviewed") acc.unreviewed += 1;
+      if (validation === "valid") acc.validated += 1;
+      if (validation === "needs_review") acc.needsReview += 1;
+      if (!row.normalized_class) acc.missingLabels += 1;
+      if (row.review_required) acc.reviewRequiredMembers += 1;
+      if (row.trainable && row.split === "unassigned") acc.missingSplitMembers += 1;
+      return acc;
+    }, { unreviewed: 0, needsReview: 0, validated: 0, missingLabels: 0, reviewRequiredMembers: 0, missingSplitMembers: 0 });
+  }, [activeMlSetScope, activeReviewRows, missingLabelsCount, needsReviewCount, unreviewedCount, validatedCount]);
+  const scopeContextCounts = useMemo(() => ({
+    members: mlSetScopeSummary?.identity.take_count ?? Number(activeScopedMlSet?.member_count ?? activeScopedMlSet?.membership_count ?? activeReviewRows.length),
+    objects: mlSetScopeSummary?.identity.physical_object_count ?? Number(activeScopedMlSet?.physical_object_count ?? 0),
+    reviewRequired: mlSetScopeSummary?.identity.review_required_count ?? Number(activeScopedMlSet?.review_required_count ?? 0),
+  }), [activeScopedMlSet?.member_count, activeScopedMlSet?.membership_count, activeScopedMlSet?.physical_object_count, activeScopedMlSet?.review_required_count, activeReviewRows.length, mlSetScopeSummary]);
   const healthScore = useMemo(() => {
     const base = hasBaseFilters ? filteredCount : datasetTotalCount;
     if (!base) return 0;
@@ -491,17 +742,68 @@ export default function DatasetsPage() {
   }, [detail?.object_annotations]);
 
   const selectedObject = useMemo(() => objectRows.find((row) => row.objectId === selectedObjectId) ?? null, [objectRows, selectedObjectId]);
-  const selectedTakeSummary = useMemo(() => takes.find((take) => take.take_id === selectedTakeId) ?? null, [takes, selectedTakeId]);
+  const selectedTakeSummary = useMemo(() => {
+    const direct = takes.find((take) => take.take_id === selectedTakeId);
+    if (direct) return direct;
+    const scoped = activeReviewRows.find((row) => row.take_id === selectedTakeId);
+    if (!scoped) return null;
+    return {
+      take_id: scoped.take_id,
+      status: "processed",
+      decision: null,
+      friendly_name: scoped.take_name || scoped.take_id,
+      thumbnail_path: scoped.thumbnail_path || null,
+      validation_status: scoped.validation_status || "unreviewed",
+      expected_class: scoped.normalized_class || null,
+      physical_object_id: scoped.physical_object_id || null,
+      experiment_session_id: scoped.session_id || null,
+      experiment_session_name: scoped.session_name || null,
+      processed_class_label: scoped.processed_class_label || null,
+      processed_superclass: scoped.processed_superclass || null,
+      has_done: scoped.processing_ready,
+      has_ready: scoped.processing_ready,
+      created_at: scoped.created_at || null,
+      tags: [],
+    } as unknown as TakeSummary;
+  }, [takes, selectedTakeId, activeReviewRows]);
   const takePreviewsById = useMemo(() => {
     const next = new Map<string, { url: string | null; placeholder: string; modality: string | null }>();
     takes.forEach((take) => {
       next.set(take.take_id, takePreviewForSummary(take));
     });
+    activeReviewRows.forEach((row) => {
+      if (next.has(row.take_id)) return;
+      next.set(row.take_id, {
+        url: row.thumbnail_path ? fileUrl(row.take_id, row.thumbnail_path) : null,
+        placeholder: row.physical_object_id ? row.physical_object_id.slice(0, 4).toUpperCase() : "TAKE",
+        modality: null,
+      });
+    });
     return next;
-  }, [takes]);
+  }, [takes, activeReviewRows]);
   const selectedTakePreview = useMemo(
     () => (selectedTakeSummary ? (takePreviewsById.get(selectedTakeSummary.take_id) ?? { url: null, placeholder: "-", modality: null }) : { url: null, placeholder: "-", modality: null }),
     [selectedTakeSummary, takePreviewsById]
+  );
+  const selectedInspectorPreview = useMemo(() => {
+    if (detail?.take_id && detail.take_id === selectedTakeId) {
+      const detailPreviewUrl = takePreviewUrlForDetail(detail);
+      if (detailPreviewUrl) {
+        return {
+          url: detailPreviewUrl,
+          placeholder: "IMG",
+          modality: selectedTakePreview.modality,
+        };
+      }
+    }
+    return selectedTakePreview;
+  }, [detail, selectedTakeId, selectedTakePreview]);
+  const selectedScopedMember = useMemo(() => activeReviewRows.find((row) => row.take_id === selectedTakeId) ?? null, [activeReviewRows, selectedTakeId]);
+  const selectedObjectGroup = useMemo(() => objectGroupRows.find((row) => row.id === selectedObjectGroupId) ?? null, [objectGroupRows, selectedObjectGroupId]);
+  const detailTakeMetadata = useMemo(() => ((detail?.take_metadata ?? {}) as Record<string, unknown>), [detail?.take_metadata]);
+  const detailTakeSuperclasses = useMemo(
+    () => (Array.isArray(detailTakeMetadata["superclass_labels"]) ? detailTakeMetadata["superclass_labels"].map(String) : []),
+    [detailTakeMetadata]
   );
   const keyboardCommands = useMemo(
     () => ({ j: "next_take", k: "prev_take", x: "toggle_select", v: "validate", r: "reject", t: "tag", s: "split" }),
@@ -515,6 +817,82 @@ export default function DatasetsPage() {
 
   function openSessionDrawer(sessionId: string) {
     selectSession(sessionId, { openDrawer: true });
+  }
+
+  function applyMlSetScope(mlSetId: string, options?: Partial<MlSetScopeState>) {
+    setActiveMlSetScope({
+      mlSetId,
+      normalizedClass: options?.normalizedClass ?? "",
+      superclass: options?.superclass ?? "",
+      physicalObjectId: options?.physicalObjectId ?? "",
+    });
+    setMlSetNormalizedClassFilter("");
+    setMlSetSuperclassFilter("");
+    setMlSetObjectIdFilter("");
+    setMlSetRawLabelFilter("");
+    setMlSetMembershipStatusFilter("all");
+    setMlSetSplitFilter("");
+    setMlSetSessionFilter("");
+    setSelectedSplit("all");
+    setActiveTab("takes");
+    setMlSetScopedView("takes");
+  }
+
+  function clearMlSetScope() {
+    setActiveMlSetScope(null);
+    setMlSetMemberRows([]);
+    setMlSetMemberFilteredCount(null);
+    setMlSetScopeSummary(null);
+    setMlSetReviewFacets(null);
+    setMlSetNormalizedClassFilter("");
+    setMlSetSuperclassFilter("");
+    setMlSetObjectIdFilter("");
+    setMlSetRawLabelFilter("");
+    setMlSetMembershipStatusFilter("all");
+    setMlSetSplitFilter("");
+    setMlSetSessionFilter("");
+    setSelectedObjectGroupId("");
+    setExpandedObjectGroupIds(new Set());
+  }
+
+  function buildFeatureAnalyticsUrl(extra?: { mlSetId?: string; normalizedClass?: string; superclass?: string; physicalObjectId?: string; rawLabel?: string }) {
+    const params = new URLSearchParams();
+    if (selectedDataset) params.set("dataset_id", selectedDataset);
+    const resolvedMlSetId = extra?.mlSetId ?? activeMlSetScope?.mlSetId ?? "";
+    if (resolvedMlSetId) params.set("ml_set_id", resolvedMlSetId);
+    const normalizedClass = extra?.normalizedClass ?? (mlSetNormalizedClassFilter.trim() || activeMlSetScope?.normalizedClass || "");
+    const superclass = extra?.superclass ?? (mlSetSuperclassFilter.trim() || activeMlSetScope?.superclass || "");
+    const physicalObjectId = extra?.physicalObjectId ?? (mlSetObjectIdFilter.trim() || activeMlSetScope?.physicalObjectId || "");
+    const rawLabel = extra?.rawLabel ?? mlSetRawLabelFilter.trim();
+    const sessionId = mlSetSessionFilter.trim() || selectedSession || "";
+    const splitValue = activeMlSetScope ? mlSetSplitFilter.trim() : (selectedSplit === "all" ? "" : selectedSplit);
+    if (rawLabel) params.append("raw_labels", rawLabel);
+    if (normalizedClass) params.append("normalized_classes", normalizedClass);
+    if (superclass) params.append("superclasses", superclass);
+    if (physicalObjectId) params.append("physical_object_ids", physicalObjectId);
+    if (sessionId) params.set("session_id", sessionId);
+    if (splitValue) params.append("split", splitValue);
+    return `/feature-analytics?${params.toString()}`;
+  }
+
+  function openFeatureAnalyticsForSlice(extra?: { mlSetId?: string; normalizedClass?: string; superclass?: string; physicalObjectId?: string; rawLabel?: string }) {
+    window.location.href = buildFeatureAnalyticsUrl(extra);
+  }
+
+  function openFeatureAnalyticsForSliceInNewTab(extra?: { mlSetId?: string; normalizedClass?: string; superclass?: string; physicalObjectId?: string; rawLabel?: string }) {
+    window.open(buildFeatureAnalyticsUrl(extra), "_blank", "noopener,noreferrer");
+  }
+
+  function buildStudioTakeHref(takeId: string) {
+    const sessionId = selectedScopedMember?.session_id || selectedTakeSummary?.experiment_session_id || selectedSession || null;
+    const datasetId = selectedTakeSummary?.dataset_id || selectedDataset || null;
+    const physicalObjectId = selectedScopedMember?.physical_object_id || selectedTakeSummary?.physical_object_id || null;
+    return buildStudioDeepLink({
+      take_id: takeId,
+      dataset_id: datasetId,
+      session_id: sessionId,
+      physical_object_id: physicalObjectId,
+    });
   }
 
   useEffect(() => {
@@ -533,6 +911,37 @@ export default function DatasetsPage() {
   async function loadTakePage(nextOffset: number, append: boolean) {
     if (append) setIsLoadingMore(true);
     else setIsInitialLoading(true);
+    if (activeMlSetScope?.mlSetId) {
+      try {
+        const page = await api.mlSetMembers(activeMlSetScope.mlSetId, {
+          dataset_id: selectedDataset || undefined,
+          physical_object_id: mlSetObjectIdFilter.trim() || activeMlSetScope.physicalObjectId || undefined,
+          raw_label: mlSetRawLabelFilter.trim() || undefined,
+          normalized_class: mlSetNormalizedClassFilter.trim() || activeMlSetScope.normalizedClass || undefined,
+          superclass: mlSetSuperclassFilter.trim() || activeMlSetScope.superclass || undefined,
+          membership_status: mlSetMembershipStatusFilter === "all" ? undefined : mlSetMembershipStatusFilter,
+          split: mlSetSplitFilter.trim() || undefined,
+          session_id: mlSetSessionFilter.trim() || undefined,
+          search: search.trim() || undefined,
+          validation_status: validationFilter === "all" ? undefined : validationFilter,
+          limit: TAKES_PAGE_LIMIT,
+          offset: nextOffset,
+        });
+        const nextItems = append ? [...mlSetMemberRows, ...page.items] : page.items;
+        setMlSetMemberRows(nextItems);
+        setMlSetMemberOffset(page.next_offset ?? (page.offset + page.items.length));
+        setMlSetMemberHasMore(Boolean(page.has_more));
+        setMlSetMemberFilteredCount(page.filtered_count ?? nextItems.length);
+        setPagedTakes([]);
+        setServerFilteredCount(page.filtered_count ?? null);
+        setServerTotalCount(page.total_count ?? null);
+        setPagedSummaryCounts(null);
+      } finally {
+        setIsInitialLoading(false);
+        setIsLoadingMore(false);
+      }
+      return;
+    }
     const params = {
       dataset_id: selectedDataset || undefined,
       session_id: selectedSession || undefined,
@@ -575,6 +984,7 @@ export default function DatasetsPage() {
       }
       const nextItems = append ? [...pagedTakes, ...page.items] : page.items;
       setPagedTakes(nextItems);
+      setMlSetMemberRows([]);
       setOffset(page.next_offset ?? (page.offset + page.items.length));
       setHasMore(Boolean(page.has_more));
       setServerFilteredCount(page.filtered_count ?? page.total_count ?? null);
@@ -621,29 +1031,62 @@ export default function DatasetsPage() {
       setIsInitialLoading(false);
       setIsLoadingMore(false);
     });
-  }, [selectedDataset, selectedSession, validationFilter, search, tagFilter, fromDate, toDate, selectedSplit, expectedClassFilter, calibrationOnly, governanceFlags, selectedDatasetSummary?.take_count, datasetsProfilerEnabled]);
+  }, [
+    selectedDataset,
+    selectedSession,
+    validationFilter,
+    search,
+    tagFilter,
+    fromDate,
+    toDate,
+    selectedSplit,
+    expectedClassFilter,
+    calibrationOnly,
+    governanceFlags,
+    selectedDatasetSummary?.take_count,
+    datasetsProfilerEnabled,
+    activeMlSetScope?.mlSetId,
+    activeMlSetScope?.normalizedClass,
+    activeMlSetScope?.superclass,
+    activeMlSetScope?.physicalObjectId,
+    mlSetObjectIdFilter,
+    mlSetRawLabelFilter,
+    mlSetNormalizedClassFilter,
+    mlSetSuperclassFilter,
+    mlSetMembershipStatusFilter,
+    mlSetSplitFilter,
+    mlSetSessionFilter,
+  ]);
 
   async function refreshTakes() {
     await loadTakePage(0, false);
   }
 
   async function loadMoreTakes() {
-    if (!hasMore || isLoadingMore || isInitialLoading) return;
-    await loadTakePage(offset, true);
+    const nextHasMore = activeMlSetScope ? mlSetMemberHasMore : hasMore;
+    const nextOffset = activeMlSetScope ? mlSetMemberOffset : offset;
+    if (!nextHasMore || isLoadingMore || isInitialLoading) return;
+    await loadTakePage(nextOffset, true);
   }
 
   function buildActiveBulkFilters() {
     return {
       dataset_id: selectedDataset || undefined,
-      session_id: selectedSession || undefined,
+      ml_set_id: activeMlSetScope?.mlSetId || undefined,
+      session_id: activeMlSetScope ? (mlSetSessionFilter.trim() || undefined) : (selectedSession || undefined),
       validation_status: validationFilter === "all" ? undefined : validationFilter,
       search: search.trim() || undefined,
       tag: tagFilter.trim() || undefined,
       created_from: fromDate || undefined,
       created_to: toDate || undefined,
-      split: selectedSplit === "all" ? undefined : selectedSplit,
+      split: activeMlSetScope ? (mlSetSplitFilter.trim() || undefined) : (selectedSplit === "all" ? undefined : selectedSplit),
       expected_class: expectedClassFilter.trim() || undefined,
       calibration_linkage_only: calibrationOnly || undefined,
+      physical_object_id: activeMlSetScope ? (mlSetObjectIdFilter.trim() || activeMlSetScope.physicalObjectId || undefined) : undefined,
+      raw_label: activeMlSetScope ? (mlSetRawLabelFilter.trim() || undefined) : undefined,
+      normalized_class: activeMlSetScope ? (mlSetNormalizedClassFilter.trim() || activeMlSetScope.normalizedClass || undefined) : undefined,
+      superclass: activeMlSetScope ? (mlSetSuperclassFilter.trim() || activeMlSetScope.superclass || undefined) : undefined,
+      membership_status: activeMlSetScope && mlSetMembershipStatusFilter !== "all" ? mlSetMembershipStatusFilter : undefined,
     };
   }
 
@@ -892,7 +1335,7 @@ export default function DatasetsPage() {
   function selectVisibleRows() {
     setSelectionScope("visible");
     setExcludedTakeIds(new Set());
-    setSelectedTakeIds(new Set(takes.map((take) => take.take_id)));
+    setSelectedTakeIds(new Set(visibleTakeIds));
   }
 
   function clearSelection() {
@@ -1048,6 +1491,49 @@ export default function DatasetsPage() {
     }
   }
 
+  async function excludeSelectionFromActiveMlSet(takeIds: string[]) {
+    if (!activeMlSetScope?.mlSetId || !selectedDataset || takeIds.length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updateDatasetMlSetMembers(selectedDataset, activeMlSetScope.mlSetId, {
+        mode: "ids",
+        action: "remove",
+        take_ids: takeIds,
+      });
+      await refreshMlSetsForDataset(selectedDataset);
+      await refreshTakes();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to exclude selection from ML set");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateActiveMlSetSelection(payload: {
+    split?: string;
+    include?: boolean;
+    expected_class?: string;
+    expected_subclass?: string;
+    review_required?: boolean;
+    default_trainable?: boolean;
+  }, takeIds: string[]) {
+    if (!activeMlSetScope?.mlSetId || !selectedDataset || takeIds.length === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updateDatasetMlSetMemberships(selectedDataset, activeMlSetScope.mlSetId, {
+        take_ids: takeIds,
+        ...payload,
+      });
+      await refreshTakes();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed ML set membership update");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="datasets-page datasets-command-center">
       <section className="datasets-headline">
@@ -1064,16 +1550,30 @@ export default function DatasetsPage() {
         </button>
       </section>
 
-      <section className="datasets-grid">
-        <aside className="concept-panel datasets-left">
+      <section className={`datasets-grid ${leftPanelCollapsed ? "left-collapsed" : ""} ${rightPanelCollapsed ? "right-collapsed" : ""}`}>
+        <aside className={`concept-panel datasets-left ${leftPanelCollapsed ? "is-collapsed" : ""}`}>
           <div className="datasets-left-title-row">
             <h3>Dataset Explorer</h3>
-            <small>
-              {hasBaseFilters
-                ? `${filteredCount} filtered / ${datasetTotalCount} total`
-                : `${datasetTotalCount} takes`}
-            </small>
+            <button
+              type="button"
+              className="panel-collapse-toggle"
+              onClick={() => setLeftPanelCollapsed((current) => !current)}
+              aria-expanded={!leftPanelCollapsed}
+              aria-label={leftPanelCollapsed ? "Expand dataset explorer" : "Collapse dataset explorer"}
+              title={leftPanelCollapsed ? "Expand dataset explorer" : "Collapse dataset explorer"}
+            >
+              {leftPanelCollapsed ? "›" : "‹"}
+            </button>
+            {!leftPanelCollapsed && (
+              <small>
+                {hasBaseFilters
+                  ? `${filteredCount} filtered / ${datasetTotalCount} total`
+                  : `${datasetTotalCount} takes`}
+              </small>
+            )}
           </div>
+          {!leftPanelCollapsed && (
+          <>
           <details className="datasets-section" open>
             <summary>Dataset hierarchy</summary>
             <div className="datasets-hierarchy-block">
@@ -1191,7 +1691,11 @@ export default function DatasetsPage() {
           </div>
           <label className="field-label">
             Search
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="take id or text" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={activeMlSetScope ? "take, object, label, superclass, notes, source row" : "take id or text"}
+            />
           </label>
           <label className="field-label">
             Tags
@@ -1252,6 +1756,8 @@ export default function DatasetsPage() {
             ))}
           </div>
           </details>
+          </>
+          )}
         </aside>
 
         <section className="datasets-center">
@@ -1338,11 +1844,11 @@ export default function DatasetsPage() {
             <section className="datasets-tab-panel">
               <div className="datasets-queue-row">
                 {[
-                  { id: "unreviewed", label: "Unreviewed", count: unreviewedCount, apply: () => setValidationFilter("unreviewed") },
-                  { id: "missing_labels", label: "Missing labels", count: missingLabelsCount, apply: () => setGovernanceFlags(new Set(["missing_expected_class"])) },
+                  { id: "unreviewed", label: "Unreviewed", count: activeReviewCounts.unreviewed, apply: () => setValidationFilter("unreviewed") },
+                  { id: "missing_labels", label: "Missing labels", count: activeReviewCounts.missingLabels, apply: () => activeMlSetScope ? setMlSetNormalizedClassFilter("") : setGovernanceFlags(new Set(["missing_expected_class"])) },
                   { id: "calibration", label: "Calibration review", count: missingCalibrationCount, apply: () => setGovernanceFlags(new Set(["missing_calibration"])) },
                   { id: "benchmark", label: "Benchmark approval", count: benchmarkApprovedCount, apply: () => setValidationFilter("benchmark_approved") },
-                  { id: "failed", label: "Failed processing", count: processingFailedCount, apply: () => setGovernanceFlags(new Set(["processing_failed"])) },
+                  { id: "review_required", label: activeMlSetScope ? "Review required" : "Failed processing", count: activeMlSetScope ? activeReviewCounts.reviewRequiredMembers : processingFailedCount, apply: () => activeMlSetScope ? setMlSetMembershipStatusFilter("review_required") : setGovernanceFlags(new Set(["processing_failed"])) },
                 ].map((queue) => (
                   <button key={queue.id} type="button" className="datasets-queue-card" onClick={queue.apply}>
                     <strong>{queue.label}</strong>
@@ -1350,33 +1856,62 @@ export default function DatasetsPage() {
                   </button>
                 ))}
               </div>
-              {selectedSessionSummary && (
+              {activeMlSetScope && (
+                <section className="concept-panel compact datasets-session-context datasets-ml-set-context">
+                  <div className="datasets-session-context-head">
+                    <div className="datasets-session-context-copy">
+                      <h3>ML Set: {activeScopedMlSet?.name || activeMlSetScope.mlSetId}</h3>
+                      <small>{scopeContextCounts.members} members · {scopeContextCounts.objects} objects · {scopeContextCounts.reviewRequired} review required</small>
+                    </div>
+                    <div className="datasets-actions-row">
+                      <button
+                        type="button"
+                        title="Open Feature Analytics for the current ML-set slice in a new tab"
+                        aria-label="Open Feature Analytics for the current ML-set slice in a new tab"
+                        onClick={() => openFeatureAnalyticsForSliceInNewTab()}
+                      >
+                        Analyze features for current slice ↗
+                      </button>
+                      <button type="button" className="datasets-session-context-edit" onClick={clearMlSetScope}>Clear scope</button>
+                    </div>
+                  </div>
+                  <div className="datasets-toolbar ml-set-scope-toolbar">
+                    <label className="field-label">View<select value={mlSetScopedView} onChange={(event) => setMlSetScopedView(event.target.value as MlSetScopedView)}><option value="takes">Takes</option><option value="object_groups">Object Groups</option></select></label>
+                    <label className="field-label">
+                      object_id
+                      <input
+                        value={mlSetObjectIdFilter}
+                        list="ml-set-object-options"
+                        onChange={(event) => setMlSetObjectIdFilter(event.target.value)}
+                        placeholder={activeMlSetScope.physicalObjectId || "Search object id"}
+                      />
+                      <datalist id="ml-set-object-options">
+                        {mlSetObjectOptions.map((option) => <option key={option.value} value={option.value} label={option.label} />)}
+                      </datalist>
+                    </label>
+                    <label className="field-label">raw_label<select value={mlSetRawLabelFilter} onChange={(event) => setMlSetRawLabelFilter(event.target.value)}><option value="">All raw labels</option>{mlSetRawLabelOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    <label className="field-label">normalized_class<select value={mlSetNormalizedClassFilter} onChange={(event) => setMlSetNormalizedClassFilter(event.target.value)}><option value="">All normalized classes</option>{mlSetNormalizedClassOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    <label className="field-label">superclass<select value={mlSetSuperclassFilter} onChange={(event) => setMlSetSuperclassFilter(event.target.value)}><option value="">All superclasses</option>{mlSetSuperclassOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    <label className="field-label">review/default_trainable<select value={mlSetMembershipStatusFilter} onChange={(event) => setMlSetMembershipStatusFilter(event.target.value as MlSetMembershipStatusFilter)}><option value="all">{formatFacetCountLabel("All members", mlSetMembershipCounts.get("all"))}</option><option value="default_trainable">{formatFacetCountLabel("Default trainable", mlSetMembershipCounts.get("default_trainable"))}</option><option value="review_required">{formatFacetCountLabel("Review required", mlSetMembershipCounts.get("review_required"))}</option><option value="excluded">{formatFacetCountLabel("Excluded", mlSetMembershipCounts.get("excluded"))}</option>{mlSetMembershipCounts.has("uncertain") && <option value="uncertain">{formatFacetCountLabel("Uncertain", mlSetMembershipCounts.get("uncertain"))}</option>}</select></label>
+                    <label className="field-label">split<select value={mlSetSplitFilter} onChange={(event) => setMlSetSplitFilter(event.target.value)}><option value="">All splits</option>{mlSetSplitOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                    <label className="field-label">session<select value={mlSetSessionFilter} onChange={(event) => setMlSetSessionFilter(event.target.value)}><option value="">All sessions</option>{mlSetSessionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+                  </div>
+                </section>
+              )}
+              {!activeMlSetScope && selectedSessionSummary && (
                 <section className="concept-panel compact datasets-session-context">
                   <div className="datasets-session-context-head">
                     <div className="datasets-session-context-copy">
                       <h3>Session: {selectedSessionSummary.name}</h3>
-                      <small>
-                        {selectedSessionTakeCount} takes · reviewed {selectedSessionReviewedPct}% · validation {selectedSessionValidatedPct}% · calibration {selectedSessionCalibrationStatus}
-                        {selectedSessionSummary.session_type ? ` · type ${selectedSessionSummary.session_type}` : ""}
-                      </small>
+                      <small>{selectedSessionTakeCount} takes · reviewed {selectedSessionReviewedPct}% · validation {selectedSessionValidatedPct}% · calibration {selectedSessionCalibrationStatus}{selectedSessionSummary.session_type ? ` · type ${selectedSessionSummary.session_type}` : ""}</small>
                     </div>
-                    <button type="button" className="datasets-session-context-edit" onClick={() => openSessionDrawer(selectedSessionSummary.id)}>
-                      Edit session
-                    </button>
+                    <button type="button" className="datasets-session-context-edit" onClick={() => openSessionDrawer(selectedSessionSummary.id)}>Edit session</button>
                   </div>
                 </section>
               )}
               <div className="datasets-toolbar" role="toolbar" aria-label="Takes selection and bulk actions">
-                <span className="datasets-toolbar-status">
-                  {selectionScope === "filtered"
-                    ? `All ${filteredCount} filtered takes selected${excludedTakeIds.size ? ` · ${excludedTakeIds.size} excluded` : ""}`
-                    : `${selectedTakeIds.size} visible selected`}
-                </span>
-                <span className="datasets-toolbar-status">
-                  {hasBaseFilters
-                    ? `Showing ${takes.length} of ${filteredCount} filtered takes · ${datasetTotalCount} total in dataset`
-                    : `Showing ${takes.length} of ${datasetTotalCount} takes`}
-                </span>
+                <span className="datasets-toolbar-status">{selectionScope === "filtered" ? `All ${activeFilteredCount} filtered takes selected${excludedTakeIds.size ? ` · ${excludedTakeIds.size} excluded` : ""}` : `${selectedTakeIds.size} visible selected`}</span>
+                <span className="datasets-toolbar-status">{activeMlSetScope ? `Showing ${activeReviewRows.length} of ${activeFilteredCount} scoped members` : hasBaseFilters ? `Showing ${takes.length} of ${filteredCount} filtered takes · ${datasetTotalCount} total in dataset` : `Showing ${takes.length} of ${datasetTotalCount} takes`}</span>
                 <button type="button" onClick={selectVisibleRows}>Select visible</button>
                 <button type="button" onClick={clearSelection}>Clear selection</button>
                 <button type="button" onClick={selectAllMatchingFilters}>Select all matching filters</button>
@@ -1406,62 +1941,33 @@ export default function DatasetsPage() {
                     </div>
                     <div className="datasets-more-actions-group">
                       <small>Advanced</small>
-                      <button type="button" disabled={selectionScope !== "visible" || selectedTakeIds.size < 2 || selectedTakeIds.size > 4} onClick={() => setCompareOpen((prev) => !prev)}>Compare selected</button>
+                      <button type="button" disabled={Boolean(activeMlSetScope) || selectionScope !== "visible" || selectedTakeIds.size < 2 || selectedTakeIds.size > 4} onClick={() => setCompareOpen((prev) => !prev)}>Compare selected</button>
                       <button type="button" disabled={busy || selectedCount === 0} onClick={() => openBulkModal("expected_class")}>Expected class</button>
                       <button type="button" disabled={busy || selectedCount === 0} onClick={() => { setModalValidationStatus("golden_sample"); openBulkModal("validation"); }}>Golden sample</button>
                       <button type="button" disabled={busy || selectedCount === 0} onClick={() => { setModalValidationStatus("benchmark_approved"); openBulkModal("validation"); }}>Benchmark approved</button>
-                      <button type="button" disabled title="Future placeholder: copy selected takes to another dataset">Copy to dataset (planned)</button>
                     </div>
                   </div>
                 </details>
               </div>
-              {datasetsProfilerEnabled && (
+              {!activeMlSetScope && datasetsProfilerEnabled && (
                 <div className="datasets-profiler-panel concept-panel compact">
                   <div className="datasets-profiler-header">
                     <strong>Datasets profiler</strong>
-                    <small>
-                      {datasetsProfiler?.captured_at
-                        ? `last capture ${new Date(datasetsProfiler.captured_at).toLocaleTimeString()}`
-                        : "waiting for next paged request"}
-                    </small>
+                    <small>{datasetsProfiler?.captured_at ? `last capture ${new Date(datasetsProfiler.captured_at).toLocaleTimeString()}` : "waiting for next paged request"}</small>
                   </div>
                   <div className="datasets-profiler-grid">
-                    <div>
-                      <span>Frontend request</span>
-                      <strong>{formatProfilerMs(datasetsProfiler?.frontend_request_ms)}</strong>
-                    </div>
-                    <div>
-                      <span>Frontend commit</span>
-                      <strong>{formatProfilerMs(datasetsProfiler?.frontend_commit_ms)}</strong>
-                    </div>
-                    <div>
-                      <span>Backend total</span>
-                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.total)}</strong>
-                    </div>
-                    <div>
-                      <span>Scan + filter</span>
-                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.scan_and_filter)}</strong>
-                    </div>
-                    <div>
-                      <span>Hydrate rows</span>
-                      <strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.hydrate_page_items)}</strong>
-                    </div>
-                    <div>
-                      <span>Scanned takes</span>
-                      <strong>{datasetsProfiler?.backend_profile?.counters.scanned_take_ids ?? "-"}</strong>
-                    </div>
-                    <div>
-                      <span>Filtered matches</span>
-                      <strong>{datasetsProfiler?.backend_profile?.counters.candidate_count ?? "-"}</strong>
-                    </div>
-                    <div>
-                      <span>Page rows</span>
-                      <strong>{datasetsProfiler?.page_item_count ?? "-"}</strong>
-                    </div>
+                    <div><span>Frontend request</span><strong>{formatProfilerMs(datasetsProfiler?.frontend_request_ms)}</strong></div>
+                    <div><span>Frontend commit</span><strong>{formatProfilerMs(datasetsProfiler?.frontend_commit_ms)}</strong></div>
+                    <div><span>Backend total</span><strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.total)}</strong></div>
+                    <div><span>Scan + filter</span><strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.scan_and_filter)}</strong></div>
+                    <div><span>Hydrate rows</span><strong>{formatProfilerMs(datasetsProfiler?.backend_profile?.phase_ms.hydrate_page_items)}</strong></div>
+                    <div><span>Scanned takes</span><strong>{datasetsProfiler?.backend_profile?.counters.scanned_take_ids ?? "-"}</strong></div>
+                    <div><span>Filtered matches</span><strong>{datasetsProfiler?.backend_profile?.counters.candidate_count ?? "-"}</strong></div>
+                    <div><span>Page rows</span><strong>{datasetsProfiler?.page_item_count ?? "-"}</strong></div>
                   </div>
                 </div>
               )}
-              {compareOpen && (
+              {!activeMlSetScope && compareOpen && (
                 <div className="concept-panel compact datasets-compare-panel">
                   <h3>Compare Selected</h3>
                   <div className="datasets-compare-grid">
@@ -1485,132 +1991,136 @@ export default function DatasetsPage() {
                 </div>
               )}
               <div className="datasets-table-wrap">
-                {isInitialLoading && (
-                  <div className="datasets-table-skeleton" aria-hidden="true">
-                    {Array.from({ length: 8 }).map((_, idx) => <div className="datasets-skeleton-row" key={idx} />)}
-                  </div>
+                {isInitialLoading && <div className="datasets-table-skeleton" aria-hidden="true">{Array.from({ length: 8 }).map((_, idx) => <div className="datasets-skeleton-row" key={idx} />)}</div>}
+                {!isInitialLoading && activeMlSetScope && mlSetScopedView === "object_groups" && objectGroupRows.length === 0 && <div className="datasets-inline-state">No object groups match the current ML set filters.</div>}
+                {!isInitialLoading && activeMlSetScope && mlSetScopedView === "object_groups" && objectGroupRows.length > 0 && (
+                  <table className="datasets-table">
+                    <thead><tr><th /></tr></thead>
+                    <tbody>
+                      {objectGroupRows.map((group) => {
+                        const expanded = expandedObjectGroupIds.has(group.id);
+                        return (
+                          <Fragment key={group.id}>
+                            <tr key={group.id} className={selectedObjectGroupId === group.id ? "active" : ""} onClick={() => setSelectedObjectGroupId(group.id)}>
+                              <td>
+                                <div className="datasets-object-group-row">
+                                  <button type="button" className="link-button" onClick={(event) => { event.stopPropagation(); setExpandedObjectGroupIds((prev) => { const next = new Set(prev); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next; }); }}>{expanded ? "▾" : "▸"}</button>
+                                  <strong>{group.physicalObjectId || "unassigned"}</strong>
+                                  <div className="datasets-inline-thumbs">
+                                    {group.members.slice(0, 3).map((member) => {
+                                      const preview = takePreviewsById.get(member.take_id) ?? { url: null, placeholder: "TAKE", modality: null };
+                                      return preview.url ? <img key={member.take_id} className="datasets-thumb micro" src={preview.url} alt={member.take_id} loading="lazy" decoding="async" /> : <span key={member.take_id} className="datasets-thumb-placeholder micro">{preview.placeholder}</span>;
+                                    })}
+                                  </div>
+                                  <span>{group.takeCount} takes</span>
+                                  <span>{group.rawLabels.join(", ") || "-"}</span>
+                                  <span>{group.normalizedClass}</span>
+                                  <span>{group.superclass}</span>
+                                  <span>{group.warningCodes.join(", ") || "-"}</span>
+                                  <span>{group.splitValues.join(", ") || "-"}</span>
+                                  <span>{group.sessions.join(", ") || "-"}</span>
+                                </div>
+                              </td>
+                            </tr>
+                            {expanded && group.members.map((member) => (
+                              <tr key={`${group.id}_${member.take_id}`} className="datasets-subrow" onClick={() => setSelectedTakeId(member.take_id)}>
+                                <td>{member.take_id} · {member.raw_label || "-"} · {member.session_name || member.session_id || "-"} · {member.split}</td>
+                              </tr>
+                            ))}
+                          </Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 )}
-                {!isInitialLoading && takes.length === 0 && <div className="datasets-inline-state">No takes match the current filters.</div>}
-                {!isInitialLoading && takes.length > 0 && (
-                <table className="datasets-table">
-                  <thead>
-                    <tr>
-                      <th />
-                      <th>thumb</th>
-                      <th>take</th>
-                      <th>dataset</th>
-                      <th>session</th>
-                      <th>tags</th>
-                      <th>expected class</th>
-                      <th>validation</th>
-                      <th>processing</th>
-                      <th>calibration</th>
-                      <th>created_at</th>
-                      <th>actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {takes.map((take) => {
-                      const selected = selectionScope === "filtered" ? !excludedTakeIds.has(take.take_id) : selectedTakeIds.has(take.take_id);
-                      const preview = takePreviewsById.get(take.take_id) ?? { url: null, placeholder: "TAKE", modality: null };
-                      return (
-                        <tr
-                          key={take.take_id}
-                          className={selectedTakeId === take.take_id ? "active" : ""}
-                          onClick={() => setSelectedTakeId(take.take_id)}
-                        >
-                          <td>
-                            <input
-                              type="checkbox"
-                              checked={selected}
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={(e) => {
-                                if (selectionScope === "filtered") {
-                                  setExcludedTakeIds((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.delete(take.take_id);
-                                    else next.add(take.take_id);
-                                    return next;
-                                  });
-                                } else {
-                                  setSelectedTakeIds((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.add(take.take_id);
-                                    else next.delete(take.take_id);
-                                    return next;
-                                  });
-                                }
-                              }}
-                            />
-                          </td>
-                          <td>
-                            <a
-                              className="datasets-thumb-link"
-                              href="/studio"
-                              title="Open in Studio"
-                              onClick={(event) => event.stopPropagation()}
-                            >
-                              {preview.modality && <span className="datasets-thumb-modality">{preview.modality}</span>}
-                              {preview.url ? (
-                                <img
-                                  className="datasets-thumb"
-                                  src={preview.url}
-                                  alt={take.friendly_name || take.take_id}
-                                  loading="lazy"
-                                  decoding="async"
-                                />
-                              ) : (
-                                <span className="datasets-thumb-placeholder">{preview.placeholder}</span>
-                              )}
-                            </a>
-                          </td>
-                          <td>
-                            <a
-                              className="datasets-take-link"
-                              href="#"
-                              onClick={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                setSelectedTakeId(take.take_id);
-                              }}
-                            >
-                              {take.friendly_name || take.take_id}
-                            </a>
-                          </td>
-                          <td>{take.dataset_name || take.dataset_id || "-"}</td>
-                          <td>
-                            {take.experiment_session_id ? (
-                              <a
-                                href="#"
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  selectSession(take.experiment_session_id || "");
-                                }}
-                              >
-                                {take.experiment_session_name || take.experiment_session_id}
-                              </a>
-                            ) : "-"}
-                          </td>
-                          <td>{(take.tags ?? []).slice(0, 3).join(", ") || "-"}</td>
-                          <td>{take.expected_class || "-"}</td>
-                          <td>{take.validation_status || "unreviewed"}</td>
-                          <td>{take.has_done ? "done" : take.has_ready ? "ready" : "pending"}</td>
-                          <td>{take.calibration_id || "-"}</td>
-                          <td>{take.created_at || "-"}</td>
-                          <td>
-                            <a href={`/takes/${encodeURIComponent(take.take_id)}`} title="Inspect pipeline outputs in Studio">Inspect</a>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                {!isInitialLoading && activeMlSetScope && mlSetScopedView === "takes" && activeReviewRows.length === 0 && <div className="datasets-inline-state">No ML set members match the current scope and filters.</div>}
+                {!isInitialLoading && activeMlSetScope && mlSetScopedView === "takes" && activeReviewRows.length > 0 && (
+                  <table className="datasets-table">
+                    <thead>
+                      <tr>
+                        <th />
+                        <th>thumbnail</th>
+                        <th>take_id</th>
+                        <th>physical_object_id</th>
+                        <th>raw_label</th>
+                        <th>normalized_class</th>
+                        <th>superclass</th>
+                        <th>review/default_trainable</th>
+                        <th>split</th>
+                        <th>session</th>
+                        <th>feature/readiness</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeReviewRows.map((row) => {
+                        const selected = selectionScope === "filtered" ? !excludedTakeIds.has(row.take_id) : selectedTakeIds.has(row.take_id);
+                        const preview = takePreviewsById.get(row.take_id) ?? { url: null, placeholder: "TAKE", modality: null };
+                        return (
+                          <tr key={row.take_id} className={selectedTakeId === row.take_id ? "active" : ""} onClick={() => setSelectedTakeId(row.take_id)}>
+                            <td><input type="checkbox" checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => { if (selectionScope === "filtered") { setExcludedTakeIds((prev) => { const next = new Set(prev); if (event.target.checked) next.delete(row.take_id); else next.add(row.take_id); return next; }); } else { setSelectedTakeIds((prev) => { const next = new Set(prev); if (event.target.checked) next.add(row.take_id); else next.delete(row.take_id); return next; }); } }} /></td>
+                            <td>{preview.url ? <img className="datasets-thumb" src={preview.url} alt={row.take_id} loading="lazy" decoding="async" /> : <span className="datasets-thumb-placeholder">{preview.placeholder}</span>}</td>
+                            <td><button type="button" className="link-button" onClick={() => setSelectedTakeId(row.take_id)}>{row.take_id}</button></td>
+                            <td><button type="button" className="link-button" onClick={() => setMlSetObjectIdFilter(row.physical_object_id || "")}>{row.physical_object_id || "-"}</button></td>
+                            <td>{row.raw_label || "-"}</td>
+                            <td>{row.normalized_class || "-"}</td>
+                            <td>{row.superclass || "-"}</td>
+                            <td>{row.review_required ? "review_required" : row.default_trainable ? "default_trainable" : row.include ? "included" : "excluded"}</td>
+                            <td>{row.split}</td>
+                            <td>{row.session_name || row.session_id || "-"}</td>
+                            <td>{[row.processing_ready ? "processing" : "pending", row.feature_ready ? "features" : "no_features"].join(" · ")}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+                {!isInitialLoading && !activeMlSetScope && takes.length === 0 && <div className="datasets-inline-state">No takes match the current filters.</div>}
+                {!isInitialLoading && !activeMlSetScope && takes.length > 0 && (
+                  <table className="datasets-table">
+                    <thead>
+                      <tr>
+                        <th />
+                        <th>thumb</th>
+                        <th>take</th>
+                        <th>dataset</th>
+                        <th>session</th>
+                        <th>tags</th>
+                        <th>expected class</th>
+                        <th>validation</th>
+                        <th>processing</th>
+                        <th>calibration</th>
+                        <th>created_at</th>
+                        <th>actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {takes.map((take) => {
+                        const selected = selectionScope === "filtered" ? !excludedTakeIds.has(take.take_id) : selectedTakeIds.has(take.take_id);
+                        const preview = takePreviewsById.get(take.take_id) ?? { url: null, placeholder: "TAKE", modality: null };
+                        return (
+                          <tr key={take.take_id} className={selectedTakeId === take.take_id ? "active" : ""} onClick={() => setSelectedTakeId(take.take_id)}>
+                            <td><input type="checkbox" checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => { if (selectionScope === "filtered") { setExcludedTakeIds((prev) => { const next = new Set(prev); if (event.target.checked) next.delete(take.take_id); else next.add(take.take_id); return next; }); } else { setSelectedTakeIds((prev) => { const next = new Set(prev); if (event.target.checked) next.add(take.take_id); else next.delete(take.take_id); return next; }); } }} /></td>
+                            <td><a className="datasets-thumb-link" href={buildStudioTakeHref(take.take_id)} target="_blank" rel="noreferrer" title="Open in Studio" onClick={(event) => event.stopPropagation()}>{preview.modality && <span className="datasets-thumb-modality">{preview.modality}</span>}{preview.url ? <img className="datasets-thumb" src={preview.url} alt={take.friendly_name || take.take_id} loading="lazy" decoding="async" /> : <span className="datasets-thumb-placeholder">{preview.placeholder}</span>}</a></td>
+                            <td><a className="datasets-take-link" href="#" onClick={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedTakeId(take.take_id); }}>{take.friendly_name || take.take_id}</a></td>
+                            <td>{take.dataset_name || take.dataset_id || "-"}</td>
+                            <td>{take.experiment_session_id ? <a href="#" onClick={(event) => { event.preventDefault(); event.stopPropagation(); selectSession(take.experiment_session_id || ""); }}>{take.experiment_session_name || take.experiment_session_id}</a> : "-"}</td>
+                            <td>{(take.tags ?? []).slice(0, 3).join(", ") || "-"}</td>
+                            <td>{take.expected_class || "-"}</td>
+                            <td>{take.validation_status || "unreviewed"}</td>
+                            <td>{take.has_done ? "done" : take.has_ready ? "ready" : "pending"}</td>
+                            <td>{take.calibration_id || "-"}</td>
+                            <td>{take.created_at || "-"}</td>
+                            <td><a href={`/takes/${encodeURIComponent(take.take_id)}`} title="Inspect pipeline outputs in Studio">Inspect</a></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 )}
               </div>
               <div className="datasets-loadmore-row">
-                <button type="button" disabled={!hasMore || isInitialLoading || isLoadingMore} onClick={() => void loadMoreTakes()}>
-                  {isLoadingMore ? "Loading more..." : hasMore ? "Load more" : "All filtered takes loaded"}
+                <button type="button" disabled={!(activeMlSetScope ? mlSetMemberHasMore : hasMore) || isInitialLoading || isLoadingMore} onClick={() => void loadMoreTakes()}>
+                  {isLoadingMore ? "Loading more..." : (activeMlSetScope ? mlSetMemberHasMore : hasMore) ? "Load more" : "All filtered takes loaded"}
                 </button>
               </div>
             </section>
@@ -1734,6 +2244,7 @@ export default function DatasetsPage() {
                         <th>membership mode</th>
                         <th>created_at</th>
                         <th>readiness</th>
+                        <th>actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1745,11 +2256,19 @@ export default function DatasetsPage() {
                           <td>{item.membership_mode || "ids"}</td>
                           <td>{item.created_at || "-"}</td>
                           <td>{`${item.split_status || "unassigned"} · ${item.physical_object_count ?? 0} objects · ${item.default_trainable_count ?? 0} trainable · ${item.review_required_count ?? 0} review`}</td>
+                          <td>
+                            <div className="datasets-row-actions">
+                              <button type="button" className="link-button" onClick={() => applyMlSetScope(item.id)}>Review members</button>
+                              <button type="button" className="link-button" onClick={() => openFeatureAnalyticsForSlice({ mlSetId: item.id })}>Analyze features</button>
+                              <button type="button" className="link-button" onClick={() => { applyMlSetScope(item.id); setMlSetSplitFilter("unassigned"); }}>Assign split</button>
+                              <button type="button" className="link-button" onClick={() => { window.location.href = `/api/ml-sets/${encodeURIComponent(item.id)}/export?kind=manifest&dataset_id=${encodeURIComponent(item.dataset_id)}`; }}>Export</button>
+                            </div>
+                          </td>
                         </tr>
                       ))}
                       {!mlSets.length && (
                         <tr>
-                          <td colSpan={6}>No ML sets yet.</td>
+                          <td colSpan={7}>No ML sets yet.</td>
                         </tr>
                       )}
                     </tbody>
@@ -1771,94 +2290,118 @@ export default function DatasetsPage() {
           )}
         </section>
 
-        <aside className="concept-panel datasets-right">
-          <h3>Inspector</h3>
-          <div className="datasets-inspector-preview">
-            {selectedTakeSummary && selectedTakePreview.url ? (
-              <img
-                className="datasets-inspector-thumb"
-                src={selectedTakePreview.url}
-                alt={selectedTakeSummary.friendly_name || selectedTakeSummary.take_id}
-                loading="lazy"
-                decoding="async"
-              />
-            ) : (
-              <span className="datasets-thumb-placeholder inspector">{selectedTakePreview.placeholder}</span>
-            )}
+        <aside className={`concept-panel datasets-right ${rightPanelCollapsed ? "is-collapsed" : ""}`}>
+          <div className="datasets-left-title-row">
+            <h3>Inspector</h3>
+            <button
+              type="button"
+              className="panel-collapse-toggle"
+              onClick={() => setRightPanelCollapsed((current) => !current)}
+              aria-expanded={!rightPanelCollapsed}
+              aria-label={rightPanelCollapsed ? "Expand inspector" : "Collapse inspector"}
+              title={rightPanelCollapsed ? "Expand inspector" : "Collapse inspector"}
+            >
+              {rightPanelCollapsed ? "‹" : "›"}
+            </button>
           </div>
+          {!rightPanelCollapsed && (
+          <>
+          {activeMlSetScope && selectedObjectGroup ? (
+            <div className="datasets-inspector-preview-grid">
+              {selectedObjectGroup.members.slice(0, 4).map((member) => {
+                const preview = takePreviewsById.get(member.take_id) ?? { url: null, placeholder: "TAKE", modality: null };
+                return preview.url ? <img key={member.take_id} className="datasets-inspector-thumb multi" src={preview.url} alt={member.take_id} loading="lazy" decoding="async" /> : <span key={member.take_id} className="datasets-thumb-placeholder inspector">{preview.placeholder}</span>;
+              })}
+            </div>
+          ) : (
+            <div className="datasets-inspector-preview">
+              {selectedTakeSummary && selectedInspectorPreview.url ? <img className="datasets-inspector-thumb" src={selectedInspectorPreview.url} alt={selectedTakeSummary.friendly_name || selectedTakeSummary.take_id} loading="lazy" decoding="async" /> : <span className="datasets-thumb-placeholder inspector">{selectedInspectorPreview.placeholder}</span>}
+            </div>
+          )}
+          {!activeMlSetScope || !selectedObjectGroup ? (
+            <button
+              type="button"
+              className="datasets-inspector-open-studio"
+              disabled={!selectedTakeId}
+              onClick={() => selectedTakeId && window.open(buildStudioTakeHref(selectedTakeId), "_blank", "noopener,noreferrer")}
+            >
+              Open in Studio ↗
+            </button>
+          ) : null}
           <section className="datasets-inspector-section">
             <h4>Preview</h4>
-            <small>{selectedTakeSummary?.friendly_name ?? selectedTakeSummary?.take_id ?? "Select a take to review metadata, labels, split, preview, and semantic actions."}</small>
+            <small>
+              {activeMlSetScope && selectedObjectGroup
+                ? `${selectedObjectGroup.physicalObjectId || "Unassigned object group"} · ${selectedObjectGroup.takeCount} takes`
+                : selectedTakeSummary?.friendly_name ?? selectedTakeSummary?.take_id ?? "Select a take or object group to review metadata, labels, membership, warnings, and actions."}
+            </small>
           </section>
           <div className="datasets-inspector-grid">
             <span>Dataset</span>
             <strong>{selectedDatasetSummary?.name ?? "All datasets"}</strong>
             <span>Session</span>
-            <strong>{selectedSessionSummary?.name ?? "All sessions"}</strong>
+            <strong>{selectedScopedMember?.session_name || selectedScopedMember?.session_id || selectedSessionSummary?.name || "All sessions"}</strong>
             <span>Take</span>
             <strong>{detail?.take_id ?? selectedTakeId ?? "-"}</strong>
             <span>Object</span>
-            <strong>{selectedObject?.objectId ?? "-"}</strong>
+            <strong>{selectedObjectGroup?.physicalObjectId || selectedScopedMember?.physical_object_id || selectedObject?.objectId || "-"}</strong>
             <span>ML set</span>
-            <strong>{activeTab === "ml_sets" ? "selection context" : "-"}</strong>
+            <strong>{activeMlSetScope?.mlSetId || (activeTab === "ml_sets" ? "selection context" : "-")}</strong>
             <span>Split</span>
-            <strong>{selectedSplit}</strong>
+            <strong>{selectedScopedMember?.split || readSplitFromSummary(selectedTakeSummary) || selectedSplit}</strong>
           </div>
 
           <div className="datasets-inspector-box">
-            <strong>Processing Summary</strong>
-            <small>acquisition type: {selectedSessionSummary?.session_type ?? "-"}</small>
-            <small>calibration: {selectedSessionSummary?.calibration_id ?? detail?.result?.calibration_id ?? "-"}</small>
-            <small>sensor metadata: {selectedSessionSummary?.sensor_metadata ? "available" : "-"}</small>
-            <small>validation: {detail?.take_metadata?.validation_status as string ?? "-"}</small>
-            <small>split: {String((detail?.take_metadata?.split as string | undefined) ?? readSplitFromSummary(selectedTakeSummary) ?? "-")}</small>
-            <small>tags: {(selectedTakeSummary?.tags ?? []).join(", ") || "-"}</small>
-            <small>objects: {String(detail?.result?.objects?.length ?? detail?.object_annotations?.length ?? "-")}</small>
+            <strong>Label provenance</strong>
+            {activeMlSetScope && selectedObjectGroup ? (
+              <>
+                <small>normalized class: {selectedObjectGroup.normalizedClass}</small>
+                <small>superclass: {selectedObjectGroup.superclass}</small>
+                <small>raw labels present: {selectedObjectGroup.rawLabels.join(", ") || "-"}</small>
+                <small>sessions: {selectedObjectGroup.sessions.join(", ") || "-"}</small>
+                <small>review warnings: {selectedObjectGroup.warningCodes.join(", ") || "-"}</small>
+              </>
+            ) : (
+              <>
+                <small>raw label: {selectedScopedMember?.label_provenance.raw_label || "-"}</small>
+                <small>normalized class: {selectedScopedMember?.label_provenance.normalized_class || selectedTakeSummary?.expected_class || "-"}</small>
+                <small>superclass: {selectedScopedMember?.label_provenance.superclass || detailTakeSuperclasses[0] || "-"}</small>
+                <small>normalization version: {selectedScopedMember?.label_provenance.normalization_version || String(detailTakeMetadata["normalization_version"] || "-")}</small>
+                <small>source row: {selectedScopedMember?.label_provenance.source_row || "-"}</small>
+              </>
+            )}
           </div>
 
           <div className="datasets-inspector-box">
-            <strong>Quick Semantic Actions</strong>
+            <strong>Object group membership</strong>
+            <small>physical_object_id: {selectedObjectGroup?.physicalObjectId || selectedScopedMember?.physical_object_id || "-"}</small>
+            <small>take count: {selectedObjectGroup?.takeCount ?? (selectedScopedMember ? 1 : 0)}</small>
+            <small>warnings: {(selectedObjectGroup?.warningCodes || selectedScopedMember?.warnings || []).join(", ") || "-"}</small>
+            <small>feature summary: {selectedScopedMember?.feature_ready ? `${selectedScopedMember.feature_summary.processed_class_label || "processed"} · ${selectedScopedMember.feature_summary.processed_superclass || "-"}` : "not available"}</small>
+          </div>
+
+          <div className="datasets-inspector-box">
+            <strong>Quick actions</strong>
             <div className="datasets-actions-row">
               <button type="button" disabled={!selectedTakeId} onClick={() => selectedTakeId && void api.updateTakeMetadata(selectedTakeId, { validation_status: "valid" }).then(refreshTakes)}>Validate</button>
-              <button type="button" disabled={!selectedTakeId} onClick={() => selectedTakeId && void api.updateTakeMetadata(selectedTakeId, { validation_status: "invalid" }).then(refreshTakes)}>Reject</button>
-              <button type="button" disabled={!selectedTakeId} onClick={() => selectedTakeId && void api.updateTakeMetadata(selectedTakeId, { split: "validation" }).then(refreshTakes)}>Assign split</button>
-              <button type="button" disabled={!selectedTakeId} onClick={() => selectedTakeId && void api.updateTakeMetadata(selectedTakeId, { ml_set_ids_add: ["ml_set_default"] }).then(refreshTakes)}>Add to ML set</button>
+              <button type="button" disabled={!selectedTakeId} onClick={() => selectedTakeId && void api.updateTakeMetadata(selectedTakeId, { validation_status: "needs_review" }).then(refreshTakes)}>Mark review</button>
+              <button type="button" disabled={!activeMlSetScope || (!selectedTakeId && !selectedObjectGroup)} onClick={() => void excludeSelectionFromActiveMlSet(selectedObjectGroup ? selectedObjectGroup.members.map((member) => member.take_id) : selectedTakeId ? [selectedTakeId] : [])}>Exclude from ML set</button>
+              <button type="button" disabled={!selectedTakeId} onClick={() => {
+                const value = window.prompt("Correct normalized class", selectedScopedMember?.normalized_class || selectedTakeSummary?.expected_class || "");
+                if (value && selectedTakeId) void updateActiveMlSetSelection({ expected_class: value.trim() }, [selectedTakeId]);
+              }}>Correct label</button>
             </div>
-          </div>
-
-          <div className="datasets-inspector-actions">
-            <button
-              type="button"
-              disabled={!selectedDataset && !selectedTakeId}
-              title={selectedTakeId ? "Open selected take in Studio" : selectedDataset ? "Open selected dataset in Studio" : "Select a dataset first"}
-              onClick={() => { window.location.href = "/studio"; }}
-            >
-              {selectedTakeId ? "Open selected take in Studio" : "Open selected dataset in Studio"}
-            </button>
-            <button
-              type="button"
-              disabled={!selectedTakeId}
-              title={selectedTakeId ? "Inspect selected take outputs" : "Select a take first"}
-              onClick={() => { if (selectedTakeId) window.location.href = `/takes/${encodeURIComponent(selectedTakeId)}`; }}
-            >
-              Inspect pipeline outputs
-            </button>
-            <button
-              type="button"
-              disabled={!selectedTakeId}
-              title={selectedTakeId ? "Open Studio for segmentation review" : "Select a take first"}
-              onClick={() => { if (selectedTakeId) window.location.href = "/studio"; }}
-            >
-              Review segmentation
-            </button>
-            <button
-              type="button"
-              disabled={selectedTakeIds.size === 0}
-              title={selectedTakeIds.size ? "Open selected takes in Feature Analytics" : "Select one or more takes first"}
-              onClick={() => { window.location.href = "/feature-analytics"; }}
-            >
-              Open selection in Feature Analytics
-            </button>
+            <div className="datasets-actions-row">
+              <button type="button" disabled={!activeMlSetScope || (!selectedTakeId && !selectedObjectGroup)} onClick={() => {
+                const value = window.prompt("Assign ML-set split", selectedScopedMember?.split || "validation");
+                if (value) void updateActiveMlSetSelection({ split: value.trim() }, selectedObjectGroup ? selectedObjectGroup.members.map((member) => member.take_id) : selectedTakeId ? [selectedTakeId] : []);
+              }}>Assign split</button>
+              <button type="button" disabled={!selectedTakeId} onClick={() => {
+                if (!selectedTakeId) return;
+                window.open(buildStudioTakeHref(selectedTakeId), "_blank", "noopener,noreferrer");
+              }}>Open in Studio</button>
+              <button type="button" disabled={!selectedTakeId && !selectedObjectGroup} onClick={() => openFeatureAnalyticsForSlice({ normalizedClass: selectedScopedMember?.normalized_class || selectedObjectGroup?.normalizedClass || "", superclass: selectedScopedMember?.superclass || selectedObjectGroup?.superclass || "", physicalObjectId: selectedScopedMember?.physical_object_id || selectedObjectGroup?.physicalObjectId || "" })}>Open in Feature Analytics</button>
+            </div>
           </div>
 
           <div className="datasets-inspector-box">
@@ -1866,15 +2409,15 @@ export default function DatasetsPage() {
             <small>next unresolved / unreviewed / missing-label take</small>
             <div className="datasets-actions-row">
               <button type="button" onClick={() => {
-                const next = takes.find((take) => String(take.validation_status ?? "unreviewed") !== "valid");
+                const next = activeMlSetScope ? activeReviewRows.find((row) => String(row.validation_status ?? "unreviewed") !== "valid") : takes.find((take) => String(take.validation_status ?? "unreviewed") !== "valid");
                 if (next) setSelectedTakeId(next.take_id);
               }}>Next unresolved</button>
               <button type="button" onClick={() => {
-                const next = takes.find((take) => String(take.validation_status ?? "unreviewed") === "unreviewed");
+                const next = activeMlSetScope ? activeReviewRows.find((row) => String(row.validation_status ?? "unreviewed") === "unreviewed") : takes.find((take) => String(take.validation_status ?? "unreviewed") === "unreviewed");
                 if (next) setSelectedTakeId(next.take_id);
               }}>Next unreviewed</button>
               <button type="button" onClick={() => {
-                const next = takes.find((take) => !take.expected_class);
+                const next = activeMlSetScope ? activeReviewRows.find((row) => !row.normalized_class) : takes.find((take) => !take.expected_class);
                 if (next) setSelectedTakeId(next.take_id);
               }}>Next missing label</button>
             </div>
@@ -1887,6 +2430,8 @@ export default function DatasetsPage() {
             <small>anomaly/disagreement clustering (placeholder)</small>
             <small>feature-space semantic exploration with Feature Analytics (placeholder)</small>
           </div>
+          </>
+          )}
         </aside>
       </section>
 
@@ -1905,7 +2450,7 @@ export default function DatasetsPage() {
               </h3>
               <small>
                 {selectionScope === "filtered"
-                  ? `All ${filteredCount} filtered takes selected${excludedTakeIds.size ? ` · ${excludedTakeIds.size} excluded` : ""}`
+                  ? `All ${activeFilteredCount} filtered takes selected${excludedTakeIds.size ? ` · ${excludedTakeIds.size} excluded` : ""}`
                   : `${selectedTakeIds.size} visible selected`}
               </small>
             </header>
@@ -2153,6 +2698,16 @@ export default function DatasetsPage() {
         onSelectSession={(sessionId) => {
           openSessionDrawer(sessionId);
         }}
+        onReviewClass={(value) => {
+          if (!selectedMlSetSummary) return;
+          setSelectedMlSetId("");
+          applyMlSetScope(selectedMlSetSummary.id, { normalizedClass: value });
+        }}
+        onReviewSuperclass={(value) => {
+          if (!selectedMlSetSummary) return;
+          setSelectedMlSetId("");
+          applyMlSetScope(selectedMlSetSummary.id, { superclass: value });
+        }}
       />
       <PhysicalObjectDetailDrawer
         open={Boolean(selectedPhysicalObjectId && selectedPhysicalObjectSummary)}
@@ -2185,6 +2740,36 @@ function firstObjectId(detail: TakeDetail): string {
   const first = (detail.object_annotations ?? [])[0] as ObjectAnnotation | undefined;
   if (!first) return "";
   return String(first.candidate_id ?? first.id ?? "");
+}
+
+function recordOrNull(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function resolvedTakePreviewUrl(takeId: string, value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return /^https?:\/\//i.test(value) ? value : fileUrl(takeId, value);
+}
+
+function takePreviewUrlForDetail(detail: TakeDetail): string | null {
+  const metadataFiles = recordOrNull(detail.metadata)?.files;
+  const sourceFiles = recordOrNull(metadataFiles);
+  const resultFiles = recordOrNull((detail.result as unknown as { files?: Record<string, unknown> | null } | null)?.files);
+  const metadata = recordOrNull(detail.metadata);
+  const takeMetadata = recordOrNull(detail.take_metadata);
+  const previewCandidate = [
+    sourceFiles?.heightmap_preview,
+    resultFiles?.input_preview,
+    detail.assets?.heightmap?.heightmap_preview,
+    detail.assets?.reflectance?.reflectance,
+    resultFiles?.reflectance,
+    resultFiles?.overlay,
+    metadata?.thumbnail_url,
+    takeMetadata?.thumbnail_url,
+    metadata?.preview_url,
+    takeMetadata?.preview_url,
+  ].find((value) => typeof value === "string" && value.trim());
+  return resolvedTakePreviewUrl(detail.take_id, previewCandidate);
 }
 
 function takePreviewForSummary(take: TakeSummary): { url: string | null; placeholder: string; modality: string | null } {

@@ -1,5 +1,7 @@
 import ProjectionArtifactViewer from "./ProjectionArtifactViewer";
+import BinaryMaskRenderer from "./BinaryMaskRenderer";
 import { fileUrl } from "../api/client";
+import type { TakeDetail } from "../api/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { overlayDebugInfo, resolveOverlayTarget, visibleOverlays, type OverlayDebugInfo, type OverlayDisplayMode } from "./overlayModel";
 import { type StudioArtifact } from "./studioWorkspaceModel";
@@ -11,6 +13,9 @@ import type { HoverInspectionSample } from "./hoverInspectionModel";
 import { inferColorMapTFromRgb, scalarToRgb } from "./colormap";
 import HeightLegend from "./HeightLegend";
 import { assertSemanticMatch, resolveHeightArtifact, resolveHeightColorMapping, toHeightLegendSemantic, type HeightColorMapping } from "./heightSemantics";
+import { shouldUseBinaryMaskRenderer } from "./binaryMaskArtifacts";
+import type { StudioArtifactViewState } from "./studioViewState";
+import { artifactRelevanceLabel, artifactRelevanceTone, type ArtifactRelevance } from "./referenceArtifactRelevance";
 type HeightRange = { min: number; max: number; unit: string };
 type DisplayRangePreset = "auto_semantic" | "fixed_semantic" | "percentile";
 type RangeSource = "persisted_render_context" | "artifact_metadata" | "semantic_fallback";
@@ -76,6 +81,8 @@ type Props = {
   selectedArtifactId: string | null;
   onSelect: (artifactId: string) => void;
   detailJson?: unknown;
+  takeDetail?: TakeDetail | null;
+  currentStageArtifacts?: StudioArtifact[];
   selectedObjectId?: number | null;
   hoveredObjectId?: number | null;
   hoveredArtifactId?: string | null;
@@ -95,6 +102,15 @@ type Props = {
   onCancelRoiEdit?: () => void;
   debugMode?: StudioDebugMode;
   onHoverSample?: (sample: HoverInspectionSample | null) => void;
+  viewState: StudioArtifactViewState;
+  onViewportModeChange: (mode: StudioArtifactViewState["viewportMode"]) => void;
+  onOverlayModeChange: (mode: OverlayDisplayMode) => void;
+  onBinaryMaskModeChange: (mode: StudioArtifactViewState["binaryMaskMode"]) => void;
+  onBinaryMaskReferenceArtifactIdChange: (artifactId: string | null) => void;
+  onBinaryMaskOpacityChange?: (value: number) => void;
+  onBinaryMaskReferenceOpacityChange?: (value: number) => void;
+  onResetViewState: () => void;
+  artifactRelevance?: Record<string, { relevance: ArtifactRelevance; reason?: string }>;
 };
 
 export default function StudioArtifactExplorer({
@@ -103,6 +119,8 @@ export default function StudioArtifactExplorer({
   selectedArtifactId,
   onSelect,
   detailJson,
+  takeDetail = null,
+  currentStageArtifacts = [],
   selectedObjectId,
   hoveredObjectId = null,
   hoveredArtifactId = null,
@@ -122,8 +140,15 @@ export default function StudioArtifactExplorer({
   onCancelRoiEdit,
   debugMode = "operator",
   onHoverSample,
+  viewState,
+  onViewportModeChange,
+  onBinaryMaskModeChange,
+  onBinaryMaskReferenceArtifactIdChange,
+  onBinaryMaskOpacityChange,
+  onBinaryMaskReferenceOpacityChange,
+  onResetViewState,
+  artifactRelevance = {},
 }: Props) {
-  const [overlayMode, setOverlayMode] = useState<OverlayDisplayMode>("all");
   const [sourceHeightRange, setSourceHeightRange] = useState<HeightRange | null>(null);
   const [drawRoiMode, setDrawRoiMode] = useState(false);
   const [draftRoi, setDraftRoi] = useState<RoiRect | null>(null);
@@ -169,6 +194,8 @@ export default function StudioArtifactExplorer({
   } | null>(null);
   const [numericSourceWarning, setNumericSourceWarning] = useState<string | null>(null);
   const [semanticMismatchWarning, setSemanticMismatchWarning] = useState<string | null>(null);
+  const [jsonFileContent, setJsonFileContent] = useState<Record<string, unknown> | null>(null);
+  const [jsonFileError, setJsonFileError] = useState<string | null>(null);
   const hoverRafRef = useRef<number | null>(null);
   const pendingHoverSampleRef = useRef<HoverInspectionSample | null>(null);
   useEffect(() => {
@@ -190,6 +217,10 @@ export default function StudioArtifactExplorer({
     ?? `${takeId ?? "take"}:${previewTarget?.artifact_id ?? selected.artifact_id}:${previewTarget?.path ?? selected.path ?? "preview"}`
   );
   const selectedOverlayId = selected.kind === "overlay" ? selected.artifact_id : null;
+  const useBinaryMaskRenderer = useMemo(
+    () => shouldUseBinaryMaskRenderer(selected, artifacts),
+    [selected, artifacts],
+  );
   const morphDebug = artifacts.find((item) => item.artifact_id === "morphology_debug_json");
   const morphMetrics = artifacts.find((item) => item.artifact_id === "morphology_metrics");
   const debugMeta = (morphDebug?.metadata ?? {}) as Record<string, unknown>;
@@ -202,8 +233,8 @@ export default function StudioArtifactExplorer({
   const thresholdCoverage = Number(threshold.foreground_coverage ?? metricsMeta.threshold_foreground_coverage ?? 0);
   const emptyCleaned = Number(morph.cleaned_foreground_pixels ?? metricsMeta.cleaned_foreground_pixels ?? 0) <= 0;
   const overlays = useMemo(
-    () => visibleOverlays(targetResolution.overlays, overlayMode, selectedObjectId ?? null),
-    [overlayMode, selectedObjectId, targetResolution.overlays]
+    () => visibleOverlays(targetResolution.overlays, viewState.overlayMode, selectedObjectId ?? null),
+    [selectedObjectId, targetResolution.overlays, viewState.overlayMode]
   );
   const allowRoiEditing = selected.stage_id === "detect_belt_plane";
   const activeViewId = String(previewTarget?.artifact_id ?? selected.artifact_id ?? "");
@@ -299,7 +330,6 @@ export default function StudioArtifactExplorer({
     if (!numericHover) return null;
     return { ...numericHover, displayVmin: effectiveDisplayRange.min, displayVmax: effectiveDisplayRange.max };
   }, [numericHover, effectiveDisplayRange.min, effectiveDisplayRange.max]);
-  const normHist = useMemo(() => histogramArtifact(artifacts), [artifacts]);
   const planeDebug = useMemo(() => planeDebugArtifact(artifacts), [artifacts]);
   const engineering = debugMode === "engineering";
   const viewerRenderContext = useMemo<ViewerRenderContext | null>(() => {
@@ -603,6 +633,29 @@ export default function StudioArtifactExplorer({
   }, [resolvedHeightRange, selected, takeId]);
   useEffect(() => {
     let canceled = false;
+    async function loadJsonFileContent() {
+      setJsonFileContent(null);
+      setJsonFileError(null);
+      if (!takeId || selected.kind !== "json" || !selected.path) return;
+      try {
+        const response = await fetch(fileUrl(takeId, selected.path));
+        if (!response.ok) {
+          if (!canceled) setJsonFileError(`Failed to load artifact content (${response.status}).`);
+          return;
+        }
+        const payload = await response.json() as Record<string, unknown>;
+        if (!canceled) setJsonFileContent(payload);
+      } catch {
+        if (!canceled) setJsonFileError("Failed to load artifact content.");
+      }
+    }
+    void loadJsonFileContent();
+    return () => {
+      canceled = true;
+    };
+  }, [selected.kind, selected.path, takeId]);
+  useEffect(() => {
+    let canceled = false;
     async function loadNumericHover() {
       setNumericSourceWarning(null);
       if (!takeId || !heightLikeImage) {
@@ -814,7 +867,10 @@ export default function StudioArtifactExplorer({
             }}
             type="button"
           >
-            <strong>{artifact.title}</strong>
+            <strong>
+              {artifact.title}
+              <ArtifactExplorerRelevanceBadge artifactId={artifact.artifact_id} relevanceByArtifact={artifactRelevance} />
+            </strong>
             <span>{artifact.stage_id}</span>
             <small>{artifact.kind}</small>
             <small>{artifact.object_id == null ? "global" : objectDisplayId(artifact.object_id)}</small>
@@ -822,11 +878,20 @@ export default function StudioArtifactExplorer({
         ))}
       </aside>
       <section className="studio-artifact-preview">
-        {(selected.kind === "overlay" || targetResolution.overlays.length > 0) && (
-          <div className="overlay-controls">
-            <button className={overlayMode === "all" ? "active" : ""} onClick={() => setOverlayMode("all")} type="button">Show all overlays</button>
-            <button className={overlayMode === "selected_only" ? "active" : ""} onClick={() => setOverlayMode("selected_only")} type="button">Selected object only</button>
-            <button className={overlayMode === "hide" ? "active" : ""} onClick={() => setOverlayMode("hide")} type="button">Hide overlays</button>
+        {!useBinaryMaskRenderer && (
+          <div className="artifact-viewport-toolbar">
+            <div className="artifact-viewport-toolbar-group">
+              <button className={viewState.viewportMode === "fit_all" ? "active" : ""} onClick={() => onViewportModeChange("fit_all")} type="button">Fit all</button>
+              <button className={viewState.viewportMode === "fit_width" ? "active" : ""} onClick={() => onViewportModeChange("fit_width")} type="button">Fit width</button>
+              <button className={viewState.viewportMode === "fit_height" ? "active" : ""} onClick={() => onViewportModeChange("fit_height")} type="button">Fit height</button>
+              <button className={viewState.viewportMode === "natural" ? "active" : ""} onClick={() => onViewportModeChange("natural")} type="button">100%</button>
+              <button onClick={() => { onResetViewState(); setHoverInspectorMode("compact"); }} type="button">Reset</button>
+            </div>
+            <div className="artifact-viewport-toolbar-group">
+              {takeId && previewTarget?.path && (
+                <a href={`${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(previewCacheKey)}`} target="_blank" rel="noreferrer">Open full size</a>
+              )}
+            </div>
           </div>
         )}
         {!!targetResolution.warning && (
@@ -844,8 +909,30 @@ export default function StudioArtifactExplorer({
             APPROXIMATE
           </div>
         )}
-        {(selected.kind === "image" || selected.kind === "overlay") && previewTarget?.path && takeId && (
-          <div className="height-image-wrap">
+        {useBinaryMaskRenderer && selected.kind === "image" && takeId && (
+          <BinaryMaskRenderer
+            artifact={selected}
+            artifacts={artifacts}
+            cacheKey={previewCacheKey}
+            takeId={takeId}
+            selectedTake={takeDetail}
+            currentStageArtifacts={currentStageArtifacts}
+            fitMode={viewState.viewportMode}
+            mode={viewState.binaryMaskMode}
+            onModeChange={onBinaryMaskModeChange}
+            overlayOpacity={viewState.binaryMaskOpacity}
+            referenceOpacity={viewState.binaryMaskReferenceOpacity}
+            selectedSourceArtifactId={viewState.binaryMaskReferenceArtifactId}
+            onSelectedSourceArtifactIdChange={onBinaryMaskReferenceArtifactIdChange}
+            onOverlayOpacityChange={onBinaryMaskOpacityChange}
+            onReferenceOpacityChange={onBinaryMaskReferenceOpacityChange}
+            onFitModeChange={onViewportModeChange}
+            onResetView={onResetViewState}
+            openUrl={previewTarget?.path ? `${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(previewCacheKey)}` : null}
+          />
+        )}
+        {!useBinaryMaskRenderer && (selected.kind === "image" || selected.kind === "overlay") && previewTarget?.path && takeId && (
+          <div className={`height-image-wrap viewport-${viewState.viewportMode}`}>
             <ProjectionArtifactViewer
               title={previewTarget.title}
               src={`${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(previewCacheKey)}`}
@@ -853,7 +940,7 @@ export default function StudioArtifactExplorer({
               selectedObjectId={selectedObjectId ?? null}
               hoveredObjectId={hoveredObjectId}
               selectedOverlayArtifactId={selectedOverlayId}
-              displayMode={overlayMode}
+              displayMode={viewState.overlayMode}
               onSelectObject={onSelectObject}
               onSelectOverlayArtifact={onSelect}
               onHoverObject={onHoverObject}
@@ -866,8 +953,14 @@ export default function StudioArtifactExplorer({
               roiType={localRoiType}
               roiLabel={localRoiType === "full_height_x_band" ? "Vertical band ROI" : "ROI"}
               drawRoiMode={drawRoiMode}
-              onRoiDrawComplete={(next) => setDraftRoi(next)}
-              onPolygonRoiComplete={(points) => setDraftPolygon(points)}
+              onRoiDrawComplete={(next) => {
+                setDraftRoi(next);
+                void onApplyRoi?.(next, false);
+              }}
+              onPolygonRoiComplete={(points) => {
+                setDraftPolygon(points);
+                if (points.length >= 3) void onApplyPolygonRoi?.(points, false);
+              }}
               engineeringMode={engineering}
               metricRange={heightRange ? { min: heightRange.min, max: heightRange.max, unit: heightRange.unit } : null}
               hoverValueKind={hoverValueKind}
@@ -1096,10 +1189,10 @@ export default function StudioArtifactExplorer({
         )}
         {selected.artifact_id === "normalized_heightmap" && (
           <div className="pipeline-status-grid">
-            <div><span>Norm p50</span><strong>{String((normHist?.metadata as Record<string, unknown> | undefined)?.median_mm ?? "-")}</strong></div>
+            <div><span>Norm p50</span><strong>{String(display?.["p50"] ?? "-")}</strong></div>
             <div><span>Norm p95</span><strong>{String(display?.["p95"] ?? "-")}</strong></div>
-            <div><span>Norm max</span><strong>{String((normHist?.metadata as Record<string, unknown> | undefined)?.max_mm ?? "-")}</strong></div>
-            <div><span>Residual p95</span><strong>{String((planeDebug?.metadata as Record<string, unknown> | undefined)?.model_residual_p95_mm ?? "-")}</strong></div>
+            <div><span>Norm max</span><strong>{String(display?.["raw_max"] ?? "-")}</strong></div>
+            <div><span>Residual p95</span><strong>{String((planeDebug?.metadata as Record<string, unknown> | undefined)?.residual_p95_mm ?? "-")}</strong></div>
             <div><span>Inlier ratio</span><strong>{String((planeDebug?.metadata as Record<string, unknown> | undefined)?.inlier_ratio ?? "-")}</strong></div>
             <div><span>Plane mode</span><strong>{String((planeDebug?.metadata as Record<string, unknown> | undefined)?.reference_surface_model_type ?? "-")}</strong></div>
             <div><span>Valid px</span><strong>{String(display?.["valid_count"] ?? "-")}</strong></div>
@@ -1127,44 +1220,9 @@ export default function StudioArtifactExplorer({
             <div><span>ROI</span><strong>{Boolean(roiInfo.enabled ?? roiEnabled) ? "enabled" : "disabled"}</strong></div>
           </div>
         )}
-        {allowRoiEditing && (
-          <div className="overlay-controls">
-            <button className={drawRoiMode ? "active" : ""} type="button">Draw reference-surface ROI</button>
-            <button className={roiEditStatus === "unsaved" ? "active" : ""} type="button">{`Status: ${roiEditStatus}`}</button>
-            <button className={roiEnabled ? "active" : ""} type="button">{`ROI: ${roiEnabled ? "enabled" : "disabled"}`}</button>
-            <button className={localRoiType === "rectangle" ? "active" : ""} onClick={() => setLocalRoiType("rectangle")} type="button">Rectangle</button>
-            <button className={localRoiType === "polygon" ? "active" : ""} onClick={() => setLocalRoiType("polygon")} type="button">Polygon</button>
-            <button className={localRoiType === "full_height_x_band" ? "active" : ""} onClick={() => setLocalRoiType("full_height_x_band")} type="button">Vertical band ROI</button>
-            <button className={drawRoiMode ? "active" : ""} onClick={() => setDrawRoiMode((value) => !value)} type="button">Draw ROI</button>
-            <button onClick={() => { setDraftRoi(null); setDraftPolygon(null); onCancelRoiEdit?.(); }} type="button">Cancel</button>
-            <button onClick={() => { setDraftRoi(null); setDraftPolygon(null); onClearRoi?.(); }} type="button">Use full frame</button>
-            <button
-              disabled={localRoiType === "polygon" ? !(draftPolygon && draftPolygon.length >= 3) : !draftRoi}
-              onClick={() => {
-                if (localRoiType === "rectangle" && draftRoi) onApplyRoi?.(draftRoi, false);
-                if (localRoiType === "full_height_x_band" && draftRoi) onApplyRoi?.(draftRoi, false);
-                if (localRoiType === "polygon" && draftPolygon && draftPolygon.length >= 3) onApplyPolygonRoi?.(draftPolygon, false);
-              }}
-              type="button"
-            >
-              Apply ROI
-            </button>
-            <button
-              disabled={localRoiType === "polygon" ? !(draftPolygon && draftPolygon.length >= 3) : !draftRoi}
-              onClick={() => {
-                if (localRoiType === "rectangle" && draftRoi) onApplyRoi?.(draftRoi, true);
-                if (localRoiType === "full_height_x_band" && draftRoi) onApplyRoi?.(draftRoi, true);
-                if (localRoiType === "polygon" && draftPolygon && draftPolygon.length >= 3) onApplyPolygonRoi?.(draftPolygon, true);
-              }}
-              type="button"
-            >
-              Apply ROI + rerun
-            </button>
-          </div>
-        )}
-        {allowRoiEditing && localRoiType === "full_height_x_band" && (
+        {allowRoiEditing && drawRoiMode && (
           <div className="artifact-reference">
-            <small>Constrains processing to an X-range while preserving the full scan height.</small>
+            <small>{localRoiType === "full_height_x_band" ? "ROI drawing active · Vertical band · Esc to cancel" : "ROI drawing active · Esc to cancel"}</small>
           </div>
         )}
         {selected.stage_id === "segmentation" && emptyCleaned && (
@@ -1172,24 +1230,15 @@ export default function StudioArtifactExplorer({
             Cleaned mask is empty. Try lowering min component area, changing threshold/invert, or selecting a tighter ROI.
           </div>
         )}
-        <details className="artifact-reference">
-          <summary>Artifact details</summary>
-          <small>Stage: {selected.stage_id}</small>
-          <small>Kind: {selected.kind}</small>
-          <small>Generated: {selected.generated ?? "derived"}</small>
-          <small>Object: {selected.object_id == null ? "-" : objectDisplayId(selected.object_id)}</small>
-          <small>Preview: {selected.preview_available ? "available" : "not available"}</small>
-          <small>File: {selected.path ?? "-"}</small>
-          <small>Focused object: {selectedObjectId == null ? "-" : selectedObjectId}</small>
-          <small>Target image: {previewTarget ? `${previewTarget.title} (${previewTarget.artifact_id})` : "-"}</small>
-          <small>Coordinate space: {selected.coordinate_space ?? "-"}</small>
-          <small>Overlay type: {selected.overlay_type ?? "-"}</small>
-          <small>Projection type: {previewTarget?.projection_type ?? "-"}</small>
-          <small>Projection transform: {previewTarget?.projection_transform_id ?? "-"}</small>
-          <small>Source artifact: {String(selected.metadata?.source_artifact_id ?? "-")}</small>
-          <small>Mask artifact: {String(selected.metadata?.mask_artifact_id ?? "-")}</small>
-        </details>
-        {selected.kind === "json" && <pre className="json-block">{JSON.stringify(detailJson ?? {}, null, 2)}</pre>}
+        {selected.kind === "json" && (
+          <pre className="json-block">
+            {jsonFileError
+              ? jsonFileError
+              : selected.path && !jsonFileContent
+                ? "Loading…"
+                : JSON.stringify((selected.path ? jsonFileContent : selected.metadata) ?? {}, null, 2)}
+          </pre>
+        )}
         {selected.kind === "table" && <div className="artifact-reference"><strong>Table artifact ready for stage/object inspection.</strong></div>}
         {selected.kind === "metric" && <div className="artifact-reference"><strong>Metric artifact ready for stage/object inspection.</strong></div>}
         {(selected.kind === "point_cloud" || selected.kind === "file" || selected.kind === "video" || selected.kind === "text") && (
@@ -1197,6 +1246,24 @@ export default function StudioArtifactExplorer({
         )}
       </section>
     </div>
+  );
+}
+
+function ArtifactExplorerRelevanceBadge({
+  artifactId,
+  relevanceByArtifact,
+}: {
+  artifactId: string;
+  relevanceByArtifact: Record<string, { relevance: ArtifactRelevance; reason?: string }>;
+}) {
+  const entry = relevanceByArtifact[artifactId];
+  if (!entry || entry.relevance === "active") return null;
+  const label = artifactRelevanceLabel(entry.relevance);
+  const title = entry.reason ? `${label}: ${entry.reason}` : label;
+  return (
+    <span className={`artifact-relevance-badge tone-${artifactRelevanceTone(entry.relevance)}`} title={title}>
+      {label}
+    </span>
   );
 }
 
@@ -1313,10 +1380,6 @@ function renderContextTransform(artifacts: StudioArtifact[]): Record<string, unk
   const metadata = preferred?.metadata;
   if (metadata && typeof metadata === "object") return metadata as Record<string, unknown>;
   return null;
-}
-
-function histogramArtifact(artifacts: StudioArtifact[]): StudioArtifact | null {
-  return artifacts.find((a) => a.artifact_id === "normalized_height_histogram") ?? null;
 }
 
 function planeDebugArtifact(artifacts: StudioArtifact[]): StudioArtifact | null {

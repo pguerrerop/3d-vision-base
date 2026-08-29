@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 
 PipelineFamily = Literal["3d", "2d", "25d", "generic"]
@@ -48,6 +48,16 @@ def append_process_run_index(
     source_id: str | None = None,
     acquisition_group_id: str | None = None,
     calibration_profile_id: str | None = None,
+    execution_mode: str | None = None,
+    parent_run_id: str | None = None,
+    parent_take_id: str | None = None,
+    partial_rerun_plan_id: str | None = None,
+    boundary_stage_id: str | None = None,
+    boundary_unit_id: str | None = None,
+    selected_unit_id: str | None = None,
+    comparison_id: str | None = None,
+    recipe_id: str | None = None,
+    run_summary: Mapping[str, Any] | None = None,
 ) -> None:
     if not take_id:
         return
@@ -68,10 +78,62 @@ def append_process_run_index(
         "source_id": source_id,
         "acquisition_group_id": acquisition_group_id,
         "calibration_profile_id": calibration_profile_id,
+        "execution_mode": execution_mode,
+        "parent_run_id": parent_run_id,
+        "parent_take_id": parent_take_id,
+        "partial_rerun_plan_id": partial_rerun_plan_id,
+        "boundary_stage_id": boundary_stage_id,
+        "boundary_unit_id": boundary_unit_id,
+        "selected_unit_id": selected_unit_id,
+        "comparison_id": comparison_id,
+        "recipe_id": recipe_id,
+        "summary": dict(run_summary) if run_summary else {},
     }
     payload.setdefault("entries", []).append(entry)
     payload["updated_at"] = datetime.now(UTC).isoformat()
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def update_process_run_index_entry(data_dir: Path, run_id: str, **patch: Any) -> None:
+    """Merge patch fields into the index entry matching run_id, e.g. to backfill
+    comparison_id once a comparison is generated after the run was already indexed."""
+    path = index_path(data_dir)
+    payload = _read_index(path)
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return
+    changed = False
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("run_id") or "") == run_id:
+            entry.update(patch)
+            changed = True
+    if not changed:
+        return
+    payload["updated_at"] = datetime.now(UTC).isoformat()
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def normalize_run_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compat view of an index entry: fills execution_mode/parent-linkage
+    defaults for legacy entries that predate partial-rerun child-run support."""
+    normalized = dict(entry)
+    normalized.setdefault("execution_mode", None)
+    if not normalized.get("execution_mode"):
+        normalized["execution_mode"] = "full_run"
+    for key in (
+        "parent_run_id",
+        "parent_take_id",
+        "partial_rerun_plan_id",
+        "boundary_stage_id",
+        "boundary_unit_id",
+        "selected_unit_id",
+        "comparison_id",
+        "recipe_id",
+    ):
+        normalized.setdefault(key, None)
+    summary = normalized.get("summary")
+    normalized["summary"] = dict(summary) if isinstance(summary, dict) else {}
+    return normalized
 
 
 def load_process_entries(data_dir: Path) -> list[dict[str, Any]]:

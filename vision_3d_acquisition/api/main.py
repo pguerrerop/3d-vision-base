@@ -38,6 +38,7 @@ from vision_3d_acquisition.acquisition.trispector_25d import TriSpectorFtpAcquis
 from vision_3d_acquisition.acquisition.replay_dataset import ReplayableAcquisitionService
 from vision_3d_acquisition.acquisition.groups import AcquisitionGroupService
 from vision_3d_acquisition.api.calibration import router as calibration_router
+from vision_3d_acquisition.api.validation import router as validation_router
 from vision_3d_acquisition.api.events import stream_events
 from vision_3d_acquisition.api.filesystem import (
     count_take_dirs,
@@ -56,9 +57,12 @@ from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.datasets.physical_objects import PhysicalObjectRegistry
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
 from vision_3d_acquisition.api.feature_analytics import (
+    build_filter_options,
     build_distributions,
     build_feature_records,
     filter_records_by_feature_range,
+    summarize_records_by_feature_range,
+    summarize_feature_scope,
     summarize_feature_values,
     _feature_definitions,
 )
@@ -72,13 +76,43 @@ from vision_3d_acquisition.api.processing_jobs import (
     ProcessingJobCreateRequest,
     get_processing_job_service,
 )
+from vision_3d_acquisition.api.feature_jobs import (
+    FeatureJobRequest,
+    get_feature_job_service,
+)
 from vision_3d_acquisition.api.processing_dispatch import dispatch_take_processing
 from vision_3d_acquisition.api.schemas import DatasetSessionSummary, DatasetSummary, HealthResponse, RuntimeState, TakeDetail, TakeSummary, TakeSummaryPage
 from vision_3d_acquisition.api.settings import ApiSettings, get_cors_origins, get_settings
 from vision_3d_acquisition.poc.exports import export_labeled_dataset_summary, export_object_metrics
 from vision_3d_acquisition.poc.labels import ALLOWED_LABELS, list_labeled_takes, load_labels, save_labels
 from vision_3d_acquisition.poc.summary import build_poc_run_summary, validate_result_payload
-from vision_3d_acquisition.pipelines.registry import list_pipelines
+from vision_3d_acquisition.pipelines.processing_units import (
+    PROCESSING_UNIT_REGISTRY_VERSION,
+    processing_unit_contract_fingerprint,
+    validate_processing_unit_contracts,
+)
+from vision_3d_acquisition.pipelines.comparison import (
+    compare_pipeline_sources,
+    get_pipeline_comparison,
+    list_pipeline_comparisons,
+    resolve_comparison_file,
+    resolve_pipeline_run_source,
+)
+from vision_3d_acquisition.pipelines.partial_rerun_plan import (
+    list_partial_rerun_plans,
+    persist_partial_rerun_plan,
+    plan_partial_rerun,
+)
+from vision_3d_acquisition.pipelines.partial_rerun_execution import execute_partial_rerun
+from vision_3d_acquisition.pipelines.run_lineage import (
+    generate_run_comparison_to_parent,
+    list_pipeline_runs,
+    resolve_run_children,
+    resolve_run_comparison_id,
+    resolve_run_parent,
+)
+from vision_3d_acquisition.pipelines.recipes import RecipeService
+from vision_3d_acquisition.pipelines.registry import list_pipelines, list_processing_unit_definitions
 from vision_3d_acquisition.fusion.preparation import build_fusion_preview, resolve_fusion_inputs
 from vision_3d_acquisition.fusion.published_service import PublishedInspectionResultService
 from vision_3d_acquisition.fusion.service import FusionService
@@ -114,8 +148,49 @@ app.add_middleware(
 )
 
 app.include_router(calibration_router)
+app.include_router(validation_router)
 _API_PROCESS_HEARTBEAT: ProcessHeartbeat | None = None
 logger = logging.getLogger(__name__)
+
+
+def _feature_query_multi(request: Request, *keys: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        for raw in request.query_params.getlist(key):
+            for part in str(raw).split(","):
+                item = part.strip()
+                if not item or item in seen:
+                    continue
+                seen.add(item)
+                values.append(item)
+    return values
+
+
+def parse_feature_analytics_query(request: Request) -> dict[str, Any]:
+    dataset_values = _feature_query_multi(request, "dataset_id", "dataset_ids", "dataset", "datasets")
+    session_values = _feature_query_multi(request, "session_id", "session_ids", "session", "sessions")
+    pipeline_values = _feature_query_multi(request, "pipeline_id", "pipeline_ids", "pipeline")
+    calibration_values = _feature_query_multi(request, "calibration_id", "calibration_ids", "calibration")
+    return {
+        "dataset_id": dataset_values[0] if dataset_values else None,
+        "ml_set_id": (request.query_params.get("ml_set_id") or "").strip() or None,
+        "session_id": session_values[0] if session_values else None,
+        "physical_object_ids": _feature_query_multi(request, "physical_object_ids", "physical_object_id"),
+        "take_ids": _feature_query_multi(request, "take_ids", "take_id"),
+        "raw_labels": _feature_query_multi(request, "raw_labels", "labels"),
+        "normalized_classes": _feature_query_multi(request, "normalized_classes", "normalized_class"),
+        "labeled_superclasses": _feature_query_multi(request, "labeled_superclasses"),
+        "processed_superclasses": _feature_query_multi(request, "processed_superclasses", "superclasses", "superclass"),
+        "processed_classes": _feature_query_multi(request, "processed_classes"),
+        "validation_status": _feature_query_multi(request, "validation_status"),
+        "split": _feature_query_multi(request, "split"),
+        "pipeline_id": pipeline_values[0] if pipeline_values else None,
+        "calibration_id": calibration_values[0] if calibration_values else None,
+        "date_from": (request.query_params.get("date_from") or "").strip() or None,
+        "date_to": (request.query_params.get("date_to") or "").strip() or None,
+        "feature_selection": _feature_query_multi(request, "feature_selection"),
+    }
 
 
 @app.on_event("startup")
@@ -202,6 +277,76 @@ class ExecuteTakeRequest(BaseModel):
     purpose: str = "manual_debug"
     acquisition_group_id: str | None = None
     stage_params: dict[str, Any] | None = None
+    recipe_id: str | None = None
+    recipe_version: int | None = None
+
+
+class RecipeUpsertRequest(BaseModel):
+    recipe_id: str | None = None
+    name: str
+    description: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    parameters_by_unit: dict[str, Any] | None = None
+    stage_params: dict[str, Any] | None = None
+    unit_enabled_state: dict[str, Any] | None = None
+    artifact_policy: dict[str, Any] | None = None
+    calibration_snapshot_reference: dict[str, Any] | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    parent_recipe_id: str | None = None
+
+
+class RecipeCloneRequest(BaseModel):
+    name: str | None = None
+    recipe_id: str | None = None
+
+
+class RecipeValidateRequest(BaseModel):
+    recipe_id: str | None = None
+    parameters_by_unit: dict[str, Any] | None = None
+    stage_params: dict[str, Any] | None = None
+
+
+class ComparisonSourceRequest(BaseModel):
+    type: str
+    label: str | None = None
+    take_id: str | None = None
+    run_id: str | None = None
+    recipe_id: str | None = None
+    version: int | None = None
+    stage_params: dict[str, Any] | None = None
+    parameters_by_unit: dict[str, Any] | None = None
+
+
+class ComparePipelineRequest(BaseModel):
+    left: ComparisonSourceRequest
+    right: ComparisonSourceRequest
+
+
+class ParentRunResultRefRequest(BaseModel):
+    take_id: str
+    run_id: str = "latest"
+
+
+class PartialRerunPlanRequest(BaseModel):
+    selected_unit_id: str
+    changed_parameters: dict[str, Any] | None = None
+    current_recipe_snapshot: dict[str, Any] | None = None
+    parent_run_result_ref: ParentRunResultRefRequest | None = None
+    parent_run_result: dict[str, Any] | None = None
+
+
+class PartialRerunExecuteOptionsRequest(BaseModel):
+    compare_to_parent: bool = True
+
+
+class PartialRerunExecuteRequest(BaseModel):
+    plan_id: str | None = None
+    plan: dict[str, Any] | None = None
+    parent_run_ref: ParentRunResultRefRequest
+    effective_recipe_snapshot: dict[str, Any] | None = None
+    overrides: dict[str, Any] | None = None
+    options: PartialRerunExecuteOptionsRequest | None = None
 
 
 class CreateProcessBindingRequest(BaseModel):
@@ -299,6 +444,7 @@ class TakeMetadataUpdateRequest(BaseModel):
 
 class TakeBulkFilters(BaseModel):
     dataset_id: str | None = None
+    ml_set_id: str | None = None
     session_id: str | None = None
     validation_status: str | None = None
     search: str | None = None
@@ -308,6 +454,11 @@ class TakeBulkFilters(BaseModel):
     split: str | None = None
     expected_class: str | None = None
     calibration_linkage_only: bool | None = None
+    physical_object_id: str | None = None
+    raw_label: str | None = None
+    normalized_class: str | None = None
+    superclass: str | None = None
+    membership_status: str | None = None
 
 
 class TakeBulkMetadataRequest(BaseModel):
@@ -341,6 +492,16 @@ class DatasetMlSetMembersRequest(BaseModel):
     filters: TakeBulkFilters | None = None
     exclude_take_ids: list[str] = Field(default_factory=list)
     dry_run: bool = False
+
+
+class DatasetMlSetMembershipUpdateRequest(BaseModel):
+    take_ids: list[str] = Field(default_factory=list)
+    split: str | None = None
+    include: bool | None = None
+    expected_class: str | None = None
+    expected_subclass: str | None = None
+    review_required: bool | None = None
+    default_trainable: bool | None = None
 
 
 class IngestionRunCreateRequest(BaseModel):
@@ -592,6 +753,337 @@ def pipelines() -> list[dict[str, Any]]:
     return list_pipelines()
 
 
+@app.get("/api/pipelines/{pipeline_id}/processing-units")
+def pipeline_processing_units(pipeline_id: str) -> dict[str, Any]:
+    units = list_processing_unit_definitions(pipeline_id)
+    return {
+        "pipeline_id": pipeline_id,
+        "processing_units": units,
+        "processing_unit_contract_version": PROCESSING_UNIT_REGISTRY_VERSION,
+        "processing_unit_contract_fingerprint": processing_unit_contract_fingerprint(units),
+        "validation": validate_processing_unit_contracts(units),
+    }
+
+
+@app.get("/api/pipelines/{pipeline_id}/recipes")
+def pipeline_recipes(pipeline_id: str, include_archived: bool = False, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    return {
+        "pipeline_id": pipeline_id,
+        "recipes": RecipeService(settings).list_recipes(pipeline_id, include_archived=include_archived),
+    }
+
+
+@app.post("/api/pipelines/{pipeline_id}/partial-rerun/plan")
+def pipeline_partial_rerun_plan(
+    pipeline_id: str,
+    payload: PartialRerunPlanRequest,
+    persist: bool = False,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    # Keep direct Python callers compatible with the older positional calling style:
+    # pipeline_partial_rerun_plan(pipeline_id, payload, settings)
+    if isinstance(persist, ApiSettings) and not isinstance(settings, ApiSettings):
+        settings = persist
+        persist = False
+    units = list_processing_unit_definitions(pipeline_id)
+    parent_run_result: dict[str, Any] | None = None
+    resolver_error: str | None = None
+    if payload.parent_run_result_ref is not None:
+        resolved = resolve_pipeline_run_source(
+            settings,
+            pipeline_id=pipeline_id,
+            take_id=payload.parent_run_result_ref.take_id,
+            run_id=payload.parent_run_result_ref.run_id,
+        )
+        if resolved is None:
+            resolver_error = (
+                f"Parent run result could not be resolved for take {payload.parent_run_result_ref.take_id} "
+                f"run {payload.parent_run_result_ref.run_id}."
+            )
+        else:
+            parent_run_result = dict(resolved.get("result_payload") or {})
+            parent_run_result["artifacts"] = list(resolved.get("artifacts") or [])
+            if isinstance(resolved.get("processing_unit_trace"), dict):
+                parent_run_result["processing_unit_trace"] = dict(resolved.get("processing_unit_trace") or {})
+    elif isinstance(payload.parent_run_result, dict):
+        parent_run_result = dict(payload.parent_run_result)
+    plan = plan_partial_rerun(
+        pipeline_id,
+        payload.selected_unit_id,
+        payload.changed_parameters,
+        payload.current_recipe_snapshot,
+        parent_run_result,
+        units,
+    )
+    if resolver_error:
+        plan["safe"] = False
+        plan["mode"] = "full_run"
+        plan["fallback_mode"] = "full_run"
+        plan.setdefault("blocking_reasons", []).append(resolver_error)
+        plan.setdefault("explanation", {})
+        plan["explanation"]["summary"] = resolver_error
+        plan["explanation"]["fallback_reason"] = "Full-run fallback was selected because the parent run reference could not be resolved."
+        plan["plan_quality"] = "unsafe"
+        plan["confidence"] = "low"
+    response = {
+        "pipeline_id": pipeline_id,
+        **plan,
+    }
+    if persist:
+        persisted = persist_partial_rerun_plan(settings.data_dir, pipeline_id, response)
+        response.update({
+            "plan_id": persisted.get("plan_id"),
+            "created_at": persisted.get("created_at"),
+            "plan_path": persisted.get("plan_path"),
+        })
+    return response
+
+
+@app.get("/api/pipelines/{pipeline_id}/partial-rerun/plans")
+def pipeline_partial_rerun_plans(pipeline_id: str, limit: int = 10, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    return {
+        "pipeline_id": pipeline_id,
+        "plans": list_partial_rerun_plans(settings.data_dir, pipeline_id, limit=limit),
+    }
+
+
+@app.post("/api/pipelines/{pipeline_id}/partial-rerun/execute")
+def pipeline_partial_rerun_execute(
+    pipeline_id: str,
+    payload: PartialRerunExecuteRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return execute_partial_rerun(
+        settings,
+        pipeline_id=pipeline_id,
+        plan_id=payload.plan_id,
+        plan_payload=payload.plan,
+        parent_run_ref=payload.parent_run_ref.model_dump(mode="json") if payload.parent_run_ref else None,
+        effective_recipe_snapshot=payload.effective_recipe_snapshot,
+        overrides=payload.overrides,
+        compare_to_parent=bool((payload.options or PartialRerunExecuteOptionsRequest()).compare_to_parent),
+    )
+
+
+@app.post("/api/pipelines/{pipeline_id}/recipes")
+def create_pipeline_recipe(pipeline_id: str, payload: RecipeUpsertRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        return RecipeService(settings).create_recipe(
+            pipeline_id,
+            name=payload.name,
+            description=payload.description,
+            recipe_id=payload.recipe_id,
+            tags=payload.tags,
+            notes=payload.notes,
+            parameters_by_unit=payload.parameters_by_unit,
+            stage_params=payload.stage_params,
+            unit_enabled_state=payload.unit_enabled_state,
+            artifact_policy=payload.artifact_policy,
+            calibration_snapshot_reference=payload.calibration_snapshot_reference,
+            provenance=payload.provenance,
+            parent_recipe_id=payload.parent_recipe_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pipelines/{pipeline_id}/recipes/from-current")
+def create_pipeline_recipe_from_current(
+    pipeline_id: str,
+    payload: RecipeUpsertRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        provenance = {
+            **payload.provenance,
+            "source": "from_current",
+        }
+        return RecipeService(settings).create_recipe(
+            pipeline_id,
+            name=payload.name,
+            description=payload.description,
+            recipe_id=payload.recipe_id,
+            tags=payload.tags,
+            notes=payload.notes,
+            parameters_by_unit=payload.parameters_by_unit,
+            stage_params=payload.stage_params,
+            unit_enabled_state=payload.unit_enabled_state,
+            artifact_policy=payload.artifact_policy,
+            calibration_snapshot_reference=payload.calibration_snapshot_reference,
+            provenance=provenance,
+            parent_recipe_id=payload.parent_recipe_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/pipelines/{pipeline_id}/recipes/{recipe_id}")
+def get_pipeline_recipe(
+    pipeline_id: str,
+    recipe_id: str,
+    version: int | None = None,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return RecipeService(settings).get_recipe(pipeline_id, recipe_id, version=version)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/pipelines/{pipeline_id}/recipes/{recipe_id}")
+def update_pipeline_recipe(
+    pipeline_id: str,
+    recipe_id: str,
+    payload: RecipeUpsertRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return RecipeService(settings).update_recipe(
+            pipeline_id,
+            recipe_id,
+            name=payload.name,
+            description=payload.description,
+            tags=payload.tags,
+            notes=payload.notes,
+            parameters_by_unit=payload.parameters_by_unit,
+            stage_params=payload.stage_params,
+            unit_enabled_state=payload.unit_enabled_state,
+            artifact_policy=payload.artifact_policy,
+            calibration_snapshot_reference=payload.calibration_snapshot_reference,
+            provenance=payload.provenance,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pipelines/{pipeline_id}/recipes/{recipe_id}/clone")
+def clone_pipeline_recipe(
+    pipeline_id: str,
+    recipe_id: str,
+    payload: RecipeCloneRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return RecipeService(settings).clone_recipe(
+            pipeline_id,
+            recipe_id,
+            new_name=payload.name,
+            new_recipe_id=payload.recipe_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pipelines/{pipeline_id}/recipes/{recipe_id}/archive")
+def archive_pipeline_recipe(pipeline_id: str, recipe_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        return RecipeService(settings).archive_recipe(pipeline_id, recipe_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/pipelines/{pipeline_id}/recipes/validate")
+def validate_pipeline_recipe(
+    pipeline_id: str,
+    payload: RecipeValidateRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return RecipeService(settings).validate_recipe(
+        pipeline_id,
+        recipe_id=payload.recipe_id,
+        parameters_by_unit=payload.parameters_by_unit,
+        stage_params=payload.stage_params,
+    )
+
+
+@app.post("/api/pipelines/{pipeline_id}/compare")
+def compare_pipeline_contracts(
+    pipeline_id: str,
+    payload: ComparePipelineRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return compare_pipeline_sources(
+            settings,
+            pipeline_id=pipeline_id,
+            left=payload.left.model_dump(exclude_none=True),
+            right=payload.right.model_dump(exclude_none=True),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/pipelines/{pipeline_id}/comparisons")
+def pipeline_comparisons(
+    pipeline_id: str,
+    take_id: str | None = None,
+    limit: int = 20,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return {
+        "pipeline_id": pipeline_id,
+        "comparisons": list_pipeline_comparisons(settings, pipeline_id, take_id=take_id, limit=limit),
+    }
+
+
+@app.get("/api/pipelines/{pipeline_id}/comparisons/{comparison_id}")
+def pipeline_comparison(
+    pipeline_id: str,
+    comparison_id: str,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return get_pipeline_comparison(settings, pipeline_id, comparison_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/pipelines/{pipeline_id}/runs")
+def pipeline_runs(
+    pipeline_id: str,
+    take_id: str | None = None,
+    limit: int = 50,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return {
+        "pipeline_id": pipeline_id,
+        "runs": list_pipeline_runs(settings, pipeline_id, take_id=take_id, limit=limit),
+    }
+
+
+@app.get("/api/pipelines/{pipeline_id}/runs/{run_id}/lineage")
+def pipeline_run_lineage(
+    pipeline_id: str,
+    run_id: str,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return {
+        "pipeline_id": pipeline_id,
+        "run_id": run_id,
+        "parent": resolve_run_parent(settings, pipeline_id, run_id),
+        "children": resolve_run_children(settings, pipeline_id, run_id),
+        "comparison_id": resolve_run_comparison_id(settings, pipeline_id, run_id),
+    }
+
+
+@app.post("/api/pipelines/{pipeline_id}/runs/{run_id}/generate-comparison")
+def pipeline_run_generate_comparison(
+    pipeline_id: str,
+    run_id: str,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return generate_run_comparison_to_parent(settings, pipeline_id, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/process-templates")
 def process_templates(settings: ApiSettings = Depends(get_settings)) -> list[dict[str, Any]]:
     return ProcessService(settings).list_templates()
@@ -702,6 +1194,33 @@ def acquisition_group_fusion_preview(group_id: str, settings: ApiSettings = Depe
     return asdict(build_fusion_preview(settings.data_dir, group_id))
 
 
+def _acquisition_group_ready_for_fusion(settings: ApiSettings, group_id: str) -> bool:
+    """Mirrors FusionService.run_fusion's own candidate-gathering so the
+    readiness gate agrees with what fusion will actually find."""
+    has_rgb = False
+    has_25d = False
+    for item in AcquisitionGroupService(settings.data_dir).list_group_takes(group_id):
+        take_id = str(item.get("take_id") or "")
+        if not take_id:
+            continue
+        detail = get_take_detail(settings, take_id)
+        if detail is None or not isinstance(detail.result, dict):
+            continue
+        result = detail.result
+        family = str(((result.get("processing_pipeline") or {}).get("pipeline_family") or ""))
+        status = str(result.get("status") or "")
+        if status not in {"ok", "success", "warning", "completed"}:
+            continue
+        candidates = [c for c in (result.get("object_candidates") or []) if isinstance(c, dict)]
+        if not candidates:
+            continue
+        if family == "2d":
+            has_rgb = True
+        elif family == "25d":
+            has_25d = True
+    return has_rgb and has_25d
+
+
 @app.post("/api/acquisition-groups/{group_id}/fusion-runs")
 def create_fusion_run(
     group_id: str,
@@ -710,15 +1229,24 @@ def create_fusion_run(
 ) -> dict[str, Any]:
     if not AcquisitionGroupService(settings.data_dir).get_acquisition_group(group_id):
         raise HTTPException(status_code=404, detail=f"Unknown acquisition group: {group_id}")
+    if not payload.force and not _acquisition_group_ready_for_fusion(settings, group_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Acquisition group is not ready for fusion: missing successful 2D or 2.5D object candidates. Pass force=true to fuse anyway.",
+        )
     try:
-        fusion_result = FusionService(settings).run_fusion(
+        fusion_service = FusionService(settings)
+        fusion_result = fusion_service.run_fusion(
             acquisition_group_id=group_id,
             force=payload.force,
             recipe_version_id=payload.recipe_version_id,
             rules=payload.rules,
         )
+        run_dir = fusion_service.runs_dir / str(fusion_result.get("fusion_run_id") or "")
         response: dict[str, Any] = {
+            "ok": True,
             "fusion_run_id": str(fusion_result.get("fusion_run_id") or ""),
+            "run": {"result_path": str(run_dir / "fusion_result.json")},
             "result": fusion_result,
         }
         if payload.auto_publish:
@@ -764,14 +1292,19 @@ def fuse_acquisition_group(
     payload: FuseAcquisitionGroupRequest,
     settings: ApiSettings = Depends(get_settings),
 ) -> dict[str, Any]:
+    if not AcquisitionGroupService(settings.data_dir).get_acquisition_group(group_id):
+        raise HTTPException(status_code=404, detail=f"Unknown acquisition group: {group_id}")
     try:
-        return create_fusion_run(
-            group_id,
-            CreateFusionRunRequest(force=payload.force, recipe_version_id=payload.recipe_version_id, rules={}),
-            settings,
+        return FusionService(settings).run_fusion(
+            acquisition_group_id=group_id,
+            force=payload.force,
+            recipe_version_id=payload.recipe_version_id,
+            rules={},
         )
-    except HTTPException:
-        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/acquisition-groups/{group_id}/publish")
@@ -1954,6 +2487,129 @@ def add_dataset_ml_set_members(dataset_id: str, ml_set_id: str, payload: Dataset
     }
 
 
+@app.post("/api/datasets/{dataset_id}/ml-sets/{ml_set_id}/members/update")
+def update_dataset_ml_set_memberships(
+    dataset_id: str,
+    ml_set_id: str,
+    payload: DatasetMlSetMembershipUpdateRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    service = DatasetService(settings.data_dir)
+    if service.get_ml_set(dataset_id, ml_set_id) is None:
+        raise HTTPException(status_code=404, detail="ML set not found")
+    take_ids = [str(item).strip() for item in payload.take_ids if str(item).strip()]
+    if not take_ids:
+        raise HTTPException(status_code=400, detail="No take_ids provided")
+    memberships = {
+        str(item.get("take_id") or ""): item
+        for item in service.list_ml_set_memberships(dataset_id=dataset_id, ml_set_id=ml_set_id)
+        if str(item.get("take_id") or "")
+    }
+    updated = 0
+    skipped: list[str] = []
+    for take_id in take_ids:
+        current = memberships.get(take_id)
+        if not current:
+            skipped.append(take_id)
+            continue
+        next_split = payload.split if payload.split is not None else str(current.get("split") or "unassigned")
+        if next_split not in {"train", "validation", "test", "holdout", "calibration", "unassigned"}:
+            raise HTTPException(status_code=400, detail=f"Invalid split: {next_split}")
+        service.add_take_to_ml_set(
+            dataset_id=dataset_id,
+            ml_set_id=ml_set_id,
+            take_id=take_id,
+            split=next_split,
+            physical_object_id=str(current.get("physical_object_id") or "") or None,
+            include=payload.include if payload.include is not None else bool(current.get("include", True)),
+            default_trainable=payload.default_trainable if payload.default_trainable is not None else current.get("default_trainable"),
+            trainable=current.get("trainable"),
+            notes=str(current.get("notes") or "") or None,
+            expected_label=str(current.get("expected_label") or "") or None,
+            expected_class=payload.expected_class if payload.expected_class is not None else (str(current.get("expected_class") or "") or None),
+            expected_subclass=payload.expected_subclass if payload.expected_subclass is not None else (str(current.get("expected_subclass") or "") or None),
+            measurements_mm=current.get("measurements_mm") if isinstance(current.get("measurements_mm"), dict) else {},
+            raw_label=str(current.get("raw_label") or "") or None,
+            label_policy=str(current.get("label_policy") or "") or None,
+            review_required=payload.review_required if payload.review_required is not None else current.get("review_required"),
+            normalization_version=str(current.get("normalization_version") or "") or None,
+            source_row=str(current.get("source_row") or "") or None,
+            extra_fields=current.get("extra_fields") if isinstance(current.get("extra_fields"), dict) else {},
+        )
+        updated += 1
+    return {"ok": True, "updated_count": updated, "skipped_count": len(skipped), "skipped_ids": skipped[:100]}
+
+
+@app.get("/api/ml-sets/{ml_set_id}/members")
+def ml_set_members(
+    ml_set_id: str,
+    dataset_id: str | None = None,
+    physical_object_id: str | None = None,
+    raw_label: str | None = None,
+    normalized_class: str | None = None,
+    superclass: str | None = None,
+    membership_status: str | None = None,
+    split: str | None = None,
+    session_id: str | None = None,
+    search: str | None = None,
+    validation_status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return MLSetSummaryService(settings).list_members(
+            ml_set_id,
+            dataset_id,
+            physical_object_id=physical_object_id,
+            raw_label=raw_label,
+            normalized_class=normalized_class,
+            superclass=superclass,
+            membership_status=membership_status,
+            split=split,
+            session_id=session_id,
+            search=search,
+            validation_status=validation_status,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{dataset_id}/ml-sets/{ml_set_id}/facets")
+def dataset_ml_set_member_facets(
+    dataset_id: str,
+    ml_set_id: str,
+    physical_object_id: str | None = None,
+    raw_label: str | None = None,
+    normalized_class: str | None = None,
+    superclass: str | None = None,
+    membership_status: str | None = None,
+    split: str | None = None,
+    session_id: str | None = None,
+    search: str | None = None,
+    validation_status: str | None = None,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return MLSetSummaryService(settings).build_member_facets(
+            ml_set_id,
+            dataset_id,
+            physical_object_id=physical_object_id,
+            raw_label=raw_label,
+            normalized_class=normalized_class,
+            superclass=superclass,
+            membership_status=membership_status,
+            split=split,
+            session_id=session_id,
+            search=search,
+            validation_status=validation_status,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/ml-sets/{ml_set_id}/summary")
 def ml_set_summary(ml_set_id: str, dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
     try:
@@ -2079,40 +2735,29 @@ def update_dataset_session(dataset_id: str, session_id: str, payload: DatasetSes
 
 @app.get("/api/feature-analytics/features")
 def feature_analytics_features(
-    datasets: str | None = None,
-    sessions: str | None = None,
-    labels: str | None = None,
-    superclass: str | None = None,
-    validation_status: str | None = None,
-    split: str | None = None,
-    pipeline: str | None = None,
-    calibration: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    feature_selection: str | None = None,
+    request: Request = None,
+    query: dict[str, Any] = Depends(parse_feature_analytics_query),
     max_takes: int = 600,
     time_budget_ms: int = 2500,
     settings: ApiSettings = Depends(get_settings),
 ) -> dict[str, Any]:
     started = time.monotonic()
-    logger.info("feature_analytics.features:start datasets=%s sessions=%s pipeline=%s max_takes=%s budget_ms=%s", datasets, sessions, pipeline, max_takes, time_budget_ms)
-    query = {
-        "datasets": datasets,
-        "sessions": sessions,
-        "labels": labels,
-        "superclass": superclass,
-        "validation_status": validation_status,
-        "split": split,
-        "pipeline": pipeline,
-        "calibration": calibration,
-        "date_from": date_from,
-        "date_to": date_to,
-        "feature_selection": feature_selection,
-    }
-    records, debug = build_feature_records(settings, query=query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    resolved_query = query if isinstance(query, dict) else (parse_feature_analytics_query(request) if request is not None else {})
+    logger.info(
+        "feature_analytics.features:start dataset=%s session=%s pipeline=%s max_takes=%s budget_ms=%s query=%s",
+        resolved_query.get("dataset_id"),
+        resolved_query.get("session_id"),
+        resolved_query.get("pipeline_id"),
+        max_takes,
+        time_budget_ms,
+        str(request.url) if request is not None else "<direct-call>",
+    )
+    records, debug = build_feature_records(settings, query=resolved_query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    scope_summary = summarize_feature_scope(records)
     payload = {
-        "record_count": len(records),
-        "object_count": len({f"{item.get('take_id')}::{item.get('object_id')}" for item in records}),
+        "record_count": scope_summary["record_count"],
+        "object_count": scope_summary["object_count"],
+        "scope_summary": scope_summary,
         "feature_definitions": _feature_definitions(records),
         "debug": debug,
     }
@@ -2123,41 +2768,22 @@ def feature_analytics_features(
 @app.get("/api/feature-analytics/distributions")
 def feature_analytics_distributions(
     feature_key: str,
+    request: Request = None,
     group_by: str = "superclass",
     bins: int = 24,
     mode: str = "count",
-    datasets: str | None = None,
-    sessions: str | None = None,
-    labels: str | None = None,
-    superclass: str | None = None,
-    validation_status: str | None = None,
-    split: str | None = None,
-    pipeline: str | None = None,
-    calibration: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
+    query: dict[str, Any] = Depends(parse_feature_analytics_query),
     max_takes: int = 600,
     time_budget_ms: int = 2500,
     settings: ApiSettings = Depends(get_settings),
 ) -> dict[str, Any]:
     started = time.monotonic()
-    logger.info("feature_analytics.distributions:start feature=%s group_by=%s bins=%s mode=%s", feature_key, group_by, bins, mode)
-    query = {
-        "datasets": datasets,
-        "sessions": sessions,
-        "labels": labels,
-        "superclass": superclass,
-        "validation_status": validation_status,
-        "split": split,
-        "pipeline": pipeline,
-        "calibration": calibration,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-    records, debug = build_feature_records(settings, query=query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    resolved_query = query if isinstance(query, dict) else (parse_feature_analytics_query(request) if request is not None else {})
+    logger.info("feature_analytics.distributions:start feature=%s group_by=%s bins=%s mode=%s query=%s", feature_key, group_by, bins, mode, str(request.url) if request is not None else "<direct-call>")
+    records, debug = build_feature_records(settings, query=resolved_query, max_takes=max_takes, time_budget_ms=time_budget_ms)
     resolved_bins = max(4, min(int(bins), 128))
     resolved_mode = "density" if mode == "density" else "count"
-    resolved_group = group_by if group_by in {"label", "physical_object_id"} else "superclass"
+    resolved_group = group_by if group_by in {"label", "raw_label", "normalized_class", "physical_object_id", "processed_superclass", "labeled_superclass", "processed_class"} else "processed_superclass"
     payload = build_distributions(records, feature_key=feature_key, group_by=resolved_group, bins=resolved_bins, mode=resolved_mode)
     payload["debug"] = debug
     logger.info("feature_analytics.distributions:done groups=%s records=%s duration_ms=%.2f", len(payload.get("groups") or []), len(records), (time.monotonic() - started) * 1000.0)
@@ -2168,37 +2794,18 @@ def feature_analytics_distributions(
 def feature_analytics_scatter(
     x_feature_key: str,
     y_feature_key: str,
+    request: Request = None,
     group_by: str = "superclass",
     limit: int = 2000,
-    datasets: str | None = None,
-    sessions: str | None = None,
-    labels: str | None = None,
-    superclass: str | None = None,
-    validation_status: str | None = None,
-    split: str | None = None,
-    pipeline: str | None = None,
-    calibration: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
+    query: dict[str, Any] = Depends(parse_feature_analytics_query),
     max_takes: int = 600,
     time_budget_ms: int = 2500,
     settings: ApiSettings = Depends(get_settings),
 ) -> dict[str, Any]:
     started = time.monotonic()
-    logger.info("feature_analytics.scatter:start x=%s y=%s group_by=%s", x_feature_key, y_feature_key, group_by)
-    query = {
-        "datasets": datasets,
-        "sessions": sessions,
-        "labels": labels,
-        "superclass": superclass,
-        "validation_status": validation_status,
-        "split": split,
-        "pipeline": pipeline,
-        "calibration": calibration,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-    records, debug = build_feature_records(settings, query=query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    resolved_query = query if isinstance(query, dict) else (parse_feature_analytics_query(request) if request is not None else {})
+    logger.info("feature_analytics.scatter:start x=%s y=%s group_by=%s query=%s", x_feature_key, y_feature_key, group_by, str(request.url) if request is not None else "<direct-call>")
+    records, debug = build_feature_records(settings, query=resolved_query, max_takes=max_takes, time_budget_ms=time_budget_ms)
     rows: list[dict[str, Any]] = []
     for item in records:
         x = (item.get("features") or {}).get(x_feature_key)
@@ -2211,7 +2818,17 @@ def feature_analytics_scatter(
                 "object_id": item.get("object_id"),
                 "x": x,
                 "y": y,
-                "group": ((item.get("labels") or ["UNKNOWN"])[0] if group_by == "label" else item.get("superclass")) or "UNKNOWN",
+                "group": (
+                    ((item.get("raw_labels") or ["UNKNOWN"])[0] if group_by == "raw_label" else None)
+                    or (item.get("processed_superclass") if group_by == "processed_superclass" else None)
+                    or (item.get("labeled_superclass") if group_by == "labeled_superclass" else None)
+                    or (item.get("processed_class") if group_by == "processed_class" else None)
+                    or (item.get("normalized_class") if group_by == "normalized_class" else None)
+                    or (((item.get("labels") or ["UNKNOWN"])[0]) if group_by == "label" else None)
+                    or (item.get("physical_object_id") if group_by == "physical_object_id" else None)
+                    or item.get("superclass")
+                    or "UNKNOWN"
+                ),
             }
         )
         if len(rows) >= max(10, min(int(limit), 10000)):
@@ -2224,38 +2841,19 @@ def feature_analytics_scatter(
 @app.get("/api/feature-analytics/objects")
 def feature_analytics_objects(
     feature_key: str,
+    request: Request = None,
     min_value: float | None = None,
     max_value: float | None = None,
     limit: int = 200,
-    datasets: str | None = None,
-    sessions: str | None = None,
-    labels: str | None = None,
-    superclass: str | None = None,
-    validation_status: str | None = None,
-    split: str | None = None,
-    pipeline: str | None = None,
-    calibration: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
+    query: dict[str, Any] = Depends(parse_feature_analytics_query),
     max_takes: int = 600,
     time_budget_ms: int = 2500,
     settings: ApiSettings = Depends(get_settings),
 ) -> dict[str, Any]:
     started = time.monotonic()
-    logger.info("feature_analytics.objects:start feature=%s min=%s max=%s limit=%s", feature_key, min_value, max_value, limit)
-    query = {
-        "datasets": datasets,
-        "sessions": sessions,
-        "labels": labels,
-        "superclass": superclass,
-        "validation_status": validation_status,
-        "split": split,
-        "pipeline": pipeline,
-        "calibration": calibration,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-    records, debug = build_feature_records(settings, query=query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    resolved_query = query if isinstance(query, dict) else (parse_feature_analytics_query(request) if request is not None else {})
+    logger.info("feature_analytics.objects:start feature=%s min=%s max=%s limit=%s query=%s", feature_key, min_value, max_value, limit, str(request.url) if request is not None else "<direct-call>")
+    records, debug = build_feature_records(settings, query=resolved_query, max_takes=max_takes, time_budget_ms=time_budget_ms)
     objects = filter_records_by_feature_range(
         records,
         feature_key=feature_key,
@@ -2263,17 +2861,42 @@ def feature_analytics_objects(
         max_value=max_value,
         limit=limit,
     )
+    scope_summary = summarize_records_by_feature_range(
+        records,
+        feature_key=feature_key,
+        min_value=min_value,
+        max_value=max_value,
+    )
     payload = {
         "feature_key": feature_key,
         "min_value": min_value,
         "max_value": max_value,
         "limit": limit,
         "objects": objects,
+        "scope_summary": scope_summary,
         "stats": summarize_feature_values(records, feature_key),
         "debug": debug,
     }
     logger.info("feature_analytics.objects:done objects=%s duration_ms=%.2f", len(objects), (time.monotonic() - started) * 1000.0)
     return payload
+
+
+@app.get("/api/feature-analytics/filter-options")
+def feature_analytics_filter_options(
+    request: Request = None,
+    query: dict[str, Any] = Depends(parse_feature_analytics_query),
+    max_takes: int = 600,
+    time_budget_ms: int = 2500,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    started = time.monotonic()
+    resolved_query = query if isinstance(query, dict) else (parse_feature_analytics_query(request) if request is not None else {})
+    logger.info("feature_analytics.filter_options:start query=%s", str(request.url) if request is not None else "<direct-call>")
+    records, debug = build_feature_records(settings, query=resolved_query, max_takes=max_takes, time_budget_ms=time_budget_ms)
+    options = build_filter_options(records)
+    options["debug"] = debug
+    logger.info("feature_analytics.filter_options:done records=%s duration_ms=%.2f", len(records), (time.monotonic() - started) * 1000.0)
+    return options
 
 
 @app.get("/api/sessions/{session_id}/summary")
@@ -2317,8 +2940,8 @@ def dataset_session_export_endpoint(
 
 
 @app.get("/api/takes/{take_id}", response_model=TakeDetail)
-def take_detail(take_id: str, settings: ApiSettings = Depends(get_settings)) -> TakeDetail:
-    detail = get_take_detail(settings, take_id)
+def take_detail(take_id: str, settings: ApiSettings = Depends(get_settings), run_id: str | None = None) -> TakeDetail:
+    detail = get_take_detail(settings, take_id, run_id=run_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Take not found")
     return detail
@@ -2358,6 +2981,44 @@ def _resolve_bulk_take_ids(mode: str, take_ids: list[str], filters: TakeBulkFilt
     if mode != "filter":
         raise HTTPException(status_code=400, detail="Invalid mode")
     f = filters or TakeBulkFilters()
+    if f.ml_set_id:
+        try:
+            payload = MLSetSummaryService(settings).list_members(
+                f.ml_set_id,
+                f.dataset_id,
+                physical_object_id=f.physical_object_id,
+                raw_label=f.raw_label,
+                normalized_class=f.normalized_class,
+                superclass=f.superclass,
+                membership_status=f.membership_status,
+                split=f.split,
+                session_id=f.session_id,
+                search=f.search,
+                validation_status=f.validation_status,
+                limit=500,
+                offset=0,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        candidate_ids: list[str] = [str(item.get("take_id") or "").strip() for item in payload.get("items") or [] if str(item.get("take_id") or "").strip()]
+        while payload.get("has_more"):
+            payload = MLSetSummaryService(settings).list_members(
+                f.ml_set_id,
+                f.dataset_id,
+                physical_object_id=f.physical_object_id,
+                raw_label=f.raw_label,
+                normalized_class=f.normalized_class,
+                superclass=f.superclass,
+                membership_status=f.membership_status,
+                split=f.split,
+                session_id=f.session_id,
+                search=f.search,
+                validation_status=f.validation_status,
+                limit=500,
+                offset=int(payload.get("next_offset") or 0),
+            )
+            candidate_ids.extend([str(item.get("take_id") or "").strip() for item in payload.get("items") or [] if str(item.get("take_id") or "").strip()])
+        return candidate_ids
     candidate_ids: list[str] = []
     page_offset = 0
     while True:
@@ -2375,6 +3036,8 @@ def _resolve_bulk_take_ids(mode: str, take_ids: list[str], filters: TakeBulkFilt
             expected_class=f.expected_class,
             split=f.split,
             calibration_linkage_only=bool(f.calibration_linkage_only),
+            physical_object_id=f.physical_object_id,
+            superclass_label=f.superclass,
             include_archived=False,
         )
         items = page.get("items") or []
@@ -2701,6 +3364,21 @@ def process_take_for_pipeline(take_id: str, payload: ExecuteTakeRequest, setting
         or detail_metadata.get("acquisition_group_id")
     )
 
+    selected_recipe = None
+    if payload.recipe_id:
+        try:
+            selected_recipe = RecipeService(settings).recipe_for_run(pipeline_id, payload.recipe_id, version=payload.recipe_version)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    merged_stage_params: dict[str, Any] | None = None
+    if selected_recipe is not None or payload.stage_params:
+        merged_stage_params = {}
+        if selected_recipe and isinstance(selected_recipe.get("stage_params"), dict):
+            merged_stage_params.update(selected_recipe["stage_params"])
+        if payload.stage_params:
+            merged_stage_params.update(payload.stage_params)
+
     try:
         response = dispatch_take_processing(
             settings=settings,
@@ -2709,9 +3387,10 @@ def process_take_for_pipeline(take_id: str, payload: ExecuteTakeRequest, setting
             reprocess=payload.reprocess,
             source_id=source_id or None,
             recipe_version_id=str(recipe_version_id) if recipe_version_id else None,
+            recipe_metadata=selected_recipe,
             acquisition_group_id=str(resolved_acquisition_group_id) if resolved_acquisition_group_id else None,
             calibration_profile_id=str(calibration_profile_id) if calibration_profile_id else None,
-            stage_params=payload.stage_params or None,
+            stage_params=merged_stage_params or None,
         )
         if binding_warning:
             response["warning"] = binding_warning
@@ -2760,6 +3439,34 @@ def cancel_processing_job(job_id: str, settings: ApiSettings = Depends(get_setti
         job = get_processing_job_service(settings).cancel_job(job_id)
         payload = ProcessingJobCancelResponse(ok=True, job_id=job_id, status=job.status)
         return payload.model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/ml/feature-jobs")
+def create_feature_job(payload: FeatureJobRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        job = get_feature_job_service(settings).create_job(payload)
+        return {"job_id": job.id, "status": job.status, "job": job.model_dump(mode="json")}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ml/feature-jobs/{job_id}")
+def get_feature_job(job_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    job = get_feature_job_service(settings).load_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown feature job: {job_id}")
+    return {"job_id": job.id, "status": job.status, "job": job.model_dump(mode="json")}
+
+
+@app.post("/api/ml/feature-jobs/{job_id}/cancel")
+def cancel_feature_job(job_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        job = get_feature_job_service(settings).cancel_job(job_id)
+        return {"ok": True, "job_id": job_id, "status": job.status}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -3126,6 +3833,18 @@ def take_file(
     return FileResponse(path)
 
 
+@app.get("/api/comparisons/{comparison_id}/files/{filename:path}")
+def comparison_file(
+    comparison_id: str,
+    filename: str,
+    settings: ApiSettings = Depends(get_settings),
+) -> FileResponse:
+    path = resolve_comparison_file(settings, comparison_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
+
+
 def _object_bbox_from_detail(detail: TakeDetail, object_id: str) -> tuple[float, float, float, float] | None:
     result = detail.result if isinstance(detail.result, dict) else {}
     oid_str = str(object_id).strip()
@@ -3208,6 +3927,40 @@ def _stage_crop_artifact_path(settings: ApiSettings, detail: TakeDetail, object_
     return None
 
 
+def _thumbnail_source_path(settings: ApiSettings, detail: TakeDetail, mode: str) -> Path | None:
+    resolved_mode = str(mode or "auto").strip().lower()
+    groups = detail.assets or {}
+    if resolved_mode == "classification_overlay":
+        result = detail.result if isinstance(detail.result, dict) else {}
+        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            candidate_path = str(artifact.get("path") or "").strip()
+            if artifact_id != "classification_overlay_image" or not candidate_path:
+                continue
+            candidate = safe_take_file(settings, detail.take_id, candidate_path)
+            if candidate is not None and candidate.is_file():
+                return candidate
+    preferred_groups = {
+        "heightmap": (("heightmap", ["heightmap", "height"]),),
+        "reflectance": (("reflectance", ["reflectance"]), ("rgb", ["rgb"]), ("laser_rgb", ["laser_rgb"])),
+    }.get(resolved_mode)
+    if preferred_groups is not None:
+        for group, keys in preferred_groups:
+            payload = groups.get(group) or {}
+            for key in keys:
+                filename = payload.get(key)
+                if not filename:
+                    continue
+                candidate = settings.incoming_dir / detail.take_id / str(filename)
+                if candidate.is_file():
+                    return candidate
+    source_path, _resolved = resolve_source_image_path(settings, detail)
+    return source_path
+
+
 def _neutral_placeholder(cache_path: Path, size_px: int) -> Path:
     if cache_path.exists():
         return cache_path
@@ -3216,12 +3969,169 @@ def _neutral_placeholder(cache_path: Path, size_px: int) -> Path:
     return cache_path
 
 
+def _thumbnail_artifact_candidate(detail: TakeDetail, *artifact_ids: str) -> tuple[str | None, str | None]:
+    result = detail.result if isinstance(detail.result, dict) else {}
+    artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+    wanted = {item for item in artifact_ids if item}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "").strip()
+        if artifact_id not in wanted:
+            continue
+        candidate_path = str(artifact.get("path") or "").strip()
+        if candidate_path:
+            return artifact_id, candidate_path
+    return None, None
+
+
+def _build_thumbnail_plan(
+    settings: ApiSettings,
+    detail: TakeDetail,
+    object_id: str,
+    *,
+    mode: str,
+    semantic_group: str | None = None,
+) -> dict[str, Any]:
+    requested_mode = str(mode or "auto").strip().lower()
+    if requested_mode not in {"auto", "heightmap", "reflectance", "classification_overlay"}:
+        requested_mode = "auto"
+    semantic = str(semantic_group or "").strip().lower()
+    bbox = _object_bbox_from_detail(detail, object_id)
+    fallback_reason: str | None = None
+    fallback_used = False
+    resolved_source = "placeholder"
+    resolved_artifact_id: str | None = None
+    resolved_artifact_path: str | None = None
+    colorized = False
+    source_path: Path | None = None
+
+    def resolve_candidate(candidate_mode: str) -> tuple[Path | None, str, str | None, str | None, bool]:
+        if candidate_mode == "classification_overlay":
+            artifact_id, artifact_path = _thumbnail_artifact_candidate(detail, "classification_overlay_image")
+            if artifact_path:
+                path = safe_take_file(settings, detail.take_id, artifact_path)
+                if path is not None and path.is_file():
+                    return path, "classification_overlay", artifact_id, artifact_path, True
+            return None, "classification_overlay", artifact_id, artifact_path, True
+        if candidate_mode == "heightmap":
+            artifact_id, artifact_path = _thumbnail_artifact_candidate(detail, "normalized_heightmap", "normalized_heightmap_display", "raw_heightmap_preview", "heightmap")
+            if artifact_path:
+                path = safe_take_file(settings, detail.take_id, artifact_path)
+                if path is not None and path.is_file():
+                    source = "normalized_heightmap" if artifact_id and "normalized_heightmap" in artifact_id else "heightmap"
+                    return path, source, artifact_id, artifact_path, source == "normalized_heightmap"
+            groups = detail.assets or {}
+            payload = groups.get("heightmap") or {}
+            for key in ("heightmap", "height"):
+                filename = payload.get(key)
+                if not filename:
+                    continue
+                path = settings.incoming_dir / detail.take_id / str(filename)
+                if path.is_file():
+                    return path, "heightmap", key, str(filename), False
+            return None, "heightmap", artifact_id, artifact_path, False
+        if candidate_mode == "reflectance":
+            groups = detail.assets or {}
+            for group, keys in (("reflectance", ["reflectance"]), ("rgb", ["rgb"]), ("laser_rgb", ["laser_rgb"])):
+                payload = groups.get(group) or {}
+                for key in keys:
+                    filename = payload.get(key)
+                    if not filename:
+                        continue
+                    path = settings.incoming_dir / detail.take_id / str(filename)
+                    if path.is_file():
+                        return path, "reflectance", key, str(filename), group == "rgb"
+            source_path_auto, resolved_name = resolve_source_image_path(settings, detail)
+            if source_path_auto is not None and source_path_auto.is_file():
+                return source_path_auto, "source_crop", None, resolved_name, True
+            return None, "reflectance", None, None, True
+        return None, "placeholder", None, None, False
+
+    if requested_mode == "auto":
+        preferred = ["heightmap", "classification_overlay", "reflectance"] if semantic in {"morphology", "geometry", "height"} else ["reflectance", "classification_overlay", "heightmap"]
+    else:
+        preferred = [requested_mode]
+        if requested_mode == "heightmap":
+            preferred.extend(["classification_overlay", "reflectance"])
+        elif requested_mode == "classification_overlay":
+            preferred.extend(["heightmap", "reflectance"])
+        elif requested_mode == "reflectance":
+            preferred.extend(["classification_overlay", "heightmap"])
+
+    for index, candidate_mode in enumerate(preferred):
+        path, source, artifact_id, artifact_path, candidate_colorized = resolve_candidate(candidate_mode)
+        if path is None:
+            continue
+        source_path = path
+        resolved_source = source
+        resolved_artifact_id = artifact_id
+        resolved_artifact_path = artifact_path
+        colorized = candidate_colorized
+        if index > 0:
+            fallback_used = True
+            fallback_reason = f"{preferred[0]} unavailable"
+        break
+
+    if source_path is None:
+        summary = get_take_summary(settings, detail.take_id)
+        thumb = summary.thumbnail_path if summary is not None else None
+        take_thumb = safe_take_file(settings, detail.take_id, thumb) if isinstance(thumb, str) and thumb else None
+        if take_thumb is not None and take_thumb.is_file():
+            source_path = take_thumb
+            resolved_source = "take_thumbnail"
+            resolved_artifact_path = thumb
+            colorized = True
+            fallback_used = True
+            fallback_reason = fallback_reason or f"{preferred[0]} unavailable"
+        else:
+            fallback_used = True
+            fallback_reason = fallback_reason or f"{preferred[0]} unavailable"
+
+    return {
+        "requested_mode": requested_mode,
+        "resolved_source": resolved_source,
+        "resolved_artifact_id": resolved_artifact_id,
+        "resolved_artifact_path": resolved_artifact_path,
+        "colorized": colorized,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "source_path": source_path,
+        "bbox": bbox,
+    }
+
+
+@app.get("/api/takes/{take_id}/objects/{object_id}/thumbnail-info")
+def take_object_thumbnail_info(
+    take_id: str,
+    object_id: str,
+    mode: str = "auto",
+    semantic_group: str | None = None,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    detail = get_take_detail(settings, take_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Take not found")
+    plan = _build_thumbnail_plan(settings, detail, object_id, mode=mode, semantic_group=semantic_group)
+    return {
+        "requested_mode": plan["requested_mode"],
+        "resolved_source": plan["resolved_source"],
+        "resolved_artifact_id": plan["resolved_artifact_id"],
+        "resolved_artifact_path": plan["resolved_artifact_path"],
+        "colorized": plan["colorized"],
+        "fallback_used": plan["fallback_used"],
+        "fallback_reason": plan["fallback_reason"],
+    }
+
+
 @app.get("/api/takes/{take_id}/objects/{object_id}/thumbnail")
 def take_object_thumbnail(
     take_id: str,
     object_id: str,
     size: int = 56,
     pad: float = 0.18,
+    mode: str = "auto",
+    semantic_group: str | None = None,
     settings: ApiSettings = Depends(get_settings),
 ) -> FileResponse:
     detail = get_take_detail(settings, take_id)
@@ -3232,25 +4142,16 @@ def take_object_thumbnail(
     pad_ratio = max(0.0, min(float(pad), 0.8))
     cache_dir = settings.incoming_dir / take_id / ".stage_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_name = f"obj_thumb_{str(object_id).strip()}_{size_px}_{int(pad_ratio * 100)}.jpg"
+    plan = _build_thumbnail_plan(settings, detail, object_id, mode=mode, semantic_group=semantic_group)
+    source_path: Path | None = plan.get("source_path")
+    bbox = plan.get("bbox")
+    resolved_source = str(plan.get("resolved_source") or "placeholder")
+    resolved_artifact_id = str(plan.get("resolved_artifact_id") or "").strip() or "none"
+    resolved_artifact_path = str(plan.get("resolved_artifact_path") or "").strip() or "none"
+    cache_name = f"obj_thumb_{str(object_id).strip()}_{size_px}_{int(pad_ratio * 100)}_{mode}_{resolved_source}_{resolved_artifact_id}_{abs(hash(resolved_artifact_path)) % 1000000}.jpg"
     cache_path = cache_dir / cache_name
     if cache_path.exists():
         return FileResponse(cache_path)
-
-    # 1) object crop artifact (preferred)
-    stage_crop = _stage_crop_artifact_path(settings, detail, object_id)
-    source_path: Path | None = stage_crop
-    bbox = None if stage_crop is not None else _object_bbox_from_detail(detail, object_id)
-
-    # 2) source image + object bbox crop
-    if source_path is None:
-        source_path, _resolved = resolve_source_image_path(settings, detail)
-
-    # 3) take thumbnail fallback
-    if source_path is None:
-        summary = get_take_summary(settings, take_id)
-        thumb = summary.thumbnail_path if summary is not None else None
-        source_path = safe_take_file(settings, take_id, thumb) if isinstance(thumb, str) and thumb else None
 
     if source_path is None or not source_path.is_file():
         return FileResponse(_neutral_placeholder(cache_path, size_px))

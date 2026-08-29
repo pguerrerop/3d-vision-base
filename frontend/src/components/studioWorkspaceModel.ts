@@ -19,12 +19,68 @@ export type BlobCandidate = {
   rejection_reason?: string;
 };
 
+type ArtifactContractBackfill = {
+  substage_id: string;
+  display_label: string;
+  order_index: number;
+  semantic_type: string;
+  role: string;
+};
+
+const DETECT_REFERENCE_BACKFILL: Record<string, ArtifactContractBackfill> = {
+  valid_mask: { substage_id: "input", display_label: "Valid ROI", order_index: 0, semantic_type: "valid_mask", role: "input" },
+  low_gradient_mask: { substage_id: "gradient", display_label: "Low-gradient mask", order_index: 1, semantic_type: "low_gradient_mask", role: "intermediate" },
+  flat_candidate_mask: { substage_id: "height_gate", display_label: "Height-gated candidates", order_index: 2, semantic_type: "flat_candidate_mask", role: "intermediate" },
+  low_gradient_blob_id_mask: { substage_id: "component_formation", display_label: "XY-only components", order_index: 3, semantic_type: "blob_components_id_mask", role: "connectivity_support" },
+  height_aware_blob_id_mask: { substage_id: "height_aware_connectivity", display_label: "Height-aware components", order_index: 4, semantic_type: "height_aware_components_id_mask", role: "connectivity_support" },
+  height_aware_connectivity_rejected_edges: { substage_id: "height_aware_connectivity", display_label: "Rejected Z-connections", order_index: 4, semantic_type: "rejected_connectivity_edges", role: "diagnostic" },
+  height_border_strength: { substage_id: "height_border_detection", display_label: "Height-border strength", order_index: 5, semantic_type: "height_border_strength", role: "diagnostic" },
+  height_border_fragments_mask: { substage_id: "blob_splitting", display_label: "Height-border fragments", order_index: 6, semantic_type: "height_border_fragments_mask", role: "logical_support" },
+  height_split_blob_fragments_mask: { substage_id: "fragment_merge", display_label: "Post-merge fragments", order_index: 7, semantic_type: "height_split_fragments_mask", role: "logical_support" },
+  blob_height_clusters: { substage_id: "height_clustering", display_label: "Height clusters", order_index: 8, semantic_type: "height_clusters", role: "diagnostic" },
+  selected_blob_cluster_pre_refine_mask: { substage_id: "candidate_support_refinement", display_label: "Selected cluster pre-refine", order_index: 9, semantic_type: "selected_cluster_pre_refine", role: "logical_support" },
+  selected_blob_cluster_refined_mask: { substage_id: "candidate_support_refinement", display_label: "Selected cluster refined", order_index: 9, semantic_type: "selected_cluster_refined", role: "fit_support" },
+  support_removed_by_candidate_refinement: { substage_id: "candidate_support_refinement", display_label: "Removed by candidate refinement", order_index: 9, semantic_type: "support_removed_by_candidate_refinement", role: "diagnostic" },
+  belt_bg_mask: { substage_id: "height_gate", display_label: "Belt background", order_index: 2, semantic_type: "belt_background_mask", role: "fit_support" },
+  belt_base_mask: { substage_id: "stripes", display_label: "Belt base mask", order_index: 10, semantic_type: "belt_base_mask", role: "logical_support" },
+  stripe_filtered_reference_support_mask: { substage_id: "stripes", display_label: "Stripe-filtered support", order_index: 10, semantic_type: "stripe_filtered_support_mask", role: "fit_support" },
+  belt_stripes_mask: { substage_id: "stripes", display_label: "Belt stripes", order_index: 10, semantic_type: "belt_stripes_mask", role: "diagnostic" },
+  unknown_low_gradient_mask: { substage_id: "stripes", display_label: "Unknown low-gradient", order_index: 10, semantic_type: "unknown_low_gradient_mask", role: "diagnostic" },
+  surface_suppression_mask: { substage_id: "stripes", display_label: "Surface suppression mask", order_index: 10, semantic_type: "surface_suppression_mask", role: "suppression_mask" },
+  object_search_domain_mask: { substage_id: "stripes", display_label: "Object search domain", order_index: 10, semantic_type: "object_search_domain_mask", role: "diagnostic" },
+  support_removed_by_stripe_filter: { substage_id: "stripes", display_label: "Removed by stripe suppression", order_index: 10, semantic_type: "support_removed_by_stripe_filter", role: "diagnostic" },
+  selected_reference_support_mask: { substage_id: "final_support", display_label: "Final selected support", order_index: 11, semantic_type: "final_selected_support_mask", role: "logical_support" },
+  final_selected_support_mask: { substage_id: "final_support", display_label: "Final selected support", order_index: 11, semantic_type: "final_selected_support_mask", role: "logical_support" },
+  reference_model_support_mask: { substage_id: "final_support", display_label: "Reference-model fit support", order_index: 11, semantic_type: "reference_model_support_mask", role: "fit_support" },
+  reference_suppression_mask: { substage_id: "final_support", display_label: "Reference suppression mask", order_index: 11, semantic_type: "reference_suppression_mask", role: "suppression_mask" },
+  support_loss_waterfall: { substage_id: "final_support", display_label: "Support-loss waterfall", order_index: 11, semantic_type: "support_loss_waterfall", role: "diagnostic" },
+  final_plane_inlier_mask: { substage_id: "plane_fit", display_label: "Plane inliers", order_index: 12, semantic_type: "final_plane_inlier_mask", role: "fit_support" },
+  plane_residual_heatmap: { substage_id: "plane_fit", display_label: "Plane residual heatmap", order_index: 12, semantic_type: "plane_residual_heatmap", role: "diagnostic" },
+};
+
+function normalizeArtifactContract(artifact: StudioArtifact): StudioArtifact {
+  if (artifact.stage_id !== "detect_belt_plane") return artifact;
+  const metadata = { ...((artifact.metadata ?? {}) as Record<string, unknown>) };
+  const backfill = DETECT_REFERENCE_BACKFILL[String(artifact.artifact_id ?? "")];
+  if (backfill) {
+    metadata.substage_id ??= backfill.substage_id;
+    metadata.display_label ??= backfill.display_label;
+    metadata.order_index ??= backfill.order_index;
+    metadata.semantic_type ??= backfill.semantic_type;
+    metadata.role ??= backfill.role;
+    metadata.is_authoritative_for_fit ??= backfill.role === "fit_support";
+    metadata.is_authoritative_for_suppression ??= backfill.role === "suppression_mask";
+    metadata.is_measurement_authoritative ??= false;
+  }
+  return { ...artifact, metadata } as StudioArtifact;
+}
+
 export function objectsForTake(detail: TakeDetail | null): StudioObject[] {
   return [...(detail?.result?.objects ?? []), ...(detail?.result?.rejected_objects ?? [])];
 }
 
 export function artifactList(detail: TakeDetail | null): StudioArtifact[] {
-  return detail?.result?.artifacts ?? [];
+  return (detail?.result?.artifacts ?? []).map((artifact) => normalizeArtifactContract(artifact as StudioArtifact));
 }
 
 export function artifactsForStage(detail: TakeDetail | null, stageId: string): StudioArtifact[] {

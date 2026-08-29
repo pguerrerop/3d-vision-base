@@ -14,28 +14,9 @@ from vision_3d_acquisition.classifiers.mining_ball_rules import (
     DEFAULT_RULE_PARAMS,
     predict_superclass_from_rules as predict_superclass_from_rules_shared,
 )
+from vision_3d_acquisition.ml.label_normalization import resolve_audit_superclass
 
 SUPERCLASSES = ("BALL_GOOD", "BALL_SCRAP", "SCRAP_METAL")
-
-DEFAULT_LABEL_TO_SUPERCLASS = {
-    "buena": "BALL_GOOD",
-    "buena_menos": "BALL_GOOD",
-    "ahuevada": "BALL_SCRAP",
-    "mitad": "BALL_SCRAP",
-    "bola_con_chip": "BALL_SCRAP",
-    "duda": "BALL_SCRAP",
-    "chica": "BALL_SCRAP",
-    "cubo": "SCRAP_METAL",
-    "cadena": "SCRAP_METAL",
-    "parece_planchuela": "SCRAP_METAL",
-    "planchuela": "SCRAP_METAL",
-    "planchuela_doblada": "SCRAP_METAL",
-    "perno": "SCRAP_METAL",
-    "tuerca": "SCRAP_METAL",
-    "chatarra": "SCRAP_METAL",
-    "scrap": "SCRAP_METAL",
-    "non_ball": "SCRAP_METAL",
-}
 
 DEFAULT_PARAMS: dict[str, float] = dict(DEFAULT_RULE_PARAMS)
 
@@ -85,11 +66,12 @@ def _bool_or_false(value: Any) -> bool:
 
 
 def expected_superclass_from_row(row: dict[str, Any], *, label_column: str = "expected_label", superclass_column: str = "expected_superclass") -> str | None:
-    sup = str(row.get(superclass_column) or "").strip().upper()
+    sup = str(row.get(superclass_column) or "").strip()
     if sup in SUPERCLASSES:
         return sup
     label = str(row.get(label_column) or "").strip().lower()
-    return DEFAULT_LABEL_TO_SUPERCLASS.get(label)
+    resolved = resolve_audit_superclass(label)
+    return resolved if resolved in SUPERCLASSES else None
 
 
 def _metric(row: dict[str, Any], key: str) -> float | None:

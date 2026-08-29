@@ -9,6 +9,7 @@ from vision_3d_acquisition.acquisition.groups import AcquisitionGroupService
 from vision_3d_acquisition.api.filesystem import get_take_detail
 from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.fusion.models import FinalObject, FusionResult
+from vision_3d_acquisition.processes.bindings import ProcessBindingService
 from vision_3d_acquisition.processing.status_index import append_process_run_index
 
 DEFAULT_FUSION_CONFIG: dict[str, Any] = {"centroid_distance_threshold_px": 45.0, "min_bbox_iou": 0.15, "use_bbox_iou": True}
@@ -31,6 +32,10 @@ class FusionService:
         group = AcquisitionGroupService(self.settings.data_dir).get_acquisition_group(acquisition_group_id)
         if not group:
             raise KeyError(f"Unknown acquisition group: {acquisition_group_id}")
+        if recipe_version_id is None:
+            binding = ProcessBindingService(self.settings).resolve_process_binding(acquisition_group_id, "acquisition_group", "fusion")
+            if binding is not None:
+                recipe_version_id = binding.get("active_recipe_version_id")
         config = dict(DEFAULT_FUSION_CONFIG)
         config_hash = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         run_id = f"fusion_run_{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
@@ -313,6 +318,20 @@ def _bbox_iou(a: tuple[float, float, float, float] | None, b: tuple[float, float
 
 def _classify(c2d: dict[str, Any] | None, c25d: dict[str, Any] | None) -> tuple[str, str, list[str], float | None]:
     reasons: list[str] = []
+    # 2.5D shape defects (deformation, low roundness) are checked before the
+    # 2D "looks good" shortcut: a top-down RGB frame cannot see that a ball
+    # has been flattened or deformed, so a strong height-based defect signal
+    # must override an otherwise-confident 2D good-ball hint.
+    if c25d:
+        hints = c25d.get("classification_hints") if isinstance(c25d.get("classification_hints"), dict) else {}
+        deform = float(hints.get("deformation_hint") or 0.0)
+        roundness = float(hints.get("roundness_hint") or 0.0)
+        if deform >= 0.6:
+            reasons.append("High 2.5D deformation hint")
+            return "Scrap de Bola / Bola deformada", "Scrap de Bola", reasons, c25d.get("confidence")
+        if roundness < 0.45:
+            reasons.append("Low roundness in 2.5D")
+            return "Scrap de Bola", "Scrap de Bola", reasons, c25d.get("confidence")
     if c2d and isinstance(c2d.get("classification_hints"), dict):
         label = str((c2d.get("classification_hints") or {}).get("class_label") or "")
         conf = c2d.get("confidence")
@@ -321,16 +340,8 @@ def _classify(c2d: dict[str, Any] | None, c25d: dict[str, Any] | None) -> tuple[
             return label, "Ball" if "Bola" in label else "Scrap", reasons, float(conf)
     if c25d:
         hints = c25d.get("classification_hints") if isinstance(c25d.get("classification_hints"), dict) else {}
-        deform = float(hints.get("deformation_hint") or 0.0)
         flatness = float(hints.get("flatness_hint") or 0.0)
-        roundness = float(hints.get("roundness_hint") or 0.0)
         max_h = float((c25d.get("measurements") or {}).get("height_max_mm") or 0.0)
-        if deform >= 0.6:
-            reasons.append("High 2.5D deformation hint")
-            return "Scrap de Bola / Bola deformada", "Scrap de Bola", reasons, c25d.get("confidence")
-        if roundness < 0.45:
-            reasons.append("Low roundness in 2.5D")
-            return "Scrap de Bola", "Scrap de Bola", reasons, c25d.get("confidence")
         if flatness > 0.9 and max_h < 4.0:
             reasons.append("Flat + low profile in 2.5D")
             return "Chatarra / Planchuelas", "Chatarra", reasons, c25d.get("confidence")

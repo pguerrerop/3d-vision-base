@@ -4711,6 +4711,39 @@ tbody tr:hover {
   gap: 4px;
 }
 
+.blob-set-viewer {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(280px, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.blob-set-viewer-table {
+  max-height: 640px;
+  overflow: auto;
+  /* Explicit light surface: this viewer also renders inside the Report walkthrough's dark
+     Lightbox, and unstyled rows would otherwise inherit that dark ambient background/text and
+     become nearly unreadable. */
+  background: #ffffff;
+  color: #0f172a;
+  border-radius: 8px;
+}
+
+.blob-set-viewer-table th,
+.blob-set-viewer-table td {
+  color: inherit;
+}
+
+.blob-set-viewer-table .rejected-candidate-row td {
+  color: #b91c1c;
+}
+
+@media (max-width: 900px) {
+  .blob-set-viewer {
+    grid-template-columns: 1fr;
+  }
+}
+
 .blob-overlay-workspace .overlay-controls {
   flex-wrap: wrap;
 }

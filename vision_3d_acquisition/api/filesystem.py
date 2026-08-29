@@ -16,6 +16,12 @@ from vision_3d_acquisition.contracts.object_candidates import normalize_object_c
 from vision_3d_acquisition.contracts.modalities import assets_by_modality, infer_modalities
 from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.pipelines.registry import build_stage_outputs_from_artifacts, default_pipeline_info
+from vision_3d_acquisition.pipelines.processing_units import (
+    PROCESSING_UNIT_REGISTRY_VERSION,
+    build_processing_unit_trace,
+    build_recipe_snapshot,
+    processing_unit_contract_fingerprint,
+)
 from vision_3d_acquisition.poc.labels import load_labels
 from vision_3d_acquisition.poc.summary import build_poc_run_summary
 from vision_3d_acquisition.processing.status_index import process_entries_for_take, summarize_take_processing
@@ -501,22 +507,39 @@ def latest_take(settings: ApiSettings) -> TakeSummary | None:
     return incoming[0] if incoming else None
 
 
-def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
+def get_take_detail(settings: ApiSettings, take_id: str, *, run_id: str | None = None) -> TakeDetail | None:
     if take_id not in list_take_ids(settings):
         return None
     summary = get_take_summary(settings, take_id)
     metadata = read_json(settings.incoming_dir / take_id / "metadata.json")
-    result = read_json(settings.processed_dir / take_id / "result.json")
-    if not isinstance(result, dict):
-        process_result = _process_run_take_result(settings, take_id)
-        if isinstance(process_result, dict):
-            result = process_result
+    result: dict[str, Any] | None
+    output_dir = settings.processed_dir / take_id
+    if run_id and run_id != "latest":
+        resolved = _resolve_specific_run(settings, take_id, run_id)
+        if resolved is None:
+            return None
+        result, output_dir = resolved
+    else:
+        result = read_json(settings.processed_dir / take_id / "result.json")
+        if not isinstance(result, dict):
+            process_result = _process_run_take_result(settings, take_id)
+            if isinstance(process_result, dict):
+                result = process_result
     if isinstance(result, dict):
-        result["artifacts"] = normalize_processing_artifacts(result, output_dir=settings.processed_dir / take_id)
+        result["artifacts"] = normalize_processing_artifacts(result, output_dir=output_dir)
         if not isinstance(result.get("stage_outputs"), list):
             result["stage_outputs"] = build_stage_outputs_from_artifacts(result["artifacts"])
         if not isinstance(result.get("processing_pipeline"), dict):
             result["processing_pipeline"] = default_pipeline_info()
+        pipeline_info = result.get("processing_pipeline") if isinstance(result.get("processing_pipeline"), dict) else {}
+        pipeline_id = str(pipeline_info.get("id") or pipeline_info.get("name") or default_pipeline_info().get("id"))
+        if not isinstance(pipeline_info.get("processing_units"), list):
+            try:
+                result["processing_pipeline"] = default_pipeline_info(pipeline_id)
+            except KeyError:
+                pass
+            else:
+                pipeline_info = result.get("processing_pipeline") if isinstance(result.get("processing_pipeline"), dict) else {}
         if not isinstance(result.get("pipeline_execution"), dict):
             result["pipeline_execution"] = build_pipeline_execution_trace(
                 pipeline=result.get("processing_pipeline"),
@@ -527,6 +550,34 @@ def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
                 rejected_objects=result.get("rejected_objects") if isinstance(result.get("rejected_objects"), list) else [],
                 result_status=result.get("status"),
                 result_error=result.get("error"),
+            )
+        if pipeline_id == "mining_steel_ball_classification_25d":
+            processing_units = list(pipeline_info.get("processing_units") or [])
+            stage_params = result.get("stage_params") if isinstance(result.get("stage_params"), dict) else {}
+            if not isinstance(result.get("recipe_snapshot"), dict):
+                result["recipe_snapshot"] = build_recipe_snapshot(
+                    pipeline_id=pipeline_id,
+                    pipeline_version=str(pipeline_info.get("version") or "1.0"),
+                    registry_version=PROCESSING_UNIT_REGISTRY_VERSION,
+                    contract_fingerprint=processing_unit_contract_fingerprint(processing_units),
+                    units=processing_units,
+                    stage_params=stage_params,
+                    recipe_version_id=result.get("recipe_version_id") if isinstance(result.get("recipe_version_id"), str) else None,
+                    enabled_units=[str(item.get("id")) for item in processing_units if isinstance(item, dict) and item.get("id")],
+                    provenance={"source": "filesystem_backfill"},
+                    artifact_policy=result.get("artifact_policy") if isinstance(result.get("artifact_policy"), dict) else None,
+                    calibration_snapshot_reference=(
+                        result.get("calibration_snapshot_reference")
+                        if isinstance(result.get("calibration_snapshot_reference"), dict)
+                        else None
+                    ),
+                )
+            result["processing_unit_trace"] = build_processing_unit_trace(
+                pipeline_id=pipeline_id,
+                units=processing_units,
+                artifacts=list(result.get("artifacts") or []),
+                stage_params=stage_params,
+                runtime_trace=result.get("processing_unit_trace") if isinstance(result.get("processing_unit_trace"), dict) else None,
             )
         result["object_candidates"] = normalize_object_candidates(result)
     labels = load_labels(settings.data_dir, take_id)
@@ -566,6 +617,23 @@ def get_take_detail(settings: ApiSettings, take_id: str) -> TakeDetail | None:
         object_annotations=matched_annotations,
         acquisition_processing_status=summary.acquisition_processing_status,
     )
+
+
+def _resolve_specific_run(settings: ApiSettings, take_id: str, run_id: str) -> tuple[dict[str, Any], Path] | None:
+    from vision_3d_acquisition.pipelines.comparison import resolve_pipeline_run_source
+
+    entries = process_entries_for_take(settings.data_dir, take_id)
+    entry = next((item for item in entries if str(item.get("run_id") or "") == run_id), None)
+    pipeline_id = str((entry or {}).get("pipeline_id") or "") or None
+    if pipeline_id is None:
+        return None
+    resolved = resolve_pipeline_run_source(settings, pipeline_id=pipeline_id, take_id=take_id, run_id=run_id)
+    if resolved is None:
+        return None
+    artifact_root = resolved.get("artifact_root")
+    if not isinstance(artifact_root, Path):
+        return None
+    return dict(resolved.get("result_payload") or {}), artifact_root
 
 
 def _process_run_take_result(settings: ApiSettings, take_id: str) -> dict[str, Any] | None:
@@ -766,13 +834,6 @@ def safe_take_file(settings: ApiSettings, take_id: str, filename: str) -> Path |
             return None
         if candidate.is_file():
             return candidate
-    shared_candidate = (settings.data_dir / normalized).resolve()
-    try:
-        shared_candidate.relative_to((settings.data_dir / "processes" / "runs").resolve())
-    except ValueError:
-        return None
-    if not shared_candidate.is_file():
-        return None
     entries = process_entries_for_take(settings.data_dir, take_id)
     allowed_roots: list[Path] = []
     for entry in entries:
@@ -783,6 +844,24 @@ def safe_take_file(settings: ApiSettings, take_id: str, filename: str) -> Path |
             allowed_roots.append(Path(str(path)).resolve())
         except Exception:
             continue
+    # Resolve the filename relative to each indexed run's own output directory. This
+    # covers run-scoped artifacts, including copied "reused/{stage_id}/..." files under
+    # a partial-rerun child run's output directory.
+    for root in allowed_roots:
+        candidate = (root / normalized).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    shared_candidate = (settings.data_dir / normalized).resolve()
+    try:
+        shared_candidate.relative_to((settings.data_dir / "processes" / "runs").resolve())
+    except ValueError:
+        return None
+    if not shared_candidate.is_file():
+        return None
     for root in allowed_roots:
         try:
             shared_candidate.relative_to(root)
@@ -830,6 +909,8 @@ def _take_thumbnail_path(
 
 
 def _take_run_history(settings: ApiSettings, take_id: str, result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    from vision_3d_acquisition.pipelines.run_lineage import enrich_run_entry
+
     history: list[dict[str, Any]] = []
     if isinstance(result, dict):
         history.append(
@@ -840,18 +921,28 @@ def _take_run_history(settings: ApiSettings, take_id: str, result: dict[str, Any
                 "status": result.get("status"),
                 "duration_ms": (result.get("timing_ms") or {}).get("total"),
                 "backend": "legacy",
+                "execution_mode": "full_run",
+                "run_type": "legacy_3d_result",
+                "parent_run_id": None,
             }
         )
     for entry in sorted(process_entries_for_take(settings.data_dir, take_id), key=lambda item: str(item.get("created_at") or ""), reverse=True):
+        enriched = enrich_run_entry(entry)
         history.append(
             {
-                "run_id": entry.get("run_id"),
-                "pipeline": entry.get("pipeline_family"),
-                "timestamp": entry.get("created_at"),
-                "status": entry.get("status"),
+                "run_id": enriched.get("run_id"),
+                "pipeline": enriched.get("pipeline_family"),
+                "timestamp": enriched.get("created_at"),
+                "status": enriched.get("status"),
                 "duration_ms": None,
                 "backend": "process_service",
-                "pipeline_instance_id": entry.get("pipeline_instance_id"),
+                "pipeline_instance_id": enriched.get("pipeline_instance_id"),
+                "execution_mode": enriched.get("execution_mode"),
+                "run_type": enriched.get("run_type"),
+                "parent_run_id": enriched.get("parent_run_id"),
+                "boundary_stage_id": enriched.get("boundary_stage_id"),
+                "comparison_id": enriched.get("comparison_id"),
+                "summary": enriched.get("summary"),
             }
         )
     return history

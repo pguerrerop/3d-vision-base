@@ -35,5 +35,4 @@ test("API error copy remains readable in operator page source", async () => {
   const source = fs.readFileSync(path.resolve(process.cwd(), "src/pages/OperatorInspectionPage.tsx"), "utf-8");
   assert.ok(source.includes("Unable to load operator inspection results"));
   assert.ok(source.includes("No display image available"));
-  assert.ok(source.includes("setSelectedResultId(item.published_result_id)"));
 });

@@ -5,19 +5,27 @@ import StudioObjectList from "../StudioObjectList";
 import type { OverlayDebugInfo } from "../overlayModel";
 import { api, fileUrl, type SourceHistogramResponse, type TakeDetail } from "../../api/client";
 import type { StudioArtifact } from "../studioWorkspaceModel";
+import type { ResolvedProcessingUnitView } from "../processingUnitModel";
 import { artifactsForStage, firstArtifactByAlias } from "../studioWorkspaceModel";
 import { stageEmptyState, stageSemanticDefinition, type StageViewDefinition } from "../stageSemantics";
 import { primarySourceImageUrl, resolveStageViewContext } from "../stage_sources";
 import type { RoiPolygon, RoiRect } from "../roiMapping";
 import type { RoiType } from "../ProjectionArtifactViewer";
-import { normalizeBlobDetectionArtifacts } from "../../studio/blobDetectionModel";
+import { normalizeBlobDetectionArtifacts, resolveBlobSetSourceImage } from "../../studio/blobDetectionModel";
+import BlobSetViewer from "../BlobSetViewer";
+import LowGradientComponentsViewer from "../LowGradientComponentsViewer";
 import type { StudioDebugMode } from "../studioDebugMode";
 import type { HoverInspectionSample } from "../hoverInspectionModel";
 import { resolveHeightArtifact } from "../heightSemantics";
 import { objectDisplayId } from "../objectSelectionModel";
+import { preferredDetectArtifactsForView, resolveDetectReferenceRunState, resolveDetectViewArtifacts, type ArtifactRelevance } from "../referenceArtifactRelevance";
 import MetricDetailsPanel from "../MetricDetailsPanel";
+import DetectClusterDecision from "../DetectClusterDecision";
+import type { StudioArtifactViewState } from "../studioViewState";
+import SelectedSupportLineagePanel from "../SelectedSupportLineagePanel";
+import StageMaskArtifactRenderer from "./StageMaskArtifactRenderer";
 
-type RendererProps = {
+export type RendererProps = {
   detail: TakeDetail | null;
   compatible: boolean;
   processed: boolean;
@@ -47,6 +55,20 @@ type RendererProps = {
   onUpsertObjectAnnotation?: (payload: Record<string, unknown>) => void;
   debugMode?: StudioDebugMode;
   onHoverSample?: (sample: HoverInspectionSample | null) => void;
+  viewState: StudioArtifactViewState;
+  onViewportModeChange: (mode: StudioArtifactViewState["viewportMode"]) => void;
+  onOverlayModeChange: (mode: StudioArtifactViewState["overlayMode"]) => void;
+  onBinaryMaskModeChange: (mode: StudioArtifactViewState["binaryMaskMode"]) => void;
+  onBinaryMaskReferenceArtifactIdChange: (artifactId: string | null) => void;
+  onBinaryMaskOpacityChange?: (value: number) => void;
+  onBinaryMaskReferenceOpacityChange?: (value: number) => void;
+  onResetViewState: () => void;
+  activeBlobClusterId?: string | null;
+  onActiveBlobClusterChange?: (clusterId: string | null) => void;
+  onFocusLineageStep?: (stepId: string, options?: { openTune?: boolean }) => void;
+  resolvedViewArtifacts?: StudioArtifact[];
+  unitViewResolution?: ResolvedProcessingUnitView | null;
+  artifactRelevance?: Record<string, { relevance: ArtifactRelevance; reason?: string }>;
 };
 
 function semanticEmpty(stageId: string, viewId: string) {
@@ -72,7 +94,12 @@ function explore(
   props: RendererProps,
   opts?: { disableRoi?: boolean }
 ) {
-  if (!artifacts.length) return semanticEmpty(props.stageId, props.view.id);
+  if (!artifacts.length) {
+    if (props.unitViewResolution?.emptyState) {
+      return <div className="empty-state"><strong>{props.unitViewResolution.label}</strong><small>{props.unitViewResolution.emptyState}</small></div>;
+    }
+    return semanticEmpty(props.stageId, props.view.id);
+  }
   return (
     <StudioArtifactExplorer
       artifacts={artifacts}
@@ -80,6 +107,8 @@ function explore(
       selectedArtifactId={props.selectedArtifactId}
       onSelect={props.onSelectArtifact}
       detailJson={props.detail?.result}
+      takeDetail={props.detail}
+      currentStageArtifacts={artifacts}
       selectedObjectId={props.selectedObjectId}
       hoveredObjectId={props.hoveredObjectId}
       hoveredArtifactId={props.hoveredArtifactId}
@@ -99,6 +128,15 @@ function explore(
       onCancelRoiEdit={props.onCancelRoiEdit}
       debugMode={props.debugMode ?? "operator"}
       onHoverSample={props.onHoverSample}
+      viewState={props.viewState}
+      onViewportModeChange={props.onViewportModeChange}
+      onOverlayModeChange={props.onOverlayModeChange}
+      onBinaryMaskModeChange={props.onBinaryMaskModeChange}
+      onBinaryMaskReferenceArtifactIdChange={props.onBinaryMaskReferenceArtifactIdChange}
+      onBinaryMaskOpacityChange={props.onBinaryMaskOpacityChange}
+      onBinaryMaskReferenceOpacityChange={props.onBinaryMaskReferenceOpacityChange}
+      onResetViewState={props.onResetViewState}
+      artifactRelevance={props.artifactRelevance}
     />
   );
 }
@@ -109,6 +147,9 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     const runArtifacts = artifactsForStage(props.detail, props.stageId);
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, runArtifacts);
     const candidateArtifacts = (() => {
+      if (props.resolvedViewArtifacts?.length) {
+        return props.resolvedViewArtifacts;
+      }
       if (props.view.id === "below_reference" || props.view.id === "above_threshold") {
         return [
           ...context.resolvedArtifacts,
@@ -117,10 +158,51 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       }
       return context.resolvedArtifacts;
     })();
+    const detectRunState = props.stageId === "detect_belt_plane"
+      ? resolveDetectReferenceRunState(props.detail, runArtifacts, null)
+      : null;
+    const preferredDetectArtifacts = props.stageId === "detect_belt_plane" && detectRunState
+      ? preferredDetectArtifactsForView(props.view.id, candidateArtifacts, detectRunState)
+      : [];
+    const detectViewResolution = props.stageId === "detect_belt_plane" && detectRunState
+      ? resolveDetectViewArtifacts(props.view.id, candidateArtifacts, detectRunState)
+      : null;
     const rawPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "raw_sensor_z", representation: "preview_image" }).artifact;
     const normalizedPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "height_above_belt", representation: "preview_image" }).artifact;
     const residualPreview = resolveHeightArtifact(candidateArtifacts, { semanticField: "plane_signed_distance", representation: "preview_image" }).artifact;
     const artifacts = candidateArtifacts.filter((artifact) => {
+      if (props.stageId === "detect_belt_plane" && preferredDetectArtifacts.length > 0) {
+        const preferredIds = new Set(preferredDetectArtifacts.map((item) => item.artifact_id));
+        if (
+          props.view.id === "blob_components"
+          || props.view.id === "height_aware_blob_components"
+          || props.view.id === "height_aware_connectivity_rejected_edges"
+          || props.view.id === "height_borders"
+          || props.view.id === "height_border_fragments"
+          || props.view.id === "height_split_blobs"
+          || props.view.id === "selected_blob_cluster"
+          || props.view.id === "selected_cluster_pre_refine"
+          || props.view.id === "selected_cluster_refined"
+          || props.view.id === "removed_by_refinement"
+          || props.view.id === "rejected_blob_clusters"
+          || props.view.id === "belt_base"
+          || props.view.id === "belt_stripes"
+          || props.view.id === "belt_stripes_tophat"
+          || props.view.id === "belt_stripes_shape"
+          || props.view.id === "belt_above_belt"
+          || props.view.id === "belt_wide_object"
+          || props.view.id === "removed_by_stripe_filter"
+          || props.view.id === "belt_altitude_plot"
+          || props.view.id === "belt_baseline"
+          || props.view.id === "reference_model_support"
+          || props.view.id === "reference_suppression_mask"
+          || props.view.id === "surface_candidates"
+          || props.view.id === "plateau_plot"
+          || props.view.id === "filtered_depth_plot"
+        ) {
+          return preferredIds.has(artifact.artifact_id);
+        }
+      }
       if (artifact.kind !== "image") return false;
       if (props.view.id === "height_preview") {
         return artifact.artifact_id === "source_heightmap_preview"
@@ -134,7 +216,11 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       }
       if (props.view.id === "depth_gradient") return artifact.artifact_id === "depth_gradient_magnitude" || /depth_gradient_magnitude/i.test(String(artifact.path ?? ""));
       if (props.view.id === "low_gradient_mask") return artifact.artifact_id === "low_gradient_mask" || /low_gradient_mask/i.test(String(artifact.path ?? ""));
-      if (props.view.id === "selected_surface") return artifact.artifact_id === "reference_surface_selected_mask" || artifact.artifact_id === "expanded_plane_mask" || /reference_surface_selected_mask|expanded_plane_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "selected_surface") {
+        return detectViewResolution?.primary != null
+          ? artifact.artifact_id === detectViewResolution.primary.artifact_id
+          : artifact.artifact_id === "reference_surface_selected_mask" || artifact.artifact_id === "expanded_plane_mask" || /reference_surface_selected_mask|expanded_plane_mask/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "normalized_height") {
         if (normalizedPreview) return artifact.artifact_id === normalizedPreview.artifact_id;
         return artifact.artifact_id === "normalized_heightmap" || /normalized_heightmap/i.test(String(artifact.path ?? ""));
@@ -160,6 +246,77 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         return artifact.artifact_id === "flat_candidate_depth_plot"
           || /flat_candidate_depth_plot/i.test(String(artifact.path ?? ""));
       }
+      if (props.view.id === "blob_components") {
+        return artifact.artifact_id === "low_gradient_blob_components_overlay"
+          || artifact.artifact_id === "low_gradient_blob_id_mask"
+          || /low_gradient_blob_components_overlay|low_gradient_blob_id_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "height_aware_blob_components") {
+        return artifact.artifact_id === "height_aware_blob_components_overlay"
+          || artifact.artifact_id === "height_aware_blob_id_mask"
+          || /height_aware_blob_components_overlay|height_aware_blob_id_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "height_aware_connectivity_rejected_edges") {
+        return artifact.artifact_id === "height_aware_connectivity_rejected_edges"
+          || artifact.artifact_id === "height_aware_connectivity_debug"
+          || /height_aware_connectivity_rejected_edges|height_aware_connectivity_debug/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "height_borders") {
+        return artifact.artifact_id === "height_border_strength"
+          || artifact.artifact_id === "height_border_cut_mask"
+          || artifact.artifact_id === "height_border_split_debug"
+          || /height_border_strength|height_border_cut_mask|height_border_split_debug/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "height_border_fragments") {
+        return artifact.artifact_id === "height_border_fragments_overlay"
+          || artifact.artifact_id === "height_border_fragments_mask"
+          || artifact.artifact_id === "height_border_fragments_id_mask"
+          || artifact.artifact_id === "fragment_merge_debug"
+          || /height_border_fragments_overlay|height_border_fragments_mask|height_border_fragments_id_mask|fragment_merge_debug/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "height_split_blobs") {
+        return artifact.artifact_id === "height_split_blob_fragments_overlay"
+          || artifact.artifact_id === "height_split_blob_fragments_mask"
+          || artifact.artifact_id === "height_split_blob_id_mask"
+          || artifact.artifact_id === "height_split_debug"
+          || artifact.artifact_id === "height_consistent_blob_summary"
+          || /height_split_blob_fragments_overlay|height_split_blob_fragments_mask|height_split_blob_id_mask|height_split_debug|height_consistent_blob_summary/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "blob_clusters") {
+        return artifact.artifact_id === "blob_height_clusters"
+          || artifact.artifact_id === "low_gradient_blob_summary"
+          || /blob_height_clusters|low_gradient_blob_summary/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "selected_blob_cluster") {
+        return artifact.artifact_id === "selected_blob_cluster_overlay"
+          || artifact.artifact_id === "selected_blob_cluster_mask"
+          || /selected_blob_cluster_overlay|selected_blob_cluster_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "selected_cluster_pre_refine") {
+        return artifact.artifact_id === "selected_blob_cluster_pre_refine_mask"
+          || artifact.artifact_id === "selected_blob_cluster_mask"
+          || /selected_blob_cluster_pre_refine_mask|selected_blob_cluster_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "selected_cluster_refined") {
+        return artifact.artifact_id === "selected_blob_cluster_refined_mask"
+          || artifact.artifact_id === "selected_reference_support_mask"
+          || artifact.artifact_id === "selected_blob_cluster_pre_refine_mask"
+          || /selected_blob_cluster_refined_mask|selected_reference_support_mask|selected_blob_cluster_pre_refine_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "removed_by_refinement") {
+        return artifact.artifact_id === "support_removed_by_candidate_refinement"
+          || /support_removed_by_candidate_refinement/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "rejected_blob_clusters") {
+        return artifact.artifact_id === "rejected_blob_clusters_overlay"
+          || artifact.artifact_id === "rejected_blob_clusters_mask"
+          || /rejected_blob_clusters_overlay|rejected_blob_clusters_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "blob_cluster_scores") {
+        return artifact.artifact_id === "blob_cluster_score_table"
+          || artifact.artifact_id === "blob_cluster_selection_debug"
+          || /blob_cluster_score_table|blob_cluster_selection_debug/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "belt_base") {
         return artifact.artifact_id === "belt_base_mask"
           || /belt_base_mask/i.test(String(artifact.path ?? ""));
@@ -184,6 +341,10 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         return artifact.artifact_id === "belt_wide_object_mask"
           || /belt_wide_object_mask/i.test(String(artifact.path ?? ""));
       }
+      if (props.view.id === "removed_by_stripe_filter") {
+        return artifact.artifact_id === "support_removed_by_stripe_filter"
+          || /support_removed_by_stripe_filter/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "belt_altitude_plot") {
         return artifact.artifact_id === "belt_altitude_histogram_image"
           || artifact.artifact_id === "belt_altitude_local_min"
@@ -193,7 +354,20 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
         return artifact.artifact_id === "belt_baseline_local_min"
           || /belt_baseline_local_min/i.test(String(artifact.path ?? ""));
       }
-      if (props.view.id === "plane_inliers") return artifact.artifact_id === "final_plane_inlier_mask" || artifact.artifact_id === "plane_inlier_mask" || /final_plane_inlier_mask|plane_inlier_mask/i.test(String(artifact.path ?? ""));
+      if (props.view.id === "reference_model_support") {
+        return artifact.artifact_id === "reference_model_support_mask"
+          || artifact.artifact_id === "selected_reference_support_mask"
+          || /reference_model_support_mask|selected_reference_support_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "reference_suppression_mask") {
+        return artifact.artifact_id === "reference_suppression_mask"
+          || /reference_suppression_mask/i.test(String(artifact.path ?? ""));
+      }
+      if (props.view.id === "plane_inliers") {
+        return detectViewResolution?.primary != null
+          ? artifact.artifact_id === detectViewResolution.primary.artifact_id
+          : artifact.artifact_id === "final_plane_inlier_mask" || artifact.artifact_id === "plane_inlier_mask" || /final_plane_inlier_mask|plane_inlier_mask/i.test(String(artifact.path ?? ""));
+      }
       if (props.view.id === "residual_heatmap" || props.view.id === "belt_plane") {
         return artifact.artifact_id === "raw_heightmap_preview"
           || artifact.artifact_id === "valid_mask"
@@ -208,7 +382,14 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       if (props.view.id === "threshold_mask") return artifact.artifact_id === "foreground_before_plane_suppression" || artifact.artifact_id === "normalized_height_threshold_mask" || artifact.artifact_id === "threshold_mask";
       if (props.view.id === "cleaned_mask") return artifact.artifact_id === "final_object_mask" || artifact.artifact_id === "plane_suppressed_mask" || artifact.artifact_id === "cleaned_object_mask" || artifact.artifact_id === "cleaned_mask";
       return true;
-    });
+    }).concat(
+      props.view.id === "normalized_height"
+        ? candidateArtifacts.filter((artifact) =>
+          (artifact.artifact_id === "plane_fit_debug" || artifact.artifact_id === "normalized_height_histogram" || artifact.artifact_id === "normalized_heightmap_display")
+          && artifact.kind !== "image",
+        )
+        : [],
+    );
     if (semantic.category === "geometry" && props.view.id === "labels") {
       return explore(context.resolvedArtifacts.filter((artifact) => artifact.artifact_id === "blob_labels" || artifact.artifact_id === "labels" || artifact.kind === "image"), props);
     }
@@ -235,13 +416,47 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     ) {
       return explore(artifacts, props, { disableRoi: true });
     }
+    if (props.detail && props.stageId === "detect_belt_plane" && (props.view.id === "selected_blob_cluster" || props.view.id === "rejected_blob_clusters")) {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      return (
+        <div className="cluster-decision-with-preview">
+          <DetectClusterDecision
+            takeId={props.detail.take_id}
+            detail={props.detail}
+            artifacts={stageArtifacts}
+            mode="card"
+            showSpatialPreview
+            activeClusterId={props.activeBlobClusterId}
+            onActiveClusterChange={props.onActiveBlobClusterChange}
+          />
+          {explore(artifacts, props)}
+        </div>
+      );
+    }
+    if (props.detail && props.stageId === "detect_belt_plane" && props.view.id === "selected_surface") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const selectedSurfaceDebug = ((stageArtifacts.find((item) => item.artifact_id === "selected_surface_debug")?.metadata ?? {}) as Record<string, unknown>);
+      const resolvedArtifact = String(selectedSurfaceDebug.selected_surface_alias_resolves_to ?? detectViewResolution?.primary?.artifact_id ?? "Not available");
+      const resolvedRole = String(selectedSurfaceDebug.selected_surface_alias_role ?? "selected_support");
+      return (
+        <div>
+          <div className="artifact-reference">
+            <span>Selected surface</span>
+            <small>Resolved artifact: {resolvedArtifact}</small>
+            <small>Role: {resolvedRole.replace(/_/g, " ")}</small>
+          </div>
+          {explore(artifacts, props)}
+        </div>
+      );
+    }
     return explore(artifacts, props);
   },
   overlay: (props) => {
     const semantic = stageSemanticDefinition(props.stageId);
     const runArtifacts = artifactsForStage(props.detail, props.stageId);
     const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, runArtifacts);
-    let artifacts = context.resolvedArtifacts.filter((artifact) => artifact.kind === "overlay" || artifact.kind === "image");
+    let artifacts = (props.resolvedViewArtifacts?.length ? props.resolvedViewArtifacts : context.resolvedArtifacts)
+      .filter((artifact) => artifact.kind === "overlay" || artifact.kind === "image");
     if (semantic.category === "segmentation" && props.view.id === "overlay") {
       artifacts = artifacts.filter((artifact) =>
         artifact.artifact_id === "connected_components_overlay"
@@ -264,12 +479,10 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     }
     if (semantic.category === "geometry" && props.view.id === "candidate_overlay") {
       const normalized = normalizeBlobDetectionArtifacts(context.runArtifacts);
-      const source = context.resolvedArtifacts.find((item) => item.artifact_id === "source_rgb_image" && item.path)
-        ?? context.resolvedArtifacts.find((item) => item.kind === "image" && item.path)
-        ?? null;
+      const source = resolveBlobSetSourceImage(context.resolvedArtifacts);
       if (source?.path) {
         return (
-          <BlobCandidateOverlayWorkspace
+          <BlobSetViewer
             src={fileUrl(props.detail!.take_id, source.path)}
             candidates={normalized.candidates}
             rejected={normalized.rejected}
@@ -326,6 +539,82 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
   table: (props) => {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
     const semantic = stageSemanticDefinition(props.stageId);
+    if (props.resolvedViewArtifacts?.length && props.stageId !== "detect_belt_plane") {
+      return explore(props.resolvedViewArtifacts, props, { disableRoi: true });
+    }
+    if (props.stageId === "detect_belt_plane" && props.resolvedViewArtifacts?.length && props.view.id !== "selection_bridge" && props.view.id !== "blob_cluster_scores" && props.view.id !== "blob_clusters") {
+      return explore(props.resolvedViewArtifacts, props, { disableRoi: true });
+    }
+    if (props.stageId === "detect_belt_plane" && (props.view.id === "blob_clusters" || props.view.id === "blob_cluster_scores" || props.view.id === "selection_bridge")) {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      return (
+        <DetectClusterDecision
+          takeId={props.detail.take_id}
+          detail={props.detail}
+          artifacts={stageArtifacts}
+          mode={props.view.id === "selection_bridge" ? "bridge" : "table"}
+          showSpatialPreview
+          activeClusterId={props.activeBlobClusterId}
+          onActiveClusterChange={props.onActiveBlobClusterChange}
+        />
+      );
+    }
+    if (props.stageId === "detect_belt_plane" && props.view.id === "selected_support_lineage") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      return (
+        <SelectedSupportLineagePanel
+          artifacts={stageArtifacts}
+          takeId={props.detail.take_id}
+          detail={props.detail}
+          selectedArtifactId={props.selectedArtifactId}
+          onSelectArtifact={props.onSelectArtifact}
+          onFocusLineageStep={props.onFocusLineageStep}
+        />
+      );
+    }
+    if (props.stageId === "detect_belt_plane" && props.view.id === "support_loss_waterfall") {
+      const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+      const waterfallArtifact = stageArtifacts.find((item) => item.artifact_id === "support_loss_waterfall");
+      const rows = Array.isArray((waterfallArtifact?.metadata as Record<string, unknown> | undefined)?.rows)
+        ? ((waterfallArtifact?.metadata as Record<string, unknown>).rows as Array<Record<string, unknown>>)
+        : [];
+      const fmtPct = (value: unknown) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : "-";
+      const largestLoss = rows
+        .filter((row) => Number.isFinite(Number(row.delta_percent_valid_roi_from_previous)))
+        .sort((a, b) => Number(a.delta_percent_valid_roi_from_previous) - Number(b.delta_percent_valid_roi_from_previous))[0] ?? null;
+      if (!rows.length) return semanticEmpty(props.stageId, props.view.id);
+      return (
+        <div className="studio-table-pane">
+          <div className="pipeline-status-grid">
+            <div><span>Rows</span><strong>{rows.length}</strong></div>
+            <div><span>Largest loss</span><strong>{largestLoss ? String(largestLoss.label ?? largestLoss.row_id ?? "-") : "-"}</strong></div>
+            <div><span>Loss amount</span><strong>{largestLoss ? fmtPct(Math.abs(Number(largestLoss.delta_percent_valid_roi_from_previous ?? 0))) : "-"}</strong></div>
+            <div><span>Final plane inliers</span><strong>{fmtPct(rows[rows.length - 1]?.percent_valid_roi)}</strong></div>
+          </div>
+          <table className="compact-candidate-table">
+            <thead>
+              <tr>
+                <th>Step</th><th>Substage</th><th>Area px</th><th>% valid ROI</th><th>% previous</th><th>Delta ROI</th><th>Status</th><th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={String(row.row_id ?? row.label ?? Math.random())}>
+                  <td>{String(row.label ?? row.row_id ?? "-")}</td>
+                  <td>{String(row.substage_id ?? "-").replace(/_/g, " ")}</td>
+                  <td>{Number.isFinite(Number(row.area_px)) ? Number(row.area_px).toFixed(0) : "-"}</td>
+                  <td>{fmtPct(row.percent_valid_roi)}</td>
+                  <td>{fmtPct(row.percent_previous)}</td>
+                  <td>{fmtPct(row.delta_percent_valid_roi_from_previous)}</td>
+                  <td>{String(row.status ?? "-")}</td>
+                  <td>{String(row.largest_loss_reason ?? row.warning ?? row.notes ?? "-")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
     if ((semantic.category === "input" || semantic.category === "plane_qa") && props.view.id === "metadata") {
       return <pre className="json-block">{JSON.stringify({ modalities: props.detail.modalities, created_at: props.detail.created_at, metadata: props.detail.metadata, frameset: props.detail.frameset, assets: props.detail.assets }, null, 2)}</pre>;
     }
@@ -385,21 +674,39 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       const normDebug = stageArtifacts.find((item) => item.artifact_id === "normalization_debug" || item.artifact_id === "normalized_height_debug");
       const bgHist = stageArtifacts.find((item) => item.artifact_id === "background_depth_histogram");
       const bgDebug = stageArtifacts.find((item) => item.artifact_id === "background_selection_debug");
+      const detectDebugArtifacts = stageArtifacts
+        .filter((item) => item.kind === "json" || item.kind === "table")
+        .filter((item) => typeof ((item.metadata ?? {}) as Record<string, unknown>).compact_summary === "object");
       return (
-        <pre className="json-block">
-          {JSON.stringify(
-            {
-              plane_fit_debug: planeDebug?.metadata ?? null,
-              background_depth_histogram: bgHist?.metadata ?? null,
-              background_selection_debug: bgDebug?.metadata ?? null,
-              normalized_height_histogram: normHist?.metadata ?? null,
-              normalization_debug: normDebug?.metadata ?? null,
-              result_summary: props.detail.result?.summary ?? null,
-            },
-            null,
-            2
-          )}
-        </pre>
+        <div>
+          {detectDebugArtifacts.length > 0 ? (
+            <section className="artifact-reference">
+              <span>Compact debug summaries</span>
+              {detectDebugArtifacts.map((artifact) => {
+                const summary = (((artifact.metadata ?? {}) as Record<string, unknown>).compact_summary ?? {}) as Record<string, unknown>;
+                return (
+                  <small key={artifact.artifact_id}>
+                    {String(summary.title ?? artifact.title)}: input {String(summary.input_count ?? "-")} • output {String(summary.output_count ?? "-")} • selected {String(summary.selected_id ?? "-")} • fallback {String(summary.fallback_used ?? false)}
+                  </small>
+                );
+              })}
+            </section>
+          ) : null}
+          <pre className="json-block">
+            {JSON.stringify(
+              {
+                plane_fit_debug: planeDebug?.metadata ?? null,
+                background_depth_histogram: bgHist?.metadata ?? null,
+                background_selection_debug: bgDebug?.metadata ?? null,
+                normalized_height_histogram: normHist?.metadata ?? null,
+                normalization_debug: normDebug?.metadata ?? null,
+                result_summary: props.detail.result?.summary ?? null,
+              },
+              null,
+              2
+            )}
+          </pre>
+        </div>
       );
     }
     if (semantic.category === "geometry" && (props.view.id === "blob_metrics" || props.view.id === "candidates_table")) {
@@ -975,7 +1282,7 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
     const semantic = stageSemanticDefinition(props.stageId);
     if (semantic.category === "plane_qa") {
-      const runArtifacts = artifactsForStage(props.detail, props.stageId);
+      const runArtifacts = props.resolvedViewArtifacts?.length ? props.resolvedViewArtifacts : artifactsForStage(props.detail, props.stageId);
       const histogram = runArtifacts.find((item) => item.artifact_id === "normalized_height_histogram");
       if (!histogram?.metadata) return semanticEmpty(props.stageId, props.view.id);
       return <pre className="json-block">{JSON.stringify(histogram.metadata, null, 2)}</pre>;
@@ -1008,39 +1315,57 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
   },
   json: (props) => {
     if (!props.detail) return semanticEmpty(props.stageId, props.view.id);
+    if (props.resolvedViewArtifacts?.length && props.stageId !== "detect_belt_plane") {
+      return explore(props.resolvedViewArtifacts, props, { disableRoi: true });
+    }
     const semantic = stageSemanticDefinition(props.stageId);
-    const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, artifactsForStage(props.detail, props.stageId));
+    const stageArtifacts = artifactsForStage(props.detail, props.stageId);
+    const context = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, stageArtifacts);
+    const runArtifacts = props.resolvedViewArtifacts?.length ? props.resolvedViewArtifacts : context.runArtifacts;
     const payload = semantic.category === "input" || semantic.category === "plane_qa"
-      ? { take: { take_id: props.detail.take_id, modalities: props.detail.modalities, metadata: props.detail.metadata, assets: props.detail.assets, frameset: props.detail.frameset }, stage: props.stageId, semantic, resolvedArtifacts: context.resolvedArtifacts }
+      ? { take: { take_id: props.detail.take_id, modalities: props.detail.modalities, metadata: props.detail.metadata, assets: props.detail.assets, frameset: props.detail.frameset }, stage: props.stageId, semantic, resolvedArtifacts: props.resolvedViewArtifacts?.length ? props.resolvedViewArtifacts : context.resolvedArtifacts }
       : semantic.category === "segmentation"
         ? {
           stage: props.stageId,
           semantic,
-          threshold_mask: context.runArtifacts.find((item) => item.artifact_id === "normalized_height_threshold_mask" || item.artifact_id === "threshold_mask") ?? null,
-          cleaned_mask: context.runArtifacts.find((item) => item.artifact_id === "cleaned_object_mask" || item.artifact_id === "cleaned_mask") ?? null,
-          connected_components_overlay: context.runArtifacts.find((item) => item.artifact_id === "connected_components_overlay") ?? null,
-          overlay_image: context.runArtifacts.find((item) => item.artifact_id === "overlay_image") ?? null,
-          segmentation_debug: context.runArtifacts.find((item) => item.artifact_id === "segmentation_debug")?.metadata ?? null,
+          threshold_mask: runArtifacts.find((item) => item.artifact_id === "normalized_height_threshold_mask" || item.artifact_id === "threshold_mask" || item.artifact_id === "above_threshold_mask") ?? null,
+          cleaned_mask: runArtifacts.find((item) => item.artifact_id === "cleaned_object_mask" || item.artifact_id === "cleaned_mask" || item.artifact_id === "final_object_mask") ?? null,
+          connected_components_overlay: runArtifacts.find((item) => item.artifact_id === "connected_components_overlay") ?? null,
+          overlay_image: runArtifacts.find((item) => item.artifact_id === "overlay_image") ?? null,
+          segmentation_debug: runArtifacts.find((item) => item.artifact_id === "segmentation_debug")?.metadata ?? null,
         }
         : semantic.category === "geometry"
           ? {
             stage: props.stageId,
             semantic,
-            artifacts: context.runArtifacts,
-            ellipse_metrics: firstArtifactByAlias(context.runArtifacts, ["ellipse_metrics", "geometry_metrics"])?.metadata ?? null,
-            ellipse_summary: firstArtifactByAlias(context.runArtifacts, ["ellipse_summary", "geometry_summary"])?.metadata ?? null,
-            blob_metrics: firstArtifactByAlias(context.runArtifacts, ["blob_metrics", "detection_metrics"])?.metadata ?? null,
-            blob_contours: firstArtifactByAlias(context.runArtifacts, ["blob_contours", "contours"])?.metadata ?? null,
-            blob_rejected: firstArtifactByAlias(context.runArtifacts, ["blob_rejected"])?.metadata ?? null,
+            artifacts: runArtifacts,
+            ellipse_metrics: firstArtifactByAlias(runArtifacts, ["ellipse_metrics", "geometry_metrics", "fitted_ellipse"])?.metadata ?? null,
+            ellipse_summary: firstArtifactByAlias(runArtifacts, ["ellipse_summary", "geometry_summary", "geometry_debug_summary"])?.metadata ?? null,
+            blob_metrics: firstArtifactByAlias(runArtifacts, ["blob_metrics", "detection_metrics", "connected_components"])?.metadata ?? null,
+            blob_contours: firstArtifactByAlias(runArtifacts, ["blob_contours", "contours", "contour"])?.metadata ?? null,
+            blob_rejected: firstArtifactByAlias(runArtifacts, ["blob_rejected"])?.metadata ?? null,
           }
-          : { stage: props.stageId, semantic, artifacts: context.runArtifacts, result: props.detail.result };
+          : { stage: props.stageId, semantic, artifacts: runArtifacts, result: props.detail.result };
     if (semantic.category === "plane_qa" && props.view.id === "surface_candidates") {
       const surfaceCandidates = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_candidates");
       const plateaus = context.runArtifacts.find((item) => item.artifact_id === "reference_surface_plateaus");
       const flatHistogram = context.runArtifacts.find((item) => item.artifact_id === "flat_candidate_histogram");
       const gradientDebug = context.runArtifacts.find((item) => item.artifact_id === "gradient_debug");
       const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");
-      return <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, plateaus: plateaus?.metadata ?? null, flat_candidate_histogram: flatHistogram?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null, selected_surface_debug: selectedSurface?.metadata ?? null }, null, 2)}</pre>;
+      const jsonDump = <pre className="json-block">{JSON.stringify({ surface_candidates: surfaceCandidates?.metadata ?? null, plateaus: plateaus?.metadata ?? null, flat_candidate_histogram: flatHistogram?.metadata ?? null, gradient_debug: gradientDebug?.metadata ?? null, selected_surface_debug: selectedSurface?.metadata ?? null }, null, 2)}</pre>;
+      if (!props.detail?.take_id || !surfaceCandidates) return jsonDump;
+      return (
+        <LowGradientComponentsViewer
+          takeId={props.detail.take_id}
+          stageArtifacts={context.runArtifacts}
+          artifact={surfaceCandidates}
+          selectedCandidateId={props.selectedObjectId}
+          hoveredCandidateId={props.hoveredObjectId}
+          onSelectCandidate={props.onSelectObject}
+          onHoverCandidate={props.onHoverObject}
+          fallback={jsonDump}
+        />
+      );
     }
     if (semantic.category === "plane_qa" && props.view.id === "reference_surface") {
       const selectedSurface = context.runArtifacts.find((item) => item.artifact_id === "selected_surface_debug");
@@ -1051,9 +1376,10 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
   },
   gallery: (props) => {
     const semantic = stageSemanticDefinition(props.stageId);
-    const artifacts = resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, artifactsForStage(props.detail, props.stageId)).resolvedArtifacts.filter((artifact) => artifact.kind === "image");
+    const artifacts = (props.resolvedViewArtifacts?.length ? props.resolvedViewArtifacts : resolveStageViewContext(props.detail, props.stageId, props.view.id, semantic.category, artifactsForStage(props.detail, props.stageId)).resolvedArtifacts).filter((artifact) => artifact.kind === "image");
     return explore(artifacts, props);
   },
+  mask: (props) => <StageMaskArtifactRenderer {...props} />,
 };
 
 export function renderStageSemanticView(props: RendererProps): ReactElement {
@@ -1277,184 +1603,7 @@ function ObjectCropThumbnail({ src, bbox, label }: { src: string | null; bbox: [
   );
 }
 
-type OverlayMode = "contours" | "labels" | "bbox" | "filled" | "rejected_only";
 type ClassificationOverlayFlags = "ids" | "labels" | "confidence" | "contours" | "geometry";
-
-function BlobCandidateOverlayWorkspace({
-  src,
-  candidates,
-  rejected,
-  selectedCandidateId,
-  hoveredCandidateId,
-  onSelectCandidate,
-  onHoverCandidate,
-}: {
-  src: string;
-  candidates: Array<{
-    id: string | number;
-    contour?: [number, number][];
-    centroid?: [number, number];
-    bbox?: [number, number, number, number];
-    areaPx?: number;
-    equivalentDiameter?: number;
-    circularity?: number;
-    aspectRatio?: number;
-  }>;
-  rejected: Array<{
-    id: string | number;
-    contour?: [number, number][];
-    centroid?: [number, number];
-    bbox?: [number, number, number, number];
-    rejectionReason?: string;
-  }>;
-  selectedCandidateId: number | null;
-  hoveredCandidateId: number | null;
-  onSelectCandidate: (id: number) => void;
-  onHoverCandidate: (id: number | null) => void;
-}) {
-  const [mode, setMode] = useState<OverlayMode>("contours");
-  const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null);
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; row: (typeof candidates)[number] | (typeof rejected)[number]; rejected: boolean } | null>(null);
-
-  const acceptedCount = candidates.length;
-  const rejectedCount = rejected.length;
-  const rows = mode === "rejected_only" ? rejected : [...candidates, ...rejected];
-
-  return (
-    <section className="image-panel overlay-image-panel blob-overlay-workspace">
-      <div className="overlay-controls">
-        <button className={mode === "contours" ? "active" : ""} onClick={() => setMode("contours")} type="button">Contours</button>
-        <button className={mode === "labels" ? "active" : ""} onClick={() => setMode("labels")} type="button">Labels</button>
-        <button className={mode === "bbox" ? "active" : ""} onClick={() => setMode("bbox")} type="button">BBox</button>
-        <button className={mode === "filled" ? "active" : ""} onClick={() => setMode("filled")} type="button">Filled mask</button>
-        <button className={mode === "rejected_only" ? "active" : ""} onClick={() => setMode("rejected_only")} type="button">Rejected only</button>
-      </div>
-      <div className="blob-overlay-legend">
-        <small><span className="legend-chip accepted" /> accepted: {acceptedCount}</small>
-        <small><span className="legend-chip rejected" /> rejected: {rejectedCount}</small>
-        <small><span className="legend-chip selected" /> selected</small>
-      </div>
-      <div className="overlay-frame blob-overlay-frame">
-        <img
-          alt="Blob candidate overlay"
-          className="artifact-image"
-          draggable={false}
-          onLoad={(event) => setImgSize({ width: event.currentTarget.naturalWidth || 1, height: event.currentTarget.naturalHeight || 1 })}
-          src={src}
-        />
-        {imgSize && (
-          <svg className="artifact-overlay-layer" viewBox={`0 0 ${imgSize.width} ${imgSize.height}`}>
-            {rows.map((row) => {
-              const id = Number(row.id);
-              const isRejected = rejected.some((item) => Number(item.id) === id);
-              const selected = selectedCandidateId != null && selectedCandidateId === id;
-              const hovered = hoveredCandidateId != null && hoveredCandidateId === id;
-              const contour = Array.isArray(row.contour) ? row.contour : [];
-              const bbox = Array.isArray(row.bbox) ? row.bbox : null;
-              const centroid = Array.isArray(row.centroid) ? row.centroid : null;
-              const stroke = isRejected ? "#ef4444" : "#22c55e";
-              const width = selected ? 4 : hovered ? 3 : isRejected ? 1.5 : 2.4;
-              const alpha = selected ? 1 : isRejected ? 0.75 : 0.95;
-              const label = `#${id}${isRejected && "rejectionReason" in row && row.rejectionReason ? ` (${row.rejectionReason})` : ""}`;
-              const shapeProps = {
-                stroke,
-                strokeWidth: width,
-                strokeOpacity: alpha,
-                fill: mode === "filled" ? (isRejected ? "rgba(239,68,68,0.24)" : "rgba(34,197,94,0.22)") : "none",
-                onClick: (event: MouseEvent<SVGElement>) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  onSelectCandidate(id);
-                },
-                onMouseEnter: (event: MouseEvent<SVGElement>) => {
-                  event.preventDefault();
-                  onHoverCandidate(id);
-                  setTooltip({
-                    x: centroid?.[0] ?? (bbox ? bbox[0] + bbox[2] / 2 : 0),
-                    y: centroid?.[1] ?? (bbox ? bbox[1] + bbox[3] / 2 : 0),
-                    row,
-                    rejected: isRejected,
-                  });
-                },
-                onMouseLeave: () => {
-                  onHoverCandidate(null);
-                  setTooltip(null);
-                },
-              };
-              const parts: ReactElement[] = [];
-              if (contour.length >= 2 && mode !== "bbox") {
-                parts.push(
-                  <polyline
-                    key={`contour_${id}`}
-                    {...shapeProps}
-                    points={contour.map((p) => `${p[0]},${p[1]}`).join(" ")}
-                    className={selected ? "blob-selected-shape" : ""}
-                  />
-                );
-              }
-              if (bbox && (mode === "bbox" || mode === "labels" || mode === "rejected_only")) {
-                parts.push(
-                  <rect
-                    key={`bbox_${id}`}
-                    {...shapeProps}
-                    x={bbox[0]}
-                    y={bbox[1]}
-                    width={bbox[2]}
-                    height={bbox[3]}
-                    className={selected ? "blob-selected-shape" : ""}
-                  />
-                );
-              }
-              if (centroid && mode !== "bbox") {
-                parts.push(
-                  <circle
-                    key={`centroid_${id}`}
-                    cx={centroid[0]}
-                    cy={centroid[1]}
-                    r={selected ? 5 : 3.2}
-                    fill={isRejected ? "#f97316" : "#06b6d4"}
-                    opacity={0.95}
-                  />
-                );
-                parts.push(
-                  <text
-                    key={`label_${id}`}
-                    className={`artifact-overlay-text ${selected ? "selected" : ""}`}
-                    x={centroid[0] + 7}
-                    y={Math.max(14, centroid[1] - 7)}
-                    fill={selected ? "#111827" : "#0f172a"}
-                    stroke={selected ? "#f8fafc" : "none"}
-                    strokeWidth={selected ? 0.8 : 0}
-                  >
-                    {label}
-                  </text>
-                );
-              }
-              return <g key={`row_${id}`}>{parts}</g>;
-            })}
-            {tooltip && (
-              <g className="blob-tooltip">
-                <rect x={Math.max(0, tooltip.x + 8)} y={Math.max(0, tooltip.y + 8)} width={210} height={88} rx={8} ry={8} fill="#0f172a" fillOpacity={0.88} />
-                <text x={Math.max(0, tooltip.x + 18)} y={Math.max(0, tooltip.y + 28)} fill="#f8fafc">ID: {String(tooltip.row.id)}</text>
-                <text x={Math.max(0, tooltip.x + 18)} y={Math.max(0, tooltip.y + 44)} fill="#f8fafc">Area: {"areaPx" in tooltip.row ? (tooltip.row.areaPx ?? "-") : "-"}</text>
-                <text x={Math.max(0, tooltip.x + 18)} y={Math.max(0, tooltip.y + 60)} fill="#f8fafc">Diameter: {"equivalentDiameter" in tooltip.row ? (tooltip.row.equivalentDiameter?.toFixed?.(2) ?? "-") : "-"}</text>
-                <text x={Math.max(0, tooltip.x + 18)} y={Math.max(0, tooltip.y + 76)} fill="#f8fafc">
-                  {tooltip.rejected ? `Rejected: ${("rejectionReason" in tooltip.row && tooltip.row.rejectionReason) || "yes"}` : `Circularity: ${"circularity" in tooltip.row && tooltip.row.circularity != null ? tooltip.row.circularity.toFixed(3) : "-"}`}
-                </text>
-              </g>
-            )}
-          </svg>
-        )}
-      </div>
-      {(acceptedCount === 0 || (acceptedCount === 0 && rejectedCount > 0)) && (
-        <div className="empty-state">
-          <strong>{acceptedCount === 0 && rejectedCount > 0 ? "All components were rejected." : "No blob candidates found."}</strong>
-          <small>Try lowering `min_area`, lowering `min_circularity`, disabling border rejection, or reducing segmentation cleanup.</small>
-        </div>
-      )}
-    </section>
-  );
-}
 
 function ClassificationOverlayWorkspace({
   src,

@@ -8,6 +8,16 @@ export type ResolvedStageViewContext = {
   usingSourceFallback: boolean;
 };
 
+function nestedRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function normalizeSourceSemanticField(source: Record<string, unknown>): string | undefined {
+  const raw = String(source.semantic_field ?? source.semantic ?? source.role ?? source.kind ?? "").toLowerCase();
+  if (raw.includes("height")) return "raw_sensor_z";
+  return undefined;
+}
+
 function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifact[] {
   const groups = detail.assets ?? {};
   const files = typeof detail.metadata?.files === "object" && detail.metadata.files ? detail.metadata.files as Record<string, unknown> : {};
@@ -23,6 +33,26 @@ function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifa
       metadata,
       generated: "derived",
     } as StudioArtifact);
+  };
+  const pushExternal = (artifactId: string, title: string, filename: string, metadata: Record<string, unknown>) => {
+    items.push({
+      artifact_id: artifactId,
+      stage_id: stageId,
+      kind: "image",
+      title,
+      path: filename,
+      preview_available: true,
+      metadata: {
+        external_source_url: filename,
+        ...metadata,
+      },
+      generated: "derived",
+    } as StudioArtifact);
+  };
+  const addSourceCandidate = (artifactId: string, title: string, value: unknown, metadata: Record<string, unknown>) => {
+    if (typeof value !== "string" || !value.trim()) return;
+    if (/^https?:\/\//i.test(value)) pushExternal(artifactId, title, value, metadata);
+    else pushNamed(artifactId, title, value, metadata);
   };
   const sourceMeta = (detail.metadata?.source && typeof detail.metadata.source === "object")
     ? detail.metadata.source as Record<string, unknown>
@@ -48,12 +78,6 @@ function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifa
         source_key: "heightmap_preview",
         visualization_role: "primary",
         parser_metadata_file: parserMetadataFile,
-        // Source-bound heightmap previews are raw sensor-space heights. We tag
-        // them with the canonical semantic field so the height legend / hover
-        // resolver can derive a valid color mapping from `min_mm`/`max_mm`
-        // (from `height_preview_range_raw`) even before any processing runs.
-        // The LUT used by the third-party SDK preview is unknown; the canonical
-        // legend gradient may differ visually from the displayed PNG.
         semantic_field: "raw_sensor_z",
         is_measurement_authoritative: false,
         source_preview_lut_unknown: true,
@@ -90,6 +114,76 @@ function sourceImageArtifacts(detail: TakeDetail, stageId: string): StudioArtifa
   pick("reflectance", ["reflectance"]);
   pick("rgb", ["rgb"]);
   pick("laser_rgb", ["laser_rgb", "laser_overlay", "laser_image"]);
+
+  addSourceCandidate("raw_heightmap", "Raw heightmap", groups.heightmap?.raw_heightmap, {
+    source_binding: true,
+    source_group: "heightmap",
+    source_key: "raw_heightmap",
+    visualization_role: "primary",
+    semantic_field: "raw_sensor_z",
+    source_preview_lut_unknown: true,
+    ...sourceRangeMetadata,
+  });
+  addSourceCandidate("heightmap_input_preview", "Heightmap input preview", groups.heightmap?.preview, {
+    source_binding: true,
+    source_group: "heightmap",
+    source_key: "preview",
+    visualization_role: "primary",
+    semantic_field: "raw_sensor_z",
+    source_preview_lut_unknown: true,
+    ...sourceRangeMetadata,
+  });
+
+  const replayManifest = nestedRecord(detail.metadata?.replay_manifest)
+    ?? nestedRecord(detail.take_metadata?.replay_manifest)
+    ?? nestedRecord(sourceMeta?.replay_manifest);
+  const replayAssets = nestedRecord(replayManifest?.assets);
+  addSourceCandidate("replay_heightmap_preview", "Replay heightmap preview", replayAssets?.heightmap ?? replayAssets?.preview, {
+    source_binding: true,
+    source_group: "replay_manifest",
+    source_key: replayAssets?.heightmap ? "heightmap" : "preview",
+    visualization_role: "primary",
+    semantic_field: "raw_sensor_z",
+    source_preview_lut_unknown: true,
+    ...sourceRangeMetadata,
+  });
+  addSourceCandidate("take_thumbnail", "Take thumbnail", nestedRecord(detail.metadata)?.thumbnail_url ?? nestedRecord(detail.take_metadata)?.thumbnail_url, {
+    source_binding: true,
+    source_group: "take",
+    source_key: "thumbnail_url",
+    visualization_role: "fallback",
+  });
+  addSourceCandidate("take_preview", "Take preview", nestedRecord(detail.metadata)?.preview_url ?? nestedRecord(detail.take_metadata)?.preview_url, {
+    source_binding: true,
+    source_group: "take",
+    source_key: "preview_url",
+    visualization_role: "fallback",
+  });
+
+  const detailLoose = detail as unknown as Record<string, unknown>;
+  const sourceArtifacts = Array.isArray(detailLoose.source_artifacts)
+    ? detailLoose.source_artifacts as unknown[]
+    : Array.isArray(detailLoose.sourceArtifacts)
+      ? detailLoose.sourceArtifacts as unknown[]
+      : Array.isArray(nestedRecord(detail.metadata)?.source_artifacts)
+        ? nestedRecord(detail.metadata)?.source_artifacts as unknown[]
+        : [];
+  for (const item of sourceArtifacts) {
+    const row = nestedRecord(item);
+    if (!row) continue;
+    const path = row.path ?? row.url ?? row.preview_url;
+    if (typeof path !== "string" || !path.trim()) continue;
+    const artifactId = String(row.artifact_id ?? row.id ?? row.key ?? row.name ?? "source_artifact").trim();
+    const title = String(row.title ?? row.label ?? row.name ?? artifactId).trim() || "Source artifact";
+    addSourceCandidate(artifactId, title, path, {
+      source_binding: true,
+      source_group: "source_artifacts",
+      source_key: artifactId,
+      visualization_role: "secondary",
+      semantic_field: normalizeSourceSemanticField(row),
+    });
+  }
+
   return items;
 }
 
@@ -131,11 +225,21 @@ function sourceMetadataArtifacts(detail: TakeDetail, stageId: string): StudioArt
   ];
 }
 
+export function sourceArtifactsForTake(detail: TakeDetail | null, stageId = "input"): StudioArtifact[] {
+  if (!detail) return [];
+  return [
+    ...sourceImageArtifacts(detail, stageId),
+    ...sourceMetadataArtifacts(detail, stageId),
+  ];
+}
+
 export function primarySourceImageUrl(detail: TakeDetail | null): string | null {
   if (!detail) return null;
   const artifacts = sourceImageArtifacts(detail, "input");
   const first = artifacts[0];
-  return first?.path ? sourceFileUrl(detail.take_id, first.path) : null;
+  if (!first?.path) return null;
+  const external = typeof first.metadata?.external_source_url === "string" ? first.metadata.external_source_url : null;
+  return external ?? sourceFileUrl(detail.take_id, first.path);
 }
 
 export function resolveStageViewContext(
@@ -150,10 +254,7 @@ export function resolveStageViewContext(
     return { sourceArtifacts: [], runArtifacts, resolvedArtifacts: runArtifacts, usingSourceFallback: false };
   }
 
-  const sourceArtifacts = [
-    ...sourceImageArtifacts(detail, stageId),
-    ...sourceMetadataArtifacts(detail, stageId),
-  ];
+  const sourceArtifacts = sourceArtifactsForTake(detail, stageId);
 
   const sourceByView = (() => {
     if (viewId === "image" || viewId === "height_preview" || viewId === "heightmap") return sourceArtifacts.filter((item) => item.kind === "image");

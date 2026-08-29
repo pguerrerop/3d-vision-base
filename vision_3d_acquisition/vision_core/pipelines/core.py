@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from vision_3d_acquisition.contracts.modalities import CaptureModality, format_modalities
+from vision_3d_acquisition.pipelines.runtime_trace import ProcessingUnitTraceRecorder, ProcessingUnitTraceScope
 from vision_3d_acquisition.utils.profiling import ProcessingProfiler
 
 
@@ -18,6 +19,7 @@ class PipelineContext:
     metrics: dict[str, Any] = field(default_factory=dict)
     debug_outputs: list[dict[str, Any]] = field(default_factory=list)
     processing_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    runtime_trace: ProcessingUnitTraceRecorder = field(default_factory=ProcessingUnitTraceRecorder)
 
     def set_artifact(self, name: str, value: Any) -> None:
         self.artifacts[name] = value
@@ -34,6 +36,15 @@ class PipelineContext:
         payload: dict[str, Any] = {"kind": kind, "path": str(path)}
         payload.update(metadata)
         self.debug_outputs.append(payload)
+
+    def trace_unit(
+        self,
+        unit_id: str,
+        *,
+        stage_id: str,
+        parent_id: str | None = None,
+    ) -> ProcessingUnitTraceScope:
+        return self.runtime_trace.trace_unit(unit_id, stage_id=stage_id, parent_id=parent_id)
 
     def add_processing_artifact(
         self,

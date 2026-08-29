@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -31,6 +32,8 @@ from vision_3d_acquisition.ml.features.ux_contracts import (
     filter_for_studio,
 )
 from vision_3d_acquisition.ml.storage import MLStorage
+from vision_3d_acquisition.vision_core.geometry.sphere_consistency_features import compute_sphere_consistency_features
+from vision_3d_acquisition.vision_core.geometry.surface_sphere_fit import fit_sphere_least_squares
 from vision_3d_acquisition.vision_core.heightmap import (
     HeightmapFrame,
     load_heightmap_npz,
@@ -68,6 +71,356 @@ def _numeric_source_meta(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if extra:
         meta.update(extra)
     return meta
+
+
+_DETECT_REFERENCE_SUBSTAGE_SPECS: dict[str, dict[str, Any]] = {
+    "raw_heightmap_preview": {"substage_id": "input", "display_label": "Raw heightmap", "order_index": 0, "semantic_type": "raw_heightmap", "role": "input"},
+    "valid_mask": {"substage_id": "input", "display_label": "Valid ROI", "order_index": 0, "semantic_type": "valid_mask", "role": "input"},
+    "plane_fit_roi_mask": {"substage_id": "input", "display_label": "Plane-fit ROI", "order_index": 0, "semantic_type": "roi_mask", "role": "diagnostic"},
+    "depth_gradient_magnitude": {"substage_id": "gradient", "display_label": "Depth gradient", "order_index": 1, "semantic_type": "gradient_heatmap", "role": "diagnostic"},
+    "low_gradient_mask": {"substage_id": "gradient", "display_label": "Low-gradient mask", "order_index": 1, "semantic_type": "low_gradient_mask", "role": "intermediate"},
+    "low_gradient_components_overlay": {"substage_id": "gradient", "display_label": "Low-gradient components", "order_index": 1, "semantic_type": "low_gradient_components", "role": "diagnostic"},
+    "low_gradient_components": {"substage_id": "gradient", "display_label": "Low-gradient component summary", "order_index": 1, "semantic_type": "low_gradient_components_summary", "role": "diagnostic"},
+    "gradient_debug": {"substage_id": "gradient", "display_label": "Gradient debug", "order_index": 1, "semantic_type": "gradient_debug", "role": "diagnostic"},
+    "belt_bg_mask": {"substage_id": "height_gate", "display_label": "Belt background mask", "order_index": 2, "semantic_type": "belt_background_mask", "role": "fit_support"},
+    "belt_bg_components": {"substage_id": "height_gate", "display_label": "Belt background components", "order_index": 2, "semantic_type": "belt_background_components", "role": "diagnostic"},
+    "height_gate_mask": {"substage_id": "height_gate", "display_label": "Height gate mask", "order_index": 2, "semantic_type": "height_gate_mask", "role": "intermediate"},
+    "flat_candidate_mask": {"substage_id": "height_gate", "display_label": "Height-gated candidates", "order_index": 2, "semantic_type": "flat_candidate_mask", "role": "intermediate"},
+    "reference_surface_candidates": {"substage_id": "height_gate", "display_label": "Reference-surface candidates", "order_index": 2, "semantic_type": "candidate_summary", "role": "diagnostic"},
+    "reference_surface_plateaus": {"substage_id": "height_gate", "display_label": "Reference-surface plateaus", "order_index": 2, "semantic_type": "plateau_summary", "role": "diagnostic"},
+    "background_selection_debug": {"substage_id": "height_gate", "display_label": "Background selection debug", "order_index": 2, "semantic_type": "background_selection_debug", "role": "diagnostic"},
+    "low_gradient_blob_components_overlay": {"substage_id": "component_formation", "display_label": "XY-only components", "order_index": 3, "semantic_type": "blob_components_overlay", "role": "connectivity_support"},
+    "low_gradient_blob_id_mask": {"substage_id": "component_formation", "display_label": "XY-only component ids", "order_index": 3, "semantic_type": "blob_components_id_mask", "role": "connectivity_support"},
+    "height_aware_blob_components_overlay": {"substage_id": "component_formation", "display_label": "Height-aware components", "order_index": 3, "semantic_type": "height_aware_components_overlay", "role": "connectivity_support"},
+    "height_aware_blob_id_mask": {"substage_id": "component_formation", "display_label": "Height-aware component ids", "order_index": 3, "semantic_type": "height_aware_components_id_mask", "role": "connectivity_support"},
+    "low_gradient_blob_summary": {"substage_id": "component_formation", "display_label": "Component formation summary", "order_index": 3, "semantic_type": "component_summary", "role": "diagnostic"},
+    "component_formation_debug": {"substage_id": "component_formation", "display_label": "Component formation debug", "order_index": 3, "semantic_type": "component_formation_debug", "role": "diagnostic"},
+    "height_aware_connectivity_rejected_edges": {"substage_id": "height_aware_connectivity", "display_label": "Rejected Z-connections", "order_index": 4, "semantic_type": "rejected_connectivity_edges", "role": "diagnostic"},
+    "height_aware_connectivity_debug": {"substage_id": "height_aware_connectivity", "display_label": "Height-aware connectivity debug", "order_index": 4, "semantic_type": "height_aware_connectivity_debug", "role": "diagnostic"},
+    "height_border_strength": {"substage_id": "height_border_detection", "display_label": "Height-border strength", "order_index": 5, "semantic_type": "height_border_strength", "role": "diagnostic"},
+    "height_border_cut_mask": {"substage_id": "height_border_detection", "display_label": "Height-border accepted cuts", "order_index": 5, "semantic_type": "height_border_accepted_cuts", "role": "diagnostic"},
+    "height_border_detection_debug": {"substage_id": "height_border_detection", "display_label": "Height-border detection debug", "order_index": 5, "semantic_type": "height_border_detection_debug", "role": "diagnostic"},
+    "height_border_split_debug": {"substage_id": "blob_splitting", "display_label": "Height-border split debug", "order_index": 6, "semantic_type": "height_border_split_debug", "role": "diagnostic"},
+    "height_border_fragments_overlay": {"substage_id": "blob_splitting", "display_label": "Height-border fragments", "order_index": 6, "semantic_type": "height_border_fragments_overlay", "role": "logical_support"},
+    "height_border_fragments_mask": {"substage_id": "blob_splitting", "display_label": "Height-border fragments mask", "order_index": 6, "semantic_type": "height_border_fragments_mask", "role": "logical_support"},
+    "height_split_blob_fragments_overlay": {"substage_id": "blob_splitting", "display_label": "Height-split blobs", "order_index": 6, "semantic_type": "height_split_fragments_overlay", "role": "logical_support"},
+    "height_split_blob_fragments_mask": {"substage_id": "blob_splitting", "display_label": "Height-split blobs mask", "order_index": 6, "semantic_type": "height_split_fragments_mask", "role": "logical_support"},
+    "height_split_debug": {"substage_id": "blob_splitting", "display_label": "Blob-splitting debug", "order_index": 6, "semantic_type": "height_split_debug", "role": "diagnostic"},
+    "fragment_merge_debug": {"substage_id": "fragment_merge", "display_label": "Fragment-merge debug", "order_index": 7, "semantic_type": "fragment_merge_debug", "role": "diagnostic"},
+    "blob_height_clusters": {"substage_id": "height_clustering", "display_label": "Height clusters", "order_index": 8, "semantic_type": "height_clusters", "role": "diagnostic"},
+    "blob_cluster_score_table": {"substage_id": "height_clustering", "display_label": "Cluster score table", "order_index": 8, "semantic_type": "cluster_score_table", "role": "diagnostic"},
+    "blob_cluster_selection_debug": {"substage_id": "height_clustering", "display_label": "Cluster-scoring debug", "order_index": 8, "semantic_type": "cluster_scoring_debug", "role": "diagnostic"},
+    "selected_blob_cluster_mask": {"substage_id": "candidate_support_refinement", "display_label": "Selected logical support", "order_index": 9, "semantic_type": "selected_cluster_mask", "role": "logical_support"},
+    "selected_blob_cluster_pre_refine_mask": {"substage_id": "candidate_support_refinement", "display_label": "Selected cluster pre-refine", "order_index": 9, "semantic_type": "selected_cluster_pre_refine", "role": "logical_support"},
+    "selected_blob_cluster_refined_mask": {"substage_id": "candidate_support_refinement", "display_label": "Selected cluster refined", "order_index": 9, "semantic_type": "selected_cluster_refined", "role": "fit_support"},
+    "support_removed_by_candidate_refinement": {"substage_id": "candidate_support_refinement", "display_label": "Removed by candidate refinement", "order_index": 9, "semantic_type": "support_removed_by_candidate_refinement", "role": "diagnostic"},
+    "candidate_support_refinement_debug": {"substage_id": "candidate_support_refinement", "display_label": "Candidate-refinement debug", "order_index": 9, "semantic_type": "candidate_support_refinement_debug", "role": "diagnostic"},
+    "belt_base_mask": {"substage_id": "stripes", "display_label": "Belt base mask", "order_index": 10, "semantic_type": "belt_base_mask", "role": "logical_support"},
+    "belt_stripes_mask": {"substage_id": "stripes", "display_label": "Belt stripes mask", "order_index": 10, "semantic_type": "belt_stripes_mask", "role": "diagnostic"},
+    "belt_stripe_candidates_overlay": {"substage_id": "stripes", "display_label": "Stripe candidate components", "order_index": 10, "semantic_type": "belt_stripe_candidates_overlay", "role": "diagnostic"},
+    "belt_stripe_components": {"substage_id": "stripes", "display_label": "Stripe component summary", "order_index": 10, "semantic_type": "belt_stripe_components", "role": "diagnostic"},
+    "unknown_low_gradient_mask": {"substage_id": "stripes", "display_label": "Unknown low-gradient mask", "order_index": 10, "semantic_type": "unknown_low_gradient_mask", "role": "diagnostic"},
+    "surface_suppression_mask": {"substage_id": "stripes", "display_label": "Surface suppression mask", "order_index": 10, "semantic_type": "surface_suppression_mask", "role": "suppression_mask"},
+    "object_search_domain_mask": {"substage_id": "stripes", "display_label": "Object search domain", "order_index": 10, "semantic_type": "object_search_domain_mask", "role": "diagnostic"},
+    "belt_above_belt_mask": {"substage_id": "stripes", "display_label": "Above-belt mask", "order_index": 10, "semantic_type": "belt_above_belt_mask", "role": "diagnostic"},
+    "belt_wide_object_mask": {"substage_id": "stripes", "display_label": "Wide-object mask", "order_index": 10, "semantic_type": "belt_wide_object_mask", "role": "diagnostic"},
+    "support_removed_by_stripe_filter": {"substage_id": "stripes", "display_label": "Removed by stripe suppression", "order_index": 10, "semantic_type": "support_removed_by_stripe_filter", "role": "diagnostic"},
+    "belt_stripe_filter_debug": {"substage_id": "stripes", "display_label": "Stripe-filter debug", "order_index": 10, "semantic_type": "stripe_filter_debug", "role": "diagnostic"},
+    "selected_reference_support_mask": {"substage_id": "final_support", "display_label": "Final selected support", "order_index": 11, "semantic_type": "final_selected_support_mask", "role": "logical_support"},
+    "final_selected_support_mask": {"substage_id": "final_support", "display_label": "Final selected support", "order_index": 11, "semantic_type": "final_selected_support_mask", "role": "logical_support"},
+    "reference_model_support_mask": {"substage_id": "final_support", "display_label": "Reference-model fit support", "order_index": 11, "semantic_type": "reference_model_support_mask", "role": "fit_support"},
+    "reference_surface_selected_mask": {"substage_id": "final_support", "display_label": "Selected support alias", "order_index": 11, "semantic_type": "reference_surface_selected_mask", "role": "logical_support"},
+    "reference_suppression_mask": {"substage_id": "final_support", "display_label": "Reference suppression mask", "order_index": 11, "semantic_type": "reference_suppression_mask", "role": "suppression_mask"},
+    "final_support_debug": {"substage_id": "final_support", "display_label": "Final support debug", "order_index": 11, "semantic_type": "final_support_debug", "role": "diagnostic"},
+    "support_loss_waterfall": {"substage_id": "final_support", "display_label": "Support-loss waterfall", "order_index": 11, "semantic_type": "support_loss_waterfall", "role": "diagnostic"},
+    "belt_plane": {"substage_id": "plane_fit", "display_label": "Reference model", "order_index": 12, "semantic_type": "reference_model_json", "role": "final"},
+    "reference_model": {"substage_id": "plane_fit", "display_label": "Reference model", "order_index": 12, "semantic_type": "reference_model_json", "role": "final"},
+    "plane_inlier_mask": {"substage_id": "plane_fit", "display_label": "Plane inliers", "order_index": 12, "semantic_type": "plane_inlier_mask", "role": "fit_support"},
+    "final_plane_inlier_mask": {"substage_id": "plane_fit", "display_label": "Final plane inliers", "order_index": 12, "semantic_type": "final_plane_inlier_mask", "role": "fit_support"},
+    "belt_plane_residuals": {"substage_id": "plane_fit", "display_label": "Plane residual heatmap", "order_index": 12, "semantic_type": "plane_residual_heatmap", "role": "diagnostic"},
+    "plane_residual_heatmap": {"substage_id": "plane_fit", "display_label": "Plane residual heatmap", "order_index": 12, "semantic_type": "plane_residual_heatmap", "role": "diagnostic"},
+    "plane_residual_histogram": {"substage_id": "plane_fit", "display_label": "Plane residual histogram", "order_index": 12, "semantic_type": "plane_residual_histogram", "role": "diagnostic"},
+    "plane_fit_debug": {"substage_id": "plane_fit", "display_label": "Plane-fit debug", "order_index": 12, "semantic_type": "plane_fit_debug", "role": "diagnostic"},
+    "selected_surface_debug": {"substage_id": "final_support", "display_label": "Selected support debug", "order_index": 11, "semantic_type": "selected_surface_debug", "role": "diagnostic"},
+}
+
+
+def _detect_reference_artifact_contract(artifact_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    contract = dict(_DETECT_REFERENCE_SUBSTAGE_SPECS.get(artifact_id, {}))
+    if not contract:
+        if artifact_id.endswith("_mask"):
+            contract["role"] = "diagnostic"
+            contract["semantic_type"] = "mask"
+        elif artifact_id.endswith("_debug"):
+            contract["role"] = "diagnostic"
+            contract["semantic_type"] = "debug_json"
+        elif artifact_id.endswith("_overlay"):
+            contract["role"] = "diagnostic"
+            contract["semantic_type"] = "overlay"
+        contract.setdefault("substage_id", "normalization")
+        contract.setdefault("display_label", str(metadata.get("display_label") or artifact_id.replace("_", " ")))
+        contract.setdefault("order_index", 13)
+    contract.setdefault("coordinate_space", str(metadata.get("coordinate_space") or "heightmap_pixel"))
+    contract.setdefault("kind", str(metadata.get("kind") or "unknown"))
+    contract.setdefault("warnings", list(metadata.get("warnings") or []))
+    contract.setdefault("fallback_reason", metadata.get("fallback_reason"))
+    role = str(contract.get("role") or "diagnostic")
+    contract["is_authoritative_for_fit"] = role == "fit_support"
+    contract["is_authoritative_for_suppression"] = role == "suppression_mask"
+    contract["is_measurement_authoritative"] = False
+    return contract
+
+
+def _make_debug_compact_summary(*, title: str, input_count: int | None = None, output_count: int | None = None, selected_id: str | int | None = None, selected_reason: str | None = None, rejected_reasons: dict[str, int] | None = None, fallback_used: bool | None = None, fallback_reason: str | None = None, warnings: list[str] | None = None, key_parameters: dict[str, Any] | None = None, affected_downstream_artifacts: list[str] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "title": title,
+        "input_count": input_count,
+        "output_count": output_count,
+        "selected_id": selected_id,
+        "selected_reason": selected_reason,
+        "rejected_reasons": rejected_reasons or {},
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "warnings": warnings or [],
+        "key_parameters": key_parameters or {},
+        "affected_downstream_artifacts": affected_downstream_artifacts or [],
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _support_loss_row(
+    *,
+    row_id: str,
+    label: str,
+    substage_id: str,
+    mask_artifact_id: str | None,
+    mask: np.ndarray | None,
+    previous_mask: np.ndarray | None,
+    valid_roi_mask: np.ndarray,
+    parameters_used_summary: dict[str, Any] | None = None,
+    largest_loss_reason: str | None = None,
+    status: str = "ok",
+    warning: str | None = None,
+    fallback_reason: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    valid_total = max(1, int(np.count_nonzero(valid_roi_mask)))
+    area_px = None if mask is None else int(np.count_nonzero(np.asarray(mask, dtype=bool) & valid_roi_mask))
+    prev_area_px = None if previous_mask is None else int(np.count_nonzero(np.asarray(previous_mask, dtype=bool) & valid_roi_mask))
+    percent_valid_roi = None if area_px is None else float(area_px / valid_total)
+    percent_previous = None if area_px is None or prev_area_px in (None, 0) else float(area_px / max(1, prev_area_px))
+    delta_px = None if area_px is None or prev_area_px is None else int(area_px - prev_area_px)
+    delta_valid = None if percent_valid_roi is None or previous_mask is None or prev_area_px is None else float(percent_valid_roi - float(prev_area_px / valid_total))
+    return {
+        "row_id": row_id,
+        "label": label,
+        "substage_id": substage_id,
+        "mask_artifact_id": mask_artifact_id,
+        "area_px": area_px,
+        "percent_valid_roi": percent_valid_roi,
+        "percent_previous": percent_previous,
+        "delta_px_from_previous": delta_px,
+        "delta_percent_valid_roi_from_previous": delta_valid,
+        "largest_loss_reason": largest_loss_reason,
+        "status": status,
+        "warning": warning,
+        "fallback_reason": fallback_reason,
+        "parameters_used_summary": parameters_used_summary or {},
+        "notes": notes,
+    }
+
+
+def _runtime_trace_mask_unit(
+    context: PipelineContext,
+    *,
+    unit_id: str,
+    stage_id: str,
+    parent_id: str | None = None,
+    status: str = "completed",
+    parameters: dict[str, Any] | None = None,
+    input_artifacts: list[str] | None = None,
+    output_artifacts: list[str] | None = None,
+    metrics: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+) -> None:
+    with context.trace_unit(unit_id, stage_id=stage_id, parent_id=parent_id) as trace:
+        trace.add_parameters(dict(parameters or {}))
+        for artifact_id in input_artifacts or []:
+            trace.add_input_artifact(artifact_id)
+        for artifact_id in output_artifacts or []:
+            trace.add_output_artifact(artifact_id)
+        for key, value in dict(metrics or {}).items():
+            trace.add_metric(key, value)
+        for key, value in dict(diagnostics or {}).items():
+            trace.add_diagnostic(key, value)
+        for message in warnings or []:
+            trace.warn(message)
+        normalized_status = str(status or "completed").strip().lower()
+        if normalized_status in {"skipped", "skip"}:
+            trace.skip((diagnostics or {}).get("skip_reason") if isinstance(diagnostics, dict) else None)
+        elif normalized_status in {"warning", "warn"}:
+            trace.set_status("warning")
+        elif normalized_status in {"failed", "error"}:
+            trace.set_status("failed")
+        else:
+            trace.set_status("completed")
+
+
+def _numeric_summary(values: list[float] | np.ndarray | None) -> dict[str, float]:
+    if values is None:
+        return {}
+    try:
+        arr = np.asarray(values, dtype=np.float64)
+    except Exception:
+        return {}
+    if arr.size == 0:
+        return {}
+    return {
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "mean": float(np.mean(arr)),
+    }
+
+
+def _enrich_detect_reference_processing_artifacts(context: PipelineContext) -> None:
+    for artifact in context.processing_artifacts:
+        if str(artifact.get("stage_id") or "") != "detect_belt_plane":
+            continue
+        metadata = dict(artifact.get("metadata") or {})
+        contract = _detect_reference_artifact_contract(str(artifact.get("artifact_id") or ""), metadata)
+        metadata.update({
+            "artifact_id": artifact.get("artifact_id"),
+            "stage_id": artifact.get("stage_id"),
+            "kind": artifact.get("kind"),
+            **contract,
+        })
+        metadata.setdefault("source_artifact_ids", list(artifact.get("source_artifact_ids") or []))
+        metadata.setdefault("display_label", artifact.get("title"))
+        artifact["metadata"] = metadata
+
+
+def _resolve_background_detection_strategy(
+    background_detection_strategy: str,
+    support_selection_method: str | None,
+) -> str:
+    value = str(support_selection_method or "").strip().lower()
+    if value == "low_gradient_depth_plateaus":
+        return "low_gradient_depth_plateaus"
+    if value == "low_gradient_bg_and_stripes":
+        return "low_gradient_bg_and_stripes"
+    if value == "low_gradient_surface":
+        return "low_gradient_surface"
+    if value == "blob_height_clusters":
+        return "low_gradient_blob_height_clusters"
+    if value == "percentile_or_legacy":
+        return "nearest_percentile"
+    return str(background_detection_strategy or "low_gradient_surface")
+
+
+def _support_selection_method_from_strategy(background_detection_strategy: str) -> str:
+    strategy = str(background_detection_strategy or "").strip().lower()
+    if strategy == "low_gradient_depth_plateaus":
+        return "low_gradient_depth_plateaus"
+    if strategy == "low_gradient_bg_and_stripes":
+        return "low_gradient_bg_and_stripes"
+    if strategy == "low_gradient_surface":
+        return "low_gradient_surface"
+    if strategy == "low_gradient_blob_height_clusters":
+        return "blob_height_clusters"
+    return "percentile_or_legacy"
+
+
+def _normalize_reference_suppression_mask_policy(value: str | None) -> str:
+    policy = str(value or "auto").strip().lower()
+    if policy in {"auto", "selected_support", "expanded_support", "final_model_inliers"}:
+        return policy
+    return "auto"
+
+
+def _resolve_reference_suppression_mask(
+    policy: str,
+    *,
+    selected_support_mask: np.ndarray,
+    expanded_support_mask: np.ndarray,
+    final_model_inlier_mask: np.ndarray,
+) -> np.ndarray:
+    if policy == "selected_support":
+        return selected_support_mask.copy()
+    if policy == "expanded_support":
+        if np.count_nonzero(expanded_support_mask):
+            return expanded_support_mask.copy()
+        if np.count_nonzero(selected_support_mask):
+            return selected_support_mask.copy()
+        return final_model_inlier_mask.copy()
+    if policy == "final_model_inliers":
+        if np.count_nonzero(final_model_inlier_mask):
+            return final_model_inlier_mask.copy()
+        if np.count_nonzero(expanded_support_mask):
+            return expanded_support_mask.copy()
+        return selected_support_mask.copy()
+    if np.count_nonzero(selected_support_mask):
+        return selected_support_mask.copy()
+    if np.count_nonzero(expanded_support_mask):
+        return expanded_support_mask.copy()
+    return final_model_inlier_mask.copy()
+
+
+def _reference_method_preset_id(
+    *,
+    background_detection_strategy: str,
+    blob_component_mode: str,
+    blob_split_method: str,
+    reference_surface_model: str,
+    reference_suppression_mask_policy: str,
+    blob_component_use_smoothed_z: bool,
+    blob_neighbor_z_tolerance_mm: float,
+) -> str | None:
+    if (
+        background_detection_strategy == "low_gradient_depth_plateaus"
+        and reference_surface_model == "auto"
+        and reference_suppression_mask_policy == "auto"
+    ):
+        return "current_default_plateau_plane"
+    if (
+        background_detection_strategy == "low_gradient_blob_height_clusters"
+        and blob_component_mode == "xy_only"
+        and blob_split_method == "height_borders"
+        and reference_surface_model == "auto"
+        and reference_suppression_mask_policy == "auto"
+    ):
+        return "blob_xy_height_borders"
+    if (
+        background_detection_strategy == "low_gradient_blob_height_clusters"
+        and blob_component_mode == "height_aware"
+        and blob_split_method == "disabled"
+        and not blob_component_use_smoothed_z
+        and abs(float(blob_neighbor_z_tolerance_mm) - 2.0) < 1e-6
+        and reference_surface_model == "auto"
+        and reference_suppression_mask_policy == "auto"
+    ):
+        return "blob_height_aware_auto"
+    if (
+        background_detection_strategy == "low_gradient_blob_height_clusters"
+        and blob_component_mode == "height_aware"
+        and blob_split_method == "disabled"
+        and not blob_component_use_smoothed_z
+        and abs(float(blob_neighbor_z_tolerance_mm) - 2.0) < 1e-6
+        and reference_surface_model == "constant_z"
+        and reference_suppression_mask_policy == "selected_support"
+    ):
+        return "blob_height_aware_constant_z"
+    if (
+        background_detection_strategy == "low_gradient_blob_height_clusters"
+        and blob_component_mode == "height_aware"
+        and blob_split_method == "disabled"
+        and reference_surface_model == "plane"
+        and reference_suppression_mask_policy == "final_model_inliers"
+    ):
+        return "blob_height_aware_strict_plane_qa"
+    return None
 
 
 def _height_semantic_meta(
@@ -300,10 +653,12 @@ class LoadHeightmapCaptureStage:
         npz_name = "heightmap_frame.npz"
         preview_name = "heightmap_input_preview.png"
         meta_name = "heightmap_frame.metadata.json"
+        source_json_name = "source_json.json"
         raw_semantic_raster = "raw_sensor_z.values.f32"
         save_heightmap_npz(frame, output_dir / npz_name)
         write_heightmap_preview_png(frame.z_mm, frame.valid_mask, output_dir / preview_name)
         write_heightmap_metadata_json(frame, output_dir / meta_name, extra={"source_file": height_file})
+        (output_dir / source_json_name).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         frame.z_mm.astype(np.float32).tofile(output_dir / raw_semantic_raster)
         # Backward-compatible alias while studio migrates to semantic-first paths.
         frame.z_mm.astype(np.float32).tofile(output_dir / "raw_heightmap.values.f32")
@@ -318,7 +673,74 @@ class LoadHeightmapCaptureStage:
         if isinstance(reflectance_file, str):
             files_payload["reflectance"] = reflectance_file
         context.set_artifact("files", files_payload)
+        context.set_artifact("input_source_modalities", list(context.get_artifact("modalities", []) or []))
 
+        valid_pixel_count = int(np.count_nonzero(frame.valid_mask))
+        total_pixels = int(frame.valid_mask.size)
+        valid_ratio = float(valid_pixel_count / max(1, total_pixels))
+
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="input.acquisition_metadata",
+            stage_id="input",
+            parent_id="input",
+            output_artifacts=["source_json"],
+            metrics={
+                "frame_count": int(context.get_artifact("frame_count", 1) or 1),
+                "source_modality_count": int(len(list(context.get_artifact("modalities", []) or []))),
+                "asset_count": int(len(list(context.get_artifact("assets", []) or []))),
+            },
+            diagnostics={
+                "session_id": metadata.get("session_id"),
+                "take_id": metadata.get("take_id"),
+                "modalities": list(context.get_artifact("modalities", []) or []),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="input.raw_heightmap",
+            stage_id="input",
+            parent_id="input",
+            input_artifacts=["source_json"],
+            output_artifacts=["raw_heightmap_preview"],
+            metrics={
+                "width_px": int(frame.z_mm.shape[1]),
+                "height_px": int(frame.z_mm.shape[0]),
+                "valid_pixel_count": valid_pixel_count,
+                "invalid_pixel_count": int(total_pixels - valid_pixel_count),
+                "valid_pixel_ratio": valid_ratio,
+                "raw_z_min_mm": float(input_min_mm),
+                "raw_z_max_mm": float(input_max_mm),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="input.valid_mask",
+            stage_id="input",
+            parent_id="input",
+            input_artifacts=["raw_heightmap_preview"],
+            output_artifacts=["valid_mask"],
+            metrics={
+                "width_px": int(frame.valid_mask.shape[1]),
+                "height_px": int(frame.valid_mask.shape[0]),
+                "valid_pixel_count": valid_pixel_count,
+                "invalid_pixel_count": int(total_pixels - valid_pixel_count),
+                "valid_pixel_ratio": valid_ratio,
+            },
+        )
+
+        context.add_processing_artifact(
+            artifact_id="source_heightmap_preview",
+            stage_id="input",
+            kind="image",
+            title="Source height preview",
+            path=preview_name,
+            mime_type="image/png",
+            preview_available=True,
+            projection_type="heightmap",
+            projection_coordinate_system={"pixel_per_mm": 1.0 / max(frame.x_resolution_mm, 1e-6)},
+            metadata={"source": "native_pipeline", "producer": self.name, "artifact_alias": "heightmap"},
+        )
         context.add_processing_artifact(
             artifact_id="heightmap",
             stage_id="input",
@@ -365,6 +787,16 @@ class LoadHeightmapCaptureStage:
             },
         )
         context.add_processing_artifact(
+            artifact_id="source_json",
+            stage_id="input",
+            kind="json",
+            title="Source metadata JSON",
+            path=source_json_name,
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **(metadata if isinstance(metadata, dict) else {})}),
+        )
+        context.add_processing_artifact(
             artifact_id="raw_sensor_z_raster",
             stage_id="input",
             kind="file",
@@ -393,6 +825,7 @@ class ApplyCalibration25DStage:
 
     def run(self, context: PipelineContext) -> None:
         metadata = context.get_artifact("metadata", {})
+        output_dir: Path = context.require_artifact("output_dir")
         calibration = {
             "x_resolution_mm": float(((metadata.get("calibration") or {}).get("x_resolution_mm") or 1.0)),
             "y_resolution_mm": float(((metadata.get("calibration") or {}).get("profile_distance_mm") or 1.0)),
@@ -402,11 +835,59 @@ class ApplyCalibration25DStage:
             "tilt_correction": None,
         }
         context.set_artifact("heightmap_calibration", calibration)
+        source_metadata_name = "source_metadata.json"
+        (output_dir / source_metadata_name).write_text(json.dumps(calibration, indent=2), encoding="utf-8")
+        context.add_processing_artifact(
+            artifact_id="source_metadata",
+            stage_id="input",
+            kind="json",
+            title="Source calibration context",
+            path=source_metadata_name,
+            mime_type="application/json",
+            preview_available=True,
+            metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **calibration}),
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="input.calibration_context",
+            stage_id="input",
+            parent_id="input",
+            input_artifacts=["source_json"],
+            output_artifacts=["source_metadata"],
+            metrics={
+                "x_resolution_mm": float(calibration["x_resolution_mm"]),
+                "y_resolution_mm": float(calibration["y_resolution_mm"]),
+                "z_scale": float(calibration["z_scale"]),
+                "z_offset": float(calibration["z_offset"]),
+            },
+            diagnostics={
+                "coordinate_system": calibration.get("coordinate_system"),
+                "calibration_resolution_source": context.get_artifact("calibration_resolution_source", "metadata"),
+            },
+        )
+        frame: HeightmapFrame = context.require_artifact("heightmap_frame")
+        valid_pixel_count = int(np.count_nonzero(frame.valid_mask))
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="input",
+            stage_id="input",
+            input_artifacts=["source_json"],
+            output_artifacts=["source_heightmap_preview", "source_json", "source_metadata", "valid_mask"],
+            metrics={
+                "width_px": int(frame.z_mm.shape[1]),
+                "height_px": int(frame.z_mm.shape[0]),
+                "valid_pixel_count": valid_pixel_count,
+                "valid_pixel_ratio": float(valid_pixel_count / max(1, frame.valid_mask.size)),
+                "source_modality_count": int(len(list(context.get_artifact("modalities", []) or []))),
+            },
+            diagnostics={"coordinate_system": calibration.get("coordinate_system")},
+        )
 
 
 @dataclass
 class DetectBeltPlaneStage:
     background_detection_strategy: str = "low_gradient_surface"
+    support_selection_method: str | None = None
     plane_fit_roi: dict[str, Any] | None = None
     plane_fit_downsample: int = 30000
     background_selection_mode: str = "nearest_percentile"
@@ -478,22 +959,17 @@ class DetectBeltPlaneStage:
     belt_stripe_filter_k_mad: float = 3.0
     belt_stripe_filter_fixed_threshold_mm: float = 10.0  # ~ 0.7 × typical rib height (14 mm) → clean belt/rib separation
     belt_stripe_filter_min_stripe_fraction: float = 0.02  # below this we treat the BG plateau as a clean belt and skip the split
-    # Apply the morphological top-hat globally (across valid_for_fit) instead
-    # of restricting it to the BG plateau. Required so stripes that fall
-    # outside the BG plateau band (i.e. above belt-z) are still recognised
-    # and excluded from expanded_plane_mask + foreground candidates. The
-    # opening (= dilate(erode)) version is used so object edges are not
-    # false-flagged as stripes (object_opening ≈ object_z near edges →
-    # altitude ≈ 0; only narrow features like chevron ribs survive).
+    # Apply the local-min top-hat globally (across valid_for_fit) instead of
+    # restricting it to the BG plateau. Required so stripes that fall outside
+    # the BG plateau band (i.e. above belt-z) are still recognised and excluded
+    # from expanded_plane_mask + foreground candidates. Baseline = erode(z) so
+    # altitude = z − local_min(window); narrow raised ribs survive, and the
+    # baseline never sits above the pixel or its neighbours in the window.
     belt_stripe_filter_scope: str = "global"  # global | bg_plateau
-    belt_stripe_filter_baseline_mode: str = "opening"  # opening | erosion (true top-hat vs local-min-only)
     # ── Complementary z-floor + shape pass ──────────────────────────────
-    # The opening-based top-hat alone fails for two cases:
-    #   1. A stripe that becomes locally wider than the kernel — the opening
-    #      preserves it (opening ≈ stripe_z) so altitude ≈ 0.
-    #   2. A stripe adjacent to a tall object — the dilate step of the
-    #      opening pulls object_z into the baseline at the stripe pixel,
-    #      so altitude turns negative.
+    # The erosion top-hat alone fails for one common case:
+    #   1. A stripe that becomes locally wider than the kernel — erosion
+    #      baseline ≈ stripe_z inside the wide rib, so altitude ≈ 0.
     # The shape-based pass sidesteps both: it classifies every above-belt
     # pixel as "raised" (purely a z-threshold over a robust belt-z estimate
     # taken from the BG plateau median), then carves out genuine objects
@@ -530,9 +1006,90 @@ class DetectBeltPlaneStage:
     belt_stripe_filter_z_floor_fallback_lower_percentile: float = 10.0  # used when no BG plateau is available
     belt_stripe_filter_z_floor_fallback_upper_percentile: float = 25.0
     belt_stripe_filter_warn_removed_fraction: float = 0.40          # warn if BG-scope filter removes > this fraction of BG plateau
+    stripe_min_height_over_base_mm: float = 6.0
+    stripe_max_height_over_base_mm: float = 40.0
+    stripe_min_width_mm: float = 5.0
+    stripe_max_width_mm: float = 80.0
+    stripe_min_height_width_ratio: float = 0.03
+    stripe_max_height_width_ratio: float = 2.0
+    stripe_max_width_cv: float = 0.75
+    stripe_min_length_width_ratio: float = 1.5
+    stripe_max_area_fraction: float = 0.08
+    stripe_component_min_overlap_fraction: float = 0.50
+    stripe_rule_overlap_enabled: bool = True
+    stripe_rule_height_range_enabled: bool = True
+    stripe_rule_width_range_enabled: bool = True
+    stripe_rule_height_width_ratio_enabled: bool = True
+    stripe_rule_width_cv_enabled: bool = True
+    stripe_rule_length_width_ratio_enabled: bool = True
+    stripe_rule_area_fraction_enabled: bool = True
+    stripe_height_mm: float = 20.0                                   # target belt-stripe height above the belt-bg baseline (bg_and_stripes blob classification)
+    stripe_height_tolerance_mm: float = 15.0                         # +/- tolerance band around stripe_height_mm for blob-level stripe classification
     low_gradient_plateau_robust_band_mad_k: float = 3.0             # k for median ± k·MAD fallback band in plateau detection
     low_gradient_plateau_detection_min_count_floor: int = 25        # absolute floor on the laxer per-bin detection threshold
     low_gradient_plateau_detection_min_count_fraction: float = 0.25 # fraction of min_pixels used as the detection floor
+    # ── Experimental low-gradient blob + height-cluster strategy ───────────
+    blob_cluster_min_component_area: int = 250
+    blob_cluster_height_gap_mm: float = 8.0
+    blob_cluster_height_gap_mode: str = "adaptive"  # fixed | adaptive
+    blob_cluster_min_area_fraction: float = 0.10
+    blob_cluster_min_total_pixels: int = 1200
+    blob_cluster_max_z_mad_mm: float = 12.0
+    blob_cluster_merge_close_clusters: bool = True
+    blob_cluster_merge_gap_mm: float = 4.0
+    blob_cluster_area_weight: float = 1.0
+    blob_cluster_border_weight: float = 0.45
+    blob_cluster_constancy_weight: float = 0.75
+    blob_cluster_spatial_coverage_weight: float = 0.40
+    blob_cluster_depth_preference_weight: float = 0.20
+    blob_cluster_fragmentation_penalty: float = 0.25
+    blob_cluster_centrality_penalty: float = 0.20
+    blob_cluster_object_like_penalty: float = 0.25
+    blob_cluster_stripe_overlap_penalty: float = 0.20
+    blob_cluster_refine_by_mad: bool = True
+    blob_cluster_refine_mad_k: float = 2.5
+    blob_cluster_refine_floor_mm: float = 1.0
+    blob_cluster_refine_keep_border_support: bool = True
+    blob_cluster_fallback_strategy: str = "low_gradient_depth_plateaus"  # low_gradient_depth_plateaus | low_gradient_surface | constant_z | fail
+    blob_split_by_height_enabled: bool = True
+    blob_split_method: str = "height_borders"  # disabled | histogram_gap | height_borders | height_borders_then_histogram
+    blob_split_min_height_range_mm: float = 8.0
+    blob_split_min_pixels: int = 300
+    blob_split_gap_mm: float = 4.0
+    blob_split_mode: str = "histogram_gap"  # histogram_gap
+    blob_split_hist_bins: int = 48
+    blob_split_min_band_fraction: float = 0.08
+    blob_split_min_band_pixels: int = 150
+    blob_split_merge_gap_mm: float = 2.0
+    blob_split_refine_morphology: bool = True
+    blob_split_open_kernel: int = 1
+    blob_split_close_kernel: int = 3
+    blob_split_height_border_enabled: bool = True
+    blob_split_height_border_mode: str = "morphological_gradient"  # sobel_gradient | local_range | morphological_gradient
+    blob_split_height_border_smoothing_kernel: int = 5
+    blob_split_height_border_threshold_mode: str = "percentile"  # percentile | fixed | otsu
+    blob_split_height_border_percentile: float = 85.0
+    blob_split_height_border_min_delta_mm: float = 4.0
+    blob_split_height_border_dilate_kernel: int = 3
+    blob_split_height_border_close_kernel: int = 3
+    blob_split_height_border_min_length_px: int = 20
+    blob_split_min_fragment_area_px: int = 300
+    blob_split_merge_weak_boundaries: bool = True
+    blob_split_merge_max_median_z_gap_mm: float = 3.0
+    blob_split_merge_max_boundary_strength_mm: float = 6.0
+    blob_split_merge_background_like_only: bool = True
+    blob_component_mode: str = "xy_only"  # xy_only | height_aware
+    blob_connectivity: int = 8
+    blob_neighbor_z_tolerance_mm: float = 3.0
+    blob_component_z_tolerance_mm: float = 8.0
+    blob_component_tolerance_mode: str = "fixed"  # fixed | mad_adaptive
+    blob_component_mad_k: float = 3.0
+    blob_component_mad_floor_mm: float = 1.0
+    blob_component_allow_gradual_slope: bool = True
+    blob_component_max_local_slope_mm_per_px: float = 3.0
+    blob_component_min_area_px: int = 300
+    blob_component_use_smoothed_z: bool = True
+    blob_component_z_smoothing_kernel: int = 3
     # ── Low-gradient surface (legacy strategy) tuning ────────────────────
     # These were previously hardcoded inside the strategy branch.
     low_gradient_surface_support_z_mad_multiplier: float = 2.5  # extends candidate's z window by k·MAD
@@ -555,6 +1112,7 @@ class DetectBeltPlaneStage:
     reference_surface_constancy_weight: float = 0.5
     reference_surface_area_weight: float = 0.3
     reference_surface_model: str = "auto"
+    reference_suppression_mask_policy: str = "auto"
     reference_surface_max_plane_residual_p95_mm: float = 3.0
     reference_surface_height_gate_enabled: bool = True
     reference_surface_height_gate_margin_mm: float = 8.0
@@ -571,6 +1129,14 @@ class DetectBeltPlaneStage:
     def run(self, context: PipelineContext) -> None:
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
         output_dir: Path = context.require_artifact("output_dir")
+        background_detection_strategy = _resolve_background_detection_strategy(
+            self.background_detection_strategy,
+            self.support_selection_method,
+        )
+        support_selection_method = _support_selection_method_from_strategy(background_detection_strategy)
+        reference_suppression_mask_policy = _normalize_reference_suppression_mask_policy(
+            self.reference_suppression_mask_policy,
+        )
         write_heightmap_preview_png(frame.z_mm, frame.valid_mask, output_dir / "raw_heightmap_preview.png")
         raw_min_mm, raw_max_mm = _valid_min_max_mm(frame.z_mm, frame.valid_mask)
         valid_mask_u8 = (frame.valid_mask.astype(np.uint8) * 255)
@@ -627,7 +1193,12 @@ class DetectBeltPlaneStage:
         # stages (segmentation reads `belt_stripes_mask_array` to suppress
         # surface texture from foreground detection).
         belt_base_mask = candidate_mask.copy()
+        low_grad_mask = np.zeros_like(valid_for_fit, dtype=bool)
         stripes_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        belt_bg_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        unknown_low_gradient_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        surface_suppression_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        object_search_domain_mask = valid_for_fit.copy()
         inferred_depth_convention = "unknown"
         candidate_coverage = 0.0
         z_thresholds: dict[str, float] = {}
@@ -635,6 +1206,28 @@ class DetectBeltPlaneStage:
         active_height_gate_mask = valid_for_fit.copy()
         height_gate_debug: dict[str, Any] = {"enabled": bool(self.reference_surface_height_gate_enabled), "status": "not_evaluated"}
         gradient_debug: dict[str, Any] = {}
+        low_gradient_component_rows: list[dict[str, Any]] = []
+        belt_bg_component_rows: list[dict[str, Any]] = []
+        belt_stripe_component_rows: list[dict[str, Any]] = []
+        stripe_info: dict[str, Any] = {"enabled": bool(self.belt_stripe_filter_enabled), "applied": False, "skip_reason": "disabled"}
+        altitude_hist_payload: dict[str, Any] = {"sample_count": 0, "bin_counts": [], "bin_edges": [], "threshold_value_mm": 0.0, "direction_used": str(self.belt_stripe_filter_direction)}
+        baseline_map = np.zeros_like(frame.z_mm, dtype=np.float32)
+        altitude_map = np.zeros_like(frame.z_mm, dtype=np.float32)
+        filter_scope = str(self.belt_stripe_filter_scope or "global").strip().lower()
+        selected_cluster: dict[str, Any] | None = None
+        selected_pre_refine_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        selected_refined_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        blob_rows: list[dict[str, Any]] = []
+        fragment_rows: list[dict[str, Any]] = []
+        blob_labels = np.zeros_like(valid_for_fit, dtype=np.int32)
+        fragment_labels = np.zeros_like(valid_for_fit, dtype=np.int32)
+        border_cut_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        border_fragment_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        height_aware_rejected_edge_mask = np.zeros_like(valid_for_fit, dtype=bool)
+        height_aware_connectivity_debug: dict[str, Any] = {}
+        blob_component_mode_used = str(self.blob_component_mode)
+        fallback_used = False
+        fallback_reason: str | None = None
         cand_z_mad = 0.0
         effective_residual_threshold_mm = float(self.plane_fit_residual_threshold_mm)
 
@@ -659,9 +1252,9 @@ class DetectBeltPlaneStage:
                 gap_floor_mm=float(self.reference_surface_height_gate_gap_floor_mm),
                 gap_ratio=float(self.reference_surface_height_gate_gap_ratio),
             )
-            active_height_gate_mask = height_gate_mask if self.background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus"} else valid_for_fit
+            active_height_gate_mask = height_gate_mask if background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus", "low_gradient_blob_height_clusters", "low_gradient_bg_and_stripes"} else valid_for_fit
 
-            if self.background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus"}:
+            if background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus", "low_gradient_blob_height_clusters", "low_gradient_bg_and_stripes"}:
                 grad = _compute_depth_gradient(
                     frame.z_mm,
                     frame.valid_mask,
@@ -688,7 +1281,7 @@ class DetectBeltPlaneStage:
                 raised_candidate_rejected_mask = np.zeros_like(valid_for_fit, dtype=bool)
                 write_heightmap_preview_png(grad, valid_for_fit, output_dir / "depth_gradient_magnitude.png")
                 cv2.imwrite(str(output_dir / "low_gradient_mask.png"), (low_grad_mask.astype(np.uint8) * 255))
-                if self.background_detection_strategy == "low_gradient_surface":
+                if background_detection_strategy == "low_gradient_surface":
                     lg_result, selected_label = _select_low_gradient_component(
                         low_grad_mask=low_grad_mask,
                         gradient=grad,
@@ -735,14 +1328,910 @@ class DetectBeltPlaneStage:
                         "height_gate": height_gate_debug,
                     }
                     labels = np.asarray(lg_result.get("labels"), dtype=np.int32)
-                    cmap = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
-                    if labels.size:
-                        lut = cv2.applyColorMap((labels % 251).astype(np.uint8), cv2.COLORMAP_TURBO)
-                        cmap = lut
-                        cmap[labels == 0] = (0, 0, 0)
+                    cmap = _label_colormap_overlay(labels)
                     cv2.imwrite(str(output_dir / "low_gradient_components_overlay.png"), cmap)
                     (output_dir / "low_gradient_components.json").write_text(json.dumps(lg_result.get("candidates", []), indent=2), encoding="utf-8")
                     (output_dir / "reference_surface_candidates.json").write_text(json.dumps(lg_result.get("candidates", []), indent=2), encoding="utf-8")
+                    (output_dir / "gradient_debug.json").write_text(json.dumps(gradient_debug, indent=2), encoding="utf-8")
+                elif background_detection_strategy == "low_gradient_bg_and_stripes":
+                    blob_component_mode = _normalize_blob_component_mode(self.blob_component_mode)
+                    blob_result = _summarize_low_gradient_blobs(
+                        low_grad_mask=low_grad_mask,
+                        gradient=grad,
+                        z=frame.z_mm,
+                        valid_mask=valid_for_fit,
+                        roi_mask=roi_mask,
+                        height_gate_mask=height_gate_mask,
+                        min_component_area=max(1, int(self.blob_cluster_min_component_area)),
+                        component_mode=blob_component_mode,
+                        blob_connectivity=max(4, int(self.blob_connectivity)),
+                        blob_neighbor_z_tolerance_mm=float(self.blob_neighbor_z_tolerance_mm),
+                        blob_component_z_tolerance_mm=float(self.blob_component_z_tolerance_mm),
+                        blob_component_tolerance_mode=str(self.blob_component_tolerance_mode),
+                        blob_component_mad_k=float(self.blob_component_mad_k),
+                        blob_component_mad_floor_mm=float(self.blob_component_mad_floor_mm),
+                        blob_component_allow_gradual_slope=bool(self.blob_component_allow_gradual_slope),
+                        blob_component_max_local_slope_mm_per_px=float(self.blob_component_max_local_slope_mm_per_px),
+                        blob_component_min_area_px=max(1, int(self.blob_component_min_area_px)),
+                        blob_component_use_smoothed_z=bool(self.blob_component_use_smoothed_z),
+                        blob_component_z_smoothing_kernel=max(1, int(self.blob_component_z_smoothing_kernel)),
+                    )
+                    blob_labels = np.asarray(blob_result.get("labels"), dtype=np.int32)
+                    blob_rows = list(blob_result.get("blobs") or [])
+                    blob_component_mode_used = str(blob_result.get("component_mode") or blob_component_mode)
+                    blob_id_cmap = _label_colormap_overlay(blob_labels)
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_components_overlay.png"), blob_id_cmap)
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_id_mask.png"), (blob_labels % 255).astype(np.uint8))
+                    if blob_component_mode_used == "height_aware":
+                        cv2.imwrite(str(output_dir / "height_aware_blob_components_overlay.png"), blob_id_cmap)
+                        cv2.imwrite(str(output_dir / "height_aware_blob_id_mask.png"), (blob_labels % 255).astype(np.uint8))
+                    low_gradient_component_rows = []
+                    flat_candidates_pre_hessian = low_grad_mask & height_gate_mask
+                    flat_candidates = flat_candidates_pre_hessian.copy()
+                    hessian_dbg = {"enabled": bool(self.low_gradient_plateau_use_hessian_filter)}
+                    if self.low_gradient_plateau_use_hessian_filter and np.count_nonzero(flat_candidates):
+                        hessian = _compute_hessian_response(
+                            frame.z_mm,
+                            frame.valid_mask,
+                            smoothing_kernel=int(self.gradient_smoothing_kernel),
+                        )
+                        hvals = hessian[flat_candidates]
+                        hp = float(np.clip(self.low_gradient_plateau_hessian_percentile, 1.0, 99.0))
+                        hthr = float(np.percentile(hvals, hp)) if hvals.size else 0.0
+                        flat_candidates = flat_candidates & (hessian <= hthr)
+                        hessian_dbg.update(
+                            {
+                                "threshold_percentile": hp,
+                                "threshold_value": hthr,
+                                "input_count": int(np.count_nonzero(flat_candidates_pre_hessian)),
+                                "post_filter_count": int(np.count_nonzero(flat_candidates)),
+                            }
+                        )
+                    cv2.imwrite(str(output_dir / "flat_candidate_mask.png"), (flat_candidates.astype(np.uint8) * 255))
+                    flat_z_values = frame.z_mm[flat_candidates].astype(np.float64) if np.count_nonzero(flat_candidates) else np.asarray([], dtype=np.float64)
+                    plateau_result = _detect_depth_plateaus(
+                        z_values=flat_z_values,
+                        bins=max(16, int(self.low_gradient_plateau_hist_bins)),
+                        min_fraction=float(self.low_gradient_plateau_min_fraction),
+                        min_pixels=max(16, int(self.low_gradient_plateau_min_pixels)),
+                        smoothing_sigma_bins=float(self.low_gradient_plateau_smoothing_sigma_bins),
+                        peak_drop_ratio=float(self.low_gradient_plateau_peak_drop_ratio),
+                        robust_band_mad_k=float(self.low_gradient_plateau_robust_band_mad_k),
+                        detection_min_count_floor=int(self.low_gradient_plateau_detection_min_count_floor),
+                        detection_min_count_fraction=float(self.low_gradient_plateau_detection_min_count_fraction),
+                    )
+                    plateaus = list(plateau_result.get("plateaus", []))
+                    selected_plateau = _select_background_plateau(
+                        plateaus,
+                        min_area_fraction=float(self.low_gradient_plateau_select_min_area_fraction),
+                        mode=str(self.low_gradient_plateau_selection_mode),
+                        robust_band=plateau_result.get("robust_band"),
+                    )
+                    # Tier 1: classify whole blobs as belt_bg by how much of their own height range
+                    # overlaps the detected belt band, instead of pixel-filtering everything to a single
+                    # z-slice. Any blob (not just the largest) that clears the overlap threshold joins
+                    # belt_bg_mask in full, so a coherent belt component isn't chopped down to a sliver.
+                    selection_reason = "no_flat_candidates"
+                    band_z_lo: float | None = None
+                    band_z_hi: float | None = None
+                    if np.count_nonzero(flat_candidates) == 0:
+                        warnings.append("bg_and_stripes_no_flat_candidates")
+                    elif selected_plateau is None:
+                        robust_band = plateau_result.get("robust_band") or {}
+                        if robust_band.get("z_min") is not None and robust_band.get("z_max") is not None:
+                            band_z_lo = float(robust_band["z_min"])
+                            band_z_hi = float(robust_band["z_max"])
+                            selection_reason = "no_plateau_detected_fallback_to_robust_band"
+                        else:
+                            band_z_lo = float(np.min(flat_z_values))
+                            band_z_hi = float(np.max(flat_z_values))
+                            selection_reason = "no_plateau_detected_fallback_to_flat_candidates"
+                        warnings.append("bg_and_stripes_no_plateau_detected")
+                    else:
+                        band_z_lo = float(selected_plateau.get("z_min", float(np.min(flat_z_values))))
+                        band_z_hi = float(selected_plateau.get("z_max", float(np.max(flat_z_values))))
+                        selection_reason = f"selected_via_{str(self.low_gradient_plateau_selection_mode).lower()}"
+
+                    pixel_size_mm = float(max(frame.x_resolution_mm or 1.0, frame.y_resolution_mm or 1.0))
+                    belt_bg_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    bg_blob_ids: set[int] = set()
+                    if band_z_lo is not None and blob_labels.size:
+                        for row in blob_rows:
+                            component_id = int(row.get("blob_id") or row.get("component_id") or 0)
+                            component_mask = (blob_labels == component_id) & valid_for_fit
+                            area_px = int(np.count_nonzero(component_mask))
+                            if area_px <= 0:
+                                continue
+                            comp_z = frame.z_mm[component_mask].astype(np.float64)
+                            band_overlap_fraction = float(np.count_nonzero((comp_z >= band_z_lo) & (comp_z <= band_z_hi)) / area_px)
+                            if band_overlap_fraction >= float(self.stripe_component_min_overlap_fraction):
+                                belt_bg_mask |= component_mask
+                                bg_blob_ids.add(component_id)
+
+                    candidate_mask = belt_bg_mask.copy()
+                    belt_base_mask = belt_bg_mask.copy()
+                    inferred_depth_convention = "low_gradient_bg_and_stripes"
+                    # Baseline model: flat belt_bg mean height for now. A fitted (or curved) belt-surface
+                    # model is a deliberate follow-up once stripe detection itself is validated against
+                    # this simpler reference.
+                    belt_bg_mean_z = (
+                        float(np.mean(frame.z_mm[belt_bg_mask]))
+                        if np.count_nonzero(belt_bg_mask)
+                        else float(np.median(frame.z_mm[valid_for_fit])) if np.count_nonzero(valid_for_fit) else 0.0
+                    )
+                    plane_z_map = np.full(frame.z_mm.shape, belt_bg_mean_z, dtype=np.float32)
+                    raw_altitude = frame.z_mm.astype(np.float32) - plane_z_map
+                    raw_negative_altitude_pixel_count = int(np.count_nonzero(valid_for_fit & (raw_altitude < -1e-6)))
+                    baseline_map = np.minimum(plane_z_map, frame.z_mm.astype(np.float32))
+                    baseline_map[~valid_for_fit] = 0.0
+                    baseline_above_source_pixel_count = int(
+                        np.count_nonzero(valid_for_fit & ((baseline_map - frame.z_mm.astype(np.float32)) > 1e-6))
+                    )
+                    altitude_map = np.maximum(frame.z_mm.astype(np.float32) - baseline_map, 0.0)
+                    altitude_map[~valid_for_fit] = 0.0
+                    negative_altitude_pixel_count = int(np.count_nonzero(valid_for_fit & (altitude_map < -1e-6)))
+
+                    # Tier 2: from the remaining (non-bg) blobs, classify belt_stripe by how much of the
+                    # blob's height-over-base falls within a target band (stripe_height_mm +/- tolerance),
+                    # instead of a fixed [min, max] gate. Again a whole-blob decision, many blobs can qualify.
+                    stripe_band_lo = max(0.0, float(self.stripe_height_mm) - float(self.stripe_height_tolerance_mm))
+                    stripe_band_hi = float(self.stripe_height_mm) + float(self.stripe_height_tolerance_mm)
+                    stripe_evidence_mask = valid_for_fit & (altitude_map >= stripe_band_lo) & (altitude_map <= stripe_band_hi) & (~belt_bg_mask)
+                    stripes_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    unknown_low_gradient_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    belt_bg_component_rows = []
+                    belt_stripe_component_rows = []
+                    for row in blob_rows:
+                        component_id = int(row.get("blob_id") or row.get("component_id") or 0)
+                        component_mask = (blob_labels == component_id) & valid_for_fit
+                        if not np.count_nonzero(component_mask):
+                            continue
+                        area_px = int(np.count_nonzero(component_mask))
+                        overlap_bg_fraction = float(np.count_nonzero(component_mask & belt_bg_mask) / max(1, area_px))
+                        metrics = _component_oriented_metrics(component_mask, pixel_size_mm=pixel_size_mm)
+                        comp_alt = altitude_map[component_mask].astype(np.float64)
+                        h_median = float(np.median(comp_alt)) if comp_alt.size else 0.0
+                        h_mean = float(np.mean(comp_alt)) if comp_alt.size else 0.0
+                        h_p95 = float(np.percentile(comp_alt, 95)) if comp_alt.size else 0.0
+                        width_mm = float(metrics["width_mm"])
+                        length_mm = float(metrics["length_mm"])
+                        width_px = float(metrics["width_px"])
+                        length_px = float(metrics["length_px"])
+                        width_cv = float(metrics["width_cv"])
+                        length_width_ratio = float(length_mm / max(width_mm, 1e-6))
+                        height_width_ratio = float(h_p95 / max(width_mm, 1e-6))
+                        stripe_band_overlap_fraction = float(np.count_nonzero((comp_alt >= stripe_band_lo) & (comp_alt <= stripe_band_hi)) / max(1, area_px))
+                        decision = dict(row)
+                        decision.update(
+                            {
+                                "component_id": component_id,
+                                "width_px": width_px,
+                                "length_px": length_px,
+                                "width_mm": width_mm,
+                                "length_mm": length_mm,
+                                "orientation_deg": float(metrics["orientation_deg"]),
+                                "width_cv": width_cv,
+                                "height_over_base_median_mm": h_median,
+                                "height_over_base_mean_mm": h_mean,
+                                "height_over_base_p95_mm": h_p95,
+                                "length_width_ratio": length_width_ratio,
+                                "height_width_ratio": height_width_ratio,
+                                "stripe_band_overlap_fraction": stripe_band_overlap_fraction,
+                                "overlap_with_belt_bg": overlap_bg_fraction,
+                                "plateau_membership": component_id in bg_blob_ids,
+                            }
+                        )
+                        if component_id in bg_blob_ids:
+                            decision["role"] = "belt_bg"
+                            decision["reason"] = (
+                                f"height range overlaps belt band [{band_z_lo:.1f}, {band_z_hi:.1f}]mm by >= {float(self.stripe_component_min_overlap_fraction):.0%}"
+                                if band_z_lo is not None
+                                else "selected belt-background plateau support"
+                            )
+                            belt_bg_component_rows.append(decision)
+                        else:
+                            passes_rules = (
+                                (not self.stripe_rule_overlap_enabled or stripe_band_overlap_fraction >= float(self.stripe_component_min_overlap_fraction))
+                                and (not self.stripe_rule_height_range_enabled or stripe_band_lo <= h_p95 <= stripe_band_hi)
+                                and (not self.stripe_rule_width_range_enabled or float(self.stripe_min_width_mm) <= width_mm <= float(self.stripe_max_width_mm))
+                                and (not self.stripe_rule_height_width_ratio_enabled or float(self.stripe_min_height_width_ratio) <= height_width_ratio <= float(self.stripe_max_height_width_ratio))
+                                and (not self.stripe_rule_width_cv_enabled or width_cv <= float(self.stripe_max_width_cv))
+                                and (not self.stripe_rule_length_width_ratio_enabled or length_width_ratio >= float(self.stripe_min_length_width_ratio))
+                                and (not self.stripe_rule_area_fraction_enabled or float(row.get("area_ratio") or 0.0) <= float(self.stripe_max_area_fraction))
+                            )
+                            if passes_rules:
+                                decision["role"] = "belt_stripe"
+                                decision["reason"] = f"height-over-base overlaps stripe band [{stripe_band_lo:.1f}, {stripe_band_hi:.1f}]mm by >= {float(self.stripe_component_min_overlap_fraction):.0%}"
+                                stripes_mask |= component_mask
+                                belt_stripe_component_rows.append(decision)
+                            else:
+                                decision["role"] = "unknown"
+                                failed_rules: list[str] = []
+                                if self.stripe_rule_overlap_enabled and stripe_band_overlap_fraction < float(self.stripe_component_min_overlap_fraction):
+                                    failed_rules.append("insufficient_stripe_band_overlap")
+                                if self.stripe_rule_height_range_enabled and not (stripe_band_lo <= h_p95 <= stripe_band_hi):
+                                    failed_rules.append("height_out_of_range")
+                                if self.stripe_rule_width_range_enabled and not (float(self.stripe_min_width_mm) <= width_mm <= float(self.stripe_max_width_mm)):
+                                    failed_rules.append("width_out_of_range")
+                                if self.stripe_rule_height_width_ratio_enabled and not (float(self.stripe_min_height_width_ratio) <= height_width_ratio <= float(self.stripe_max_height_width_ratio)):
+                                    failed_rules.append("height_width_ratio_out_of_range")
+                                if self.stripe_rule_width_cv_enabled and width_cv > float(self.stripe_max_width_cv):
+                                    failed_rules.append("width_variation_too_high")
+                                if self.stripe_rule_length_width_ratio_enabled and length_width_ratio < float(self.stripe_min_length_width_ratio):
+                                    failed_rules.append("not_elongated_enough")
+                                if self.stripe_rule_area_fraction_enabled and float(row.get("area_ratio") or 0.0) > float(self.stripe_max_area_fraction):
+                                    failed_rules.append("area_fraction_too_large")
+                                decision["reason"] = ",".join(failed_rules) if failed_rules else "kept as unknown_low_gradient"
+                                unknown_low_gradient_mask |= component_mask
+                        low_gradient_component_rows.append(decision)
+                    belt_bg_mask = belt_bg_mask & valid_for_fit
+                    stripes_mask = stripes_mask & valid_for_fit & (~belt_bg_mask)
+                    unknown_low_gradient_mask = (low_grad_mask & valid_for_fit & (~belt_bg_mask) & (~stripes_mask)) | unknown_low_gradient_mask
+                    unknown_low_gradient_mask = unknown_low_gradient_mask & valid_for_fit & (~belt_bg_mask) & (~stripes_mask)
+                    surface_suppression_mask = belt_bg_mask | stripes_mask
+                    object_search_domain_mask = valid_for_fit & (~surface_suppression_mask)
+                    unknown_low_gradient_suppressed_pixel_count = int(
+                        np.count_nonzero(unknown_low_gradient_mask & surface_suppression_mask)
+                    )
+                    raised_candidate_rejected_mask = stripes_mask.copy()
+                    stripe_info = {
+                        "background_detection_strategy": "low_gradient_bg_and_stripes",
+                        "strategy": "low_gradient_bg_and_stripes",
+                        "enabled": True,
+                        "applied": bool(np.count_nonzero(stripes_mask) > 0),
+                        "belt_bg_count_px": int(np.count_nonzero(belt_bg_mask)),
+                        "belt_stripes_count_px": int(np.count_nonzero(stripes_mask)),
+                        "unknown_low_gradient_count_px": int(np.count_nonzero(unknown_low_gradient_mask)),
+                        "surface_roles": {
+                            "belt_bg_pixels": int(np.count_nonzero(belt_bg_mask)),
+                            "belt_stripe_pixels": int(np.count_nonzero(stripes_mask)),
+                            "unknown_low_gradient_pixels": int(np.count_nonzero(unknown_low_gradient_mask)),
+                            "bg_stripe_overlap_pixels": int(np.count_nonzero(belt_bg_mask & stripes_mask)),
+                            "suppression_pixels": int(np.count_nonzero(surface_suppression_mask)),
+                        },
+                        "invariants": {
+                            "background_support_equals_belt_bg": bool(np.array_equal(candidate_mask, belt_bg_mask)),
+                            "surface_suppression_equals_bg_or_stripes": bool(
+                                np.array_equal(surface_suppression_mask, belt_bg_mask | stripes_mask)
+                            ),
+                            "stripes_excluded_from_background_fit": int(np.count_nonzero(belt_bg_mask & stripes_mask)) == 0,
+                            "baseline_above_source_pixel_count": baseline_above_source_pixel_count,
+                            "negative_altitude_pixel_count": negative_altitude_pixel_count,
+                            "raw_negative_altitude_pixel_count": raw_negative_altitude_pixel_count,
+                            "unknown_low_gradient_suppressed_pixel_count": unknown_low_gradient_suppressed_pixel_count,
+                        },
+                        "stripe_rules": {
+                            "stripe_height_mm": self.stripe_height_mm,
+                            "stripe_height_tolerance_mm": self.stripe_height_tolerance_mm,
+                            "stripe_band_low_mm": stripe_band_lo,
+                            "stripe_band_high_mm": stripe_band_hi,
+                            "bg_band_low_mm": band_z_lo,
+                            "bg_band_high_mm": band_z_hi,
+                            "min_width_mm": self.stripe_min_width_mm,
+                            "max_width_mm": self.stripe_max_width_mm,
+                            "min_height_width_ratio": self.stripe_min_height_width_ratio,
+                            "max_height_width_ratio": self.stripe_max_height_width_ratio,
+                            "max_width_cv": self.stripe_max_width_cv,
+                            "min_length_width_ratio": self.stripe_min_length_width_ratio,
+                            "max_area_fraction": self.stripe_max_area_fraction,
+                            "min_overlap_fraction": self.stripe_component_min_overlap_fraction,
+                        },
+                        "stripe_rule_enabled": {
+                            "overlap": self.stripe_rule_overlap_enabled,
+                            "height_range": self.stripe_rule_height_range_enabled,
+                            "width_range": self.stripe_rule_width_range_enabled,
+                            "height_width_ratio": self.stripe_rule_height_width_ratio_enabled,
+                            "width_cv": self.stripe_rule_width_cv_enabled,
+                            "length_width_ratio": self.stripe_rule_length_width_ratio_enabled,
+                            "area_fraction": self.stripe_rule_area_fraction_enabled,
+                        },
+                        "component_decisions": low_gradient_component_rows,
+                        "selection_reason": selection_reason,
+                        "selected_plateau": selected_plateau,
+                        "baseline_model": "belt_bg_mean_z",
+                        "belt_bg_mean_z_mm": belt_bg_mean_z,
+                    }
+                    altitude_hist_counts, altitude_hist_edges = np.histogram(
+                        altitude_map[valid_for_fit].astype(np.float64) if np.count_nonzero(valid_for_fit) else np.asarray([0.0], dtype=np.float64),
+                        bins=max(8, int(self.belt_stripe_filter_altitude_hist_bins)),
+                    )
+                    altitude_hist_payload = {
+                        "sample_count": int(np.count_nonzero(valid_for_fit)),
+                        "bin_counts": [int(x) for x in altitude_hist_counts.tolist()],
+                        "bin_edges": [float(x) for x in altitude_hist_edges.tolist()],
+                        "threshold_value_mm": float(stripe_band_lo),
+                        "min_altitude_mm": float(stripe_band_lo),
+                        "direction_used": "raised_from_belt_bg_model",
+                    }
+                    cv2.imwrite(str(output_dir / "belt_bg_mask.png"), (belt_bg_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "belt_base_mask.png"), (belt_bg_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "belt_stripes_mask.png"), (stripes_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "unknown_low_gradient_mask.png"), (unknown_low_gradient_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "surface_suppression_mask.png"), (surface_suppression_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "object_search_domain_mask.png"), (object_search_domain_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "belt_stripes_tophat_mask.png"), (stripe_evidence_mask.astype(np.uint8) * 255))
+                    empty_diag = np.zeros_like(valid_for_fit, dtype=np.uint8)
+                    cv2.imwrite(str(output_dir / "belt_stripes_shape_mask.png"), empty_diag)
+                    cv2.imwrite(str(output_dir / "belt_above_belt_mask.png"), (stripe_evidence_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "belt_wide_object_mask.png"), empty_diag)
+                    surface_overlay = _surface_role_overlay(
+                        frame.z_mm,
+                        valid_for_fit,
+                        belt_bg_mask=belt_bg_mask,
+                        belt_stripes_mask=stripes_mask,
+                        unknown_low_gradient_mask=unknown_low_gradient_mask,
+                    )
+                    cv2.imwrite(str(output_dir / "low_gradient_components_overlay.png"), surface_overlay)
+                    cv2.imwrite(str(output_dir / "belt_stripe_candidates_overlay.png"), surface_overlay)
+                    write_heightmap_preview_png(baseline_map, valid_for_fit, output_dir / "belt_baseline_local_min.png", colorbar_label="belt-bg baseline (mm)")
+                    write_heightmap_preview_png(altitude_map, valid_for_fit, output_dir / "belt_altitude_local_min.png", colorbar_label="height over belt-bg baseline (mm)")
+                    _write_altitude_histogram_png(
+                        altitude_hist_payload,
+                        out_path=output_dir / "belt_altitude_histogram.png",
+                        robust_y_percentile=float(self.plot_y_robust_percentile),
+                    )
+                    (output_dir / "belt_altitude_histogram.json").write_text(json.dumps(altitude_hist_payload, indent=2), encoding="utf-8")
+                    (output_dir / "low_gradient_components.json").write_text(json.dumps(low_gradient_component_rows, indent=2), encoding="utf-8")
+                    (output_dir / "belt_bg_components.json").write_text(json.dumps(belt_bg_component_rows, indent=2), encoding="utf-8")
+                    (output_dir / "belt_stripe_components.json").write_text(json.dumps(belt_stripe_component_rows, indent=2), encoding="utf-8")
+                    (output_dir / "reference_surface_candidates.json").write_text(json.dumps(low_gradient_component_rows, indent=2), encoding="utf-8")
+                    (output_dir / "reference_surface_plateaus.json").write_text(json.dumps(plateaus, indent=2), encoding="utf-8")
+                    (output_dir / "flat_candidate_histogram.json").write_text(json.dumps(plateau_result, indent=2), encoding="utf-8")
+                    (output_dir / "belt_stripe_filter_debug.json").write_text(json.dumps(stripe_info, indent=2), encoding="utf-8")
+                    gradient_debug = {
+                        "strategy": "low_gradient_bg_and_stripes",
+                        "selection_reason": selection_reason,
+                        "threshold_mode": self.gradient_threshold_mode,
+                        "threshold_value": float(gthr),
+                        "valid_for_fit_count": int(np.count_nonzero(valid_for_fit)),
+                        "low_grad_mask_count": int(np.count_nonzero(low_grad_mask)),
+                        "flat_candidate_count": int(np.count_nonzero(flat_candidates)),
+                        "selected_component_area_ratio": float(np.count_nonzero(belt_bg_mask) / max(1, np.count_nonzero(valid_for_fit))),
+                        "selected_component_count_px": int(np.count_nonzero(belt_bg_mask)),
+                        "rejected_raised_count_px": int(np.count_nonzero(stripes_mask)),
+                        "plateau_count": int(len(plateaus)),
+                        "selected_plateau": selected_plateau,
+                        "robust_band": plateau_result.get("robust_band"),
+                        "belt_stripe_filter": stripe_info,
+                        "hessian_filter": hessian_dbg,
+                        "height_gate": height_gate_debug,
+                    }
+                    (output_dir / "gradient_debug.json").write_text(json.dumps(gradient_debug, indent=2), encoding="utf-8")
+                elif background_detection_strategy == "low_gradient_blob_height_clusters":
+                    blob_component_mode = _normalize_blob_component_mode(self.blob_component_mode)
+                    blob_result = _summarize_low_gradient_blobs(
+                        low_grad_mask=low_grad_mask,
+                        gradient=grad,
+                        z=frame.z_mm,
+                        valid_mask=valid_for_fit,
+                        roi_mask=roi_mask,
+                        height_gate_mask=height_gate_mask,
+                        min_component_area=max(1, int(self.blob_cluster_min_component_area)),
+                        component_mode=blob_component_mode,
+                        blob_connectivity=max(4, int(self.blob_connectivity)),
+                        blob_neighbor_z_tolerance_mm=float(self.blob_neighbor_z_tolerance_mm),
+                        blob_component_z_tolerance_mm=float(self.blob_component_z_tolerance_mm),
+                        blob_component_tolerance_mode=str(self.blob_component_tolerance_mode),
+                        blob_component_mad_k=float(self.blob_component_mad_k),
+                        blob_component_mad_floor_mm=float(self.blob_component_mad_floor_mm),
+                        blob_component_allow_gradual_slope=bool(self.blob_component_allow_gradual_slope),
+                        blob_component_max_local_slope_mm_per_px=float(self.blob_component_max_local_slope_mm_per_px),
+                        blob_component_min_area_px=max(1, int(self.blob_component_min_area_px)),
+                        blob_component_use_smoothed_z=bool(self.blob_component_use_smoothed_z),
+                        blob_component_z_smoothing_kernel=max(1, int(self.blob_component_z_smoothing_kernel)),
+                    )
+                    blob_labels = np.asarray(blob_result.get("labels"), dtype=np.int32)
+                    blob_rows = list(blob_result.get("blobs") or [])
+                    blob_component_mode_used = str(blob_result.get("component_mode") or blob_component_mode)
+                    height_aware_rejected_edge_mask = np.asarray(blob_result.get("rejected_edge_mask"), dtype=bool) if blob_result.get("rejected_edge_mask") is not None else np.zeros_like(valid_for_fit, dtype=bool)
+                    height_aware_connectivity_debug = dict(blob_result.get("connectivity_debug") or {})
+                    original_component_count = int(len(blob_rows))
+                    fragment_result = _split_low_gradient_blob_candidates_by_height(
+                        labels=blob_labels,
+                        blob_rows=blob_rows,
+                        gradient=grad,
+                        z=frame.z_mm,
+                        valid_mask=valid_for_fit,
+                        roi_mask=roi_mask,
+                        height_gate_mask=height_gate_mask,
+                        min_component_area=max(1, int(self.blob_cluster_min_component_area)),
+                        split_enabled=bool(self.blob_split_by_height_enabled),
+                        split_method=str(self.blob_split_method),
+                        split_min_height_range_mm=float(self.blob_split_min_height_range_mm),
+                        split_min_pixels=max(1, int(self.blob_split_min_pixels)),
+                        split_gap_mm=float(self.blob_split_gap_mm),
+                        split_mode=str(self.blob_split_mode),
+                        split_hist_bins=max(8, int(self.blob_split_hist_bins)),
+                        split_min_band_fraction=float(self.blob_split_min_band_fraction),
+                        split_min_band_pixels=max(1, int(self.blob_split_min_band_pixels)),
+                        split_merge_gap_mm=float(self.blob_split_merge_gap_mm),
+                        split_refine_morphology=bool(self.blob_split_refine_morphology),
+                        split_open_kernel=max(1, int(self.blob_split_open_kernel)),
+                        split_close_kernel=max(1, int(self.blob_split_close_kernel)),
+                        split_height_border_enabled=bool(self.blob_split_height_border_enabled),
+                        split_height_border_mode=str(self.blob_split_height_border_mode),
+                        split_height_border_smoothing_kernel=max(1, int(self.blob_split_height_border_smoothing_kernel)),
+                        split_height_border_threshold_mode=str(self.blob_split_height_border_threshold_mode),
+                        split_height_border_percentile=float(self.blob_split_height_border_percentile),
+                        split_height_border_min_delta_mm=float(self.blob_split_height_border_min_delta_mm),
+                        split_height_border_dilate_kernel=max(1, int(self.blob_split_height_border_dilate_kernel)),
+                        split_height_border_close_kernel=max(1, int(self.blob_split_height_border_close_kernel)),
+                        split_height_border_min_length_px=max(1, int(self.blob_split_height_border_min_length_px)),
+                        split_min_fragment_area_px=max(1, int(self.blob_split_min_fragment_area_px)),
+                        split_merge_weak_boundaries=bool(self.blob_split_merge_weak_boundaries),
+                        split_merge_max_median_z_gap_mm=float(self.blob_split_merge_max_median_z_gap_mm),
+                        split_merge_max_boundary_strength_mm=float(self.blob_split_merge_max_boundary_strength_mm),
+                        split_merge_background_like_only=bool(self.blob_split_merge_background_like_only),
+                    )
+                    fragment_labels = np.asarray(fragment_result.get("labels"), dtype=np.int32)
+                    fragment_rows = list(fragment_result.get("fragments") or [])
+                    split_debug_rows = list(fragment_result.get("debug") or [])
+                    split_method_used = str(fragment_result.get("method") or "disabled")
+                    border_strength = np.asarray(fragment_result.get("height_border_strength"), dtype=np.float32)
+                    border_cut_mask = np.asarray(fragment_result.get("height_border_cut_mask"), dtype=bool)
+                    border_fragment_labels = np.asarray(fragment_result.get("height_border_fragment_labels"), dtype=np.int32)
+                    border_fragment_mask = np.asarray(fragment_result.get("height_border_fragment_mask"), dtype=bool)
+                    merge_debug_rows = list(fragment_result.get("merge_debug") or [])
+                    clusters = _cluster_low_gradient_blobs_by_height(
+                        fragment_rows,
+                        height_gap_mm=float(self.blob_cluster_height_gap_mm),
+                        height_gap_mode=str(self.blob_cluster_height_gap_mode),
+                        merge_close_clusters=bool(self.blob_cluster_merge_close_clusters),
+                        merge_gap_mm=float(self.blob_cluster_merge_gap_mm),
+                    )
+                    scored_clusters = _score_blob_height_clusters(
+                        clusters,
+                        valid_pixel_count=int(np.count_nonzero(valid_for_fit)),
+                        min_area_fraction=float(self.blob_cluster_min_area_fraction),
+                        min_total_pixels=int(self.blob_cluster_min_total_pixels),
+                        max_z_mad_mm=float(self.blob_cluster_max_z_mad_mm),
+                        area_weight=float(self.blob_cluster_area_weight),
+                        border_weight=float(self.blob_cluster_border_weight),
+                        constancy_weight=float(self.blob_cluster_constancy_weight),
+                        spatial_coverage_weight=float(self.blob_cluster_spatial_coverage_weight),
+                        depth_preference_weight=float(self.blob_cluster_depth_preference_weight),
+                        fragmentation_penalty=float(self.blob_cluster_fragmentation_penalty),
+                        centrality_penalty=float(self.blob_cluster_centrality_penalty),
+                        object_like_penalty=float(self.blob_cluster_object_like_penalty),
+                        stripe_overlap_penalty=float(self.blob_cluster_stripe_overlap_penalty),
+                    )
+                    selected_cluster = next((row for row in scored_clusters if not bool(row.get("rejected"))), None)
+                    fallback_used = False
+                    fallback_reason = None
+                    fallback_strategy = None
+                    candidate_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    selected_pre_refine_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    selected_refined_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    rejected_blob_clusters_mask = np.zeros_like(valid_for_fit, dtype=bool)
+
+                    if selected_cluster is not None:
+                        selected_blob_ids = {int(blob_id) for blob_id in (selected_cluster.get("blob_ids") or [])}
+                        selected_pre_refine_mask = np.isin(fragment_labels, list(selected_blob_ids)) & valid_for_fit & height_gate_mask
+                        candidate_mask = selected_pre_refine_mask.copy()
+                        if bool(self.blob_cluster_refine_by_mad) and np.count_nonzero(candidate_mask):
+                            selected_rows = [row for row in fragment_rows if int(row.get("blob_id") or 0) in selected_blob_ids]
+                            medians = np.asarray([float(row.get("median_z") or 0.0) for row in selected_rows], dtype=np.float64)
+                            weights = np.asarray([max(1, int(row.get("area_px") or 0)) for row in selected_rows], dtype=np.float64)
+                            z_med = float(np.average(medians, weights=weights)) if medians.size else float(np.median(frame.z_mm[candidate_mask]))
+                            z_mad = float(np.average(np.asarray([float(row.get("mad_z") or 0.0) for row in selected_rows]), weights=weights)) if selected_rows else 0.0
+                            z_band = max(float(self.blob_cluster_refine_floor_mm), float(self.blob_cluster_refine_mad_k) * max(0.25, z_mad))
+                            selected_refined_mask = candidate_mask & (frame.z_mm >= (z_med - z_band)) & (frame.z_mm <= (z_med + z_band))
+                            if bool(self.blob_cluster_refine_keep_border_support):
+                                border_mask = _roi_border_mask(roi_mask)
+                                selected_refined_mask = selected_refined_mask | (candidate_mask & border_mask)
+                            candidate_mask = selected_refined_mask.copy()
+                        else:
+                            selected_refined_mask = candidate_mask.copy()
+                        rejected_blob_ids = {
+                            int(blob_id)
+                            for row in scored_clusters
+                            if str(row.get("cluster_id") or "") != str(selected_cluster.get("cluster_id") or "")
+                            for blob_id in (row.get("blob_ids") or [])
+                        }
+                        if rejected_blob_ids:
+                            rejected_blob_clusters_mask = np.isin(fragment_labels, list(rejected_blob_ids)) & valid_for_fit
+                    else:
+                        fallback_strategy = str(self.blob_cluster_fallback_strategy or "low_gradient_depth_plateaus").strip().lower()
+                        fallback_used = True
+                        fallback_reason = "no_cluster_passed_filters"
+                        warnings.append("blob_cluster_strategy_fallback_used")
+                        if fallback_strategy == "fail":
+                            candidate_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                        elif fallback_strategy == "constant_z":
+                            candidate_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                        elif fallback_strategy == "low_gradient_surface":
+                            lg_result, selected_label = _select_low_gradient_component(
+                                low_grad_mask=low_grad_mask,
+                                gradient=grad,
+                                z=frame.z_mm,
+                                valid_mask=valid_for_fit,
+                                roi_mask=roi_mask,
+                                selection_mode=self.reference_surface_selection_mode,
+                                min_area_ratio=float(self.reference_surface_min_area_ratio),
+                                border_bonus=float(self.reference_surface_border_bonus),
+                                area_weight=float(self.reference_surface_area_weight),
+                                constancy_weight=float(self.reference_surface_constancy_weight),
+                                depth_pref_weight=float(self.reference_surface_depth_preference_weight),
+                            )
+                            if selected_label > 0:
+                                candidate_mask = (lg_result["labels"] == selected_label) & valid_for_fit & height_gate_mask
+                        else:
+                            flat_candidates = low_grad_mask & height_gate_mask
+                            if np.count_nonzero(flat_candidates):
+                                flat_z_values = frame.z_mm[flat_candidates].astype(np.float64)
+                                plateau_result = _detect_depth_plateaus(
+                                    z_values=flat_z_values,
+                                    bins=max(16, int(self.low_gradient_plateau_hist_bins)),
+                                    min_fraction=float(self.low_gradient_plateau_min_fraction),
+                                    min_pixels=max(16, int(self.low_gradient_plateau_min_pixels)),
+                                    smoothing_sigma_bins=float(self.low_gradient_plateau_smoothing_sigma_bins),
+                                    peak_drop_ratio=float(self.low_gradient_plateau_peak_drop_ratio),
+                                    robust_band_mad_k=float(self.low_gradient_plateau_robust_band_mad_k),
+                                    detection_min_count_floor=int(self.low_gradient_plateau_detection_min_count_floor),
+                                    detection_min_count_fraction=float(self.low_gradient_plateau_detection_min_count_fraction),
+                                )
+                                selected_plateau = _select_background_plateau(
+                                    plateau_result.get("plateaus", []),
+                                    min_area_fraction=float(self.low_gradient_plateau_select_min_area_fraction),
+                                    mode=str(self.low_gradient_plateau_selection_mode),
+                                    robust_band=plateau_result.get("robust_band"),
+                                )
+                                if selected_plateau is None:
+                                    candidate_mask = flat_candidates.copy()
+                                else:
+                                    z_lo = float(selected_plateau.get("z_min", float(np.min(flat_z_values))))
+                                    z_hi = float(selected_plateau.get("z_max", float(np.max(flat_z_values))))
+                                    candidate_mask = flat_candidates & (frame.z_mm >= z_lo) & (frame.z_mm <= z_hi)
+
+                    belt_base_mask = candidate_mask.copy()
+                    stripes_mask = np.zeros_like(valid_for_fit, dtype=bool)
+                    stripe_info: dict[str, Any] = {"enabled": bool(self.belt_stripe_filter_enabled), "applied": False, "skip_reason": "disabled"}
+                    altitude_hist_payload: dict[str, Any] = {"sample_count": 0, "bin_counts": [], "bin_edges": [], "threshold_value_mm": 0.0, "direction_used": str(self.belt_stripe_filter_direction)}
+                    baseline_map = np.zeros_like(frame.z_mm, dtype=np.float32)
+                    altitude_map = np.zeros_like(frame.z_mm, dtype=np.float32)
+                    filter_scope = str(self.belt_stripe_filter_scope or "global").strip().lower()
+                    if filter_scope not in {"global", "bg_plateau"}:
+                        filter_scope = "global"
+                    if self.belt_stripe_filter_enabled and np.count_nonzero(candidate_mask) > 0:
+                        pixel_size_mm = float(max(frame.x_resolution_mm or 1.0, frame.y_resolution_mm or 1.0))
+                        domain_mask = np.asarray(valid_for_fit, dtype=bool) if filter_scope == "global" else np.asarray(candidate_mask, dtype=bool)
+                        stripe_result = _compute_belt_stripe_filter(
+                            z_mm=frame.z_mm,
+                            domain_mask=domain_mask,
+                            pixel_size_mm=pixel_size_mm,
+                            window_mm=float(self.belt_stripe_filter_window_mm),
+                            direction=str(self.belt_stripe_filter_direction),
+                            threshold_mode=str(self.belt_stripe_filter_threshold_mode),
+                            min_altitude_mm=float(self.belt_stripe_filter_min_altitude_mm),
+                            k_mad=float(self.belt_stripe_filter_k_mad),
+                            fixed_threshold_mm=float(self.belt_stripe_filter_fixed_threshold_mm),
+                            min_stripe_fraction=float(self.belt_stripe_filter_min_stripe_fraction),
+                            bg_plateau_mask=np.asarray(candidate_mask, dtype=bool),
+                            z_floor_enabled=bool(self.belt_stripe_filter_z_floor_enabled),
+                            z_floor_use_upper_bound=bool(self.belt_stripe_filter_z_floor_use_upper_bound),
+                            z_floor_margin_mm=float(self.belt_stripe_filter_z_floor_margin_mm),
+                            max_stripe_height_mm=float(self.belt_stripe_filter_max_stripe_height_mm),
+                            above_belt_close_mm=float(self.belt_stripe_filter_above_belt_close_mm),
+                            object_kernel_mm=float(self.belt_stripe_filter_object_kernel_mm),
+                            object_kernel_shape=str(self.belt_stripe_filter_object_kernel_shape),
+                            altitude_hist_bins=int(self.belt_stripe_filter_altitude_hist_bins),
+                            auto_bimodality_margin=float(self.belt_stripe_filter_auto_bimodality_margin),
+                            z_floor_upper_percentile=float(self.belt_stripe_filter_z_floor_upper_percentile),
+                            z_floor_fallback_lower_percentile=float(self.belt_stripe_filter_z_floor_fallback_lower_percentile),
+                            z_floor_fallback_upper_percentile=float(self.belt_stripe_filter_z_floor_fallback_upper_percentile),
+                        )
+                        stripes_mask = stripe_result["stripes_mask"]
+                        baseline_map = stripe_result["baseline_map"]
+                        altitude_map = stripe_result["altitude_map"]
+                        stripe_info = stripe_result["info"]
+                        stripe_info["scope"] = filter_scope
+                        altitude_hist_payload = stripe_result["altitude_histogram"]
+                        if stripe_info.get("applied"):
+                            bg_snapshot = candidate_mask.copy()
+                            belt_base_mask = bg_snapshot & (~stripes_mask)
+                            candidate_mask = belt_base_mask
+                            raised_candidate_rejected_mask = raised_candidate_rejected_mask | stripes_mask
+                        else:
+                            belt_base_mask = candidate_mask.copy()
+                        cv2.imwrite(str(output_dir / "belt_stripes_mask.png"), (stripes_mask.astype(np.uint8) * 255))
+                        cv2.imwrite(str(output_dir / "belt_base_mask.png"), (belt_base_mask.astype(np.uint8) * 255))
+                        if "tophat_stripes_mask" in stripe_result:
+                            cv2.imwrite(str(output_dir / "belt_stripes_tophat_mask.png"), (stripe_result["tophat_stripes_mask"].astype(np.uint8) * 255))
+                        if "shape_stripes_mask" in stripe_result:
+                            cv2.imwrite(str(output_dir / "belt_stripes_shape_mask.png"), (stripe_result["shape_stripes_mask"].astype(np.uint8) * 255))
+                        if "above_belt_mask" in stripe_result:
+                            cv2.imwrite(str(output_dir / "belt_above_belt_mask.png"), (stripe_result["above_belt_mask"].astype(np.uint8) * 255))
+                        if "wide_object_mask" in stripe_result:
+                            cv2.imwrite(str(output_dir / "belt_wide_object_mask.png"), (stripe_result["wide_object_mask"].astype(np.uint8) * 255))
+                        diag_domain = np.asarray(valid_for_fit, dtype=bool) if filter_scope == "global" else (candidate_mask | belt_base_mask | stripes_mask)
+                        write_heightmap_preview_png(baseline_map, diag_domain, output_dir / "belt_baseline_local_min.png", colorbar_label="local-min z baseline (mm)")
+                        write_heightmap_preview_png(altitude_map, diag_domain, output_dir / "belt_altitude_local_min.png", colorbar_label="altitude over local-min (mm)")
+                        _write_altitude_histogram_png(altitude_hist_payload, out_path=output_dir / "belt_altitude_histogram.png", robust_y_percentile=float(self.plot_y_robust_percentile))
+                        (output_dir / "belt_altitude_histogram.json").write_text(json.dumps(altitude_hist_payload, indent=2), encoding="utf-8")
+                        (output_dir / "belt_stripe_filter_debug.json").write_text(json.dumps(stripe_info, indent=2), encoding="utf-8")
+                    if not (output_dir / "belt_stripes_mask.png").is_file():
+                        empty_mask = np.zeros_like(candidate_mask, dtype=np.uint8)
+                        cv2.imwrite(str(output_dir / "belt_stripes_mask.png"), empty_mask)
+                        cv2.imwrite(str(output_dir / "belt_base_mask.png"), (candidate_mask.astype(np.uint8) * 255))
+                        for _name in (
+                            "belt_stripes_tophat_mask.png",
+                            "belt_stripes_shape_mask.png",
+                            "belt_above_belt_mask.png",
+                            "belt_wide_object_mask.png",
+                        ):
+                            cv2.imwrite(str(output_dir / _name), empty_mask)
+                        _write_plateau_plot_not_applicable_png(
+                            out_path=output_dir / "belt_baseline_local_min.png",
+                            strategy="low_gradient_blob_height_clusters",
+                        )
+                        _write_plateau_plot_not_applicable_png(
+                            out_path=output_dir / "belt_altitude_local_min.png",
+                            strategy="low_gradient_blob_height_clusters",
+                        )
+                        _write_plateau_plot_not_applicable_png(
+                            out_path=output_dir / "belt_altitude_histogram.png",
+                            strategy="low_gradient_blob_height_clusters",
+                        )
+                        (output_dir / "belt_altitude_histogram.json").write_text(
+                            json.dumps({"strategy": "low_gradient_blob_height_clusters", "applied": False, "sample_count": 0, "bin_counts": [], "bin_edges": [], "threshold_value_mm": 0.0}, indent=2),
+                            encoding="utf-8",
+                        )
+                        (output_dir / "belt_stripe_filter_debug.json").write_text(
+                            json.dumps({"strategy": "low_gradient_blob_height_clusters", "applied": False, "reason": "disabled_or_empty_candidate"}, indent=2),
+                            encoding="utf-8",
+                        )
+
+                    inferred_depth_convention = "low_gradient_blob_height_clusters"
+                    gradient_debug = {
+                        "strategy": "low_gradient_blob_height_clusters",
+                        "threshold_mode": self.gradient_threshold_mode,
+                        "threshold_value": float(gthr),
+                        "low_grad_mask_count": int(np.count_nonzero(low_grad_mask)),
+                        "blob_count": int(len(blob_rows)),
+                        "component_mode": blob_component_mode_used,
+                        "blob_connectivity": int(self.blob_connectivity),
+                        "blob_neighbor_z_tolerance_mm": float(self.blob_neighbor_z_tolerance_mm),
+                        "accepted_neighbor_edges": int(height_aware_connectivity_debug.get("accepted_neighbor_edges") or 0),
+                        "rejected_neighbor_edges": int(height_aware_connectivity_debug.get("rejected_neighbor_edges") or 0),
+                        "height_aware_component_count": int(height_aware_connectivity_debug.get("component_count") or len(blob_rows)),
+                        "height_consistent_fragment_count": int(len(fragment_rows)),
+                        "kept_blob_count": int(len(blob_result.get("kept_ids") or [])),
+                        "rejected_blob_count": int(len(blob_result.get("rejected_ids") or [])),
+                        "split_method": split_method_used,
+                        "eligible_blob_count": int(fragment_result.get("eligible_blob_count") or 0),
+                        "height_border_split_blob_count": int(fragment_result.get("height_border_split_blob_count") or 0),
+                        "histogram_split_blob_count": int(fragment_result.get("histogram_split_blob_count") or 0),
+                        "merged_fragment_count": int(fragment_result.get("merge_back_count") or 0),
+                        "kept_fragment_count": int(len(fragment_result.get("kept_ids") or [])),
+                        "rejected_fragment_count": int(len(fragment_result.get("rejected_ids") or [])),
+                        "height_splitting_enabled": bool(self.blob_split_by_height_enabled),
+                        "height_splitting_applied": bool(fragment_result.get("using_split_fragments")),
+                        "cluster_count": int(len(scored_clusters)),
+                        "selected_cluster_id": selected_cluster.get("cluster_id") if isinstance(selected_cluster, dict) else None,
+                        "selected_blob_ids": selected_cluster.get("blob_ids") if isinstance(selected_cluster, dict) else [],
+                        "selected_source_blob_ids": selected_cluster.get("source_blob_ids") if isinstance(selected_cluster, dict) else [],
+                        "selected_component_area_ratio": float(np.count_nonzero(candidate_mask) / max(1, np.count_nonzero(valid_for_fit))),
+                        "fallback_used": bool(fallback_used),
+                        "fallback_reason": fallback_reason,
+                        "fallback_strategy": fallback_strategy,
+                        "belt_stripe_filter": stripe_info,
+                        "height_gate": height_gate_debug,
+                    }
+                    cmap = _label_colormap_overlay(blob_labels)
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_components_overlay.png"), cmap)
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_id_mask.png"), (blob_labels % 255).astype(np.uint8))
+                    if blob_component_mode_used == "height_aware":
+                        cv2.imwrite(str(output_dir / "height_aware_blob_components_overlay.png"), cmap)
+                        cv2.imwrite(str(output_dir / "height_aware_blob_id_mask.png"), (blob_labels % 255).astype(np.uint8))
+                        rejected_edge_vis = _label_colormap_overlay(blob_labels)
+                        rejected_edge_vis[height_aware_rejected_edge_mask & low_grad_mask] = (0, 0, 255)
+                        cv2.imwrite(str(output_dir / "height_aware_connectivity_rejected_edges.png"), rejected_edge_vis)
+                        (output_dir / "height_aware_connectivity_debug.json").write_text(
+                            json.dumps(height_aware_connectivity_debug, indent=2),
+                            encoding="utf-8",
+                        )
+                    write_heightmap_preview_png(border_strength, valid_for_fit, output_dir / "height_border_strength.png", colorbar_label="height-border strength (mm)")
+                    cv2.imwrite(str(output_dir / "height_border_cut_mask.png"), (border_cut_mask.astype(np.uint8) * 255))
+                    height_border_overlay = _label_colormap_overlay(border_fragment_labels)
+                    cv2.imwrite(str(output_dir / "height_border_fragments_overlay.png"), height_border_overlay)
+                    cv2.imwrite(str(output_dir / "height_border_fragments_mask.png"), (border_fragment_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "height_border_fragments_id_mask.png"), (border_fragment_labels % 255).astype(np.uint8))
+                    fragment_overlay = _label_colormap_overlay(fragment_labels)
+                    cv2.imwrite(str(output_dir / "height_split_blob_fragments_overlay.png"), fragment_overlay)
+                    cv2.imwrite(str(output_dir / "height_split_blob_fragments_mask.png"), ((fragment_labels > 0).astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "height_split_blob_id_mask.png"), (fragment_labels % 255).astype(np.uint8))
+                    cv2.imwrite(str(output_dir / "selected_blob_cluster_mask.png"), (candidate_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "selected_blob_cluster_pre_refine_mask.png"), (selected_pre_refine_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "selected_blob_cluster_refined_mask.png"), (selected_refined_mask.astype(np.uint8) * 255))
+                    cv2.imwrite(str(output_dir / "rejected_blob_clusters_mask.png"), (rejected_blob_clusters_mask.astype(np.uint8) * 255))
+                    selected_overlay = _height_color_image(frame.z_mm, valid_for_fit)
+                    selected_overlay[candidate_mask] = (0, 255, 0)
+                    rejected_overlay = _height_color_image(frame.z_mm, valid_for_fit)
+                    rejected_overlay[rejected_blob_clusters_mask] = (0, 0, 255)
+                    cv2.imwrite(str(output_dir / "selected_blob_cluster_overlay.png"), selected_overlay)
+                    cv2.imwrite(str(output_dir / "rejected_blob_clusters_overlay.png"), rejected_overlay)
+                    (output_dir / "low_gradient_blob_summary.json").write_text(json.dumps(blob_rows, indent=2), encoding="utf-8")
+                    (output_dir / "height_consistent_blob_summary.json").write_text(json.dumps(fragment_rows, indent=2), encoding="utf-8")
+                    (output_dir / "height_split_debug.json").write_text(
+                        json.dumps(
+                            {
+                                "strategy": "low_gradient_blob_height_clusters",
+                                "enabled": bool(self.blob_split_by_height_enabled),
+                                "method": split_method_used,
+                                "mode": str(self.blob_split_mode),
+                                "original_blob_count": len(blob_rows),
+                                "eligible_blob_count": int(fragment_result.get("eligible_blob_count") or 0),
+                                "height_border_split_blob_count": int(fragment_result.get("height_border_split_blob_count") or 0),
+                                "histogram_split_blob_count": int(fragment_result.get("histogram_split_blob_count") or 0),
+                                "final_fragment_count": len(fragment_rows),
+                                "merge_back_count": int(fragment_result.get("merge_back_count") or 0),
+                                "using_split_fragments": bool(fragment_result.get("using_split_fragments")),
+                                "blob_count": len(blob_rows),
+                                "fragment_count": len(fragment_rows),
+                                "warnings": list(fragment_result.get("warnings") or []),
+                                "blobs": split_debug_rows,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    (output_dir / "height_border_split_debug.json").write_text(
+                        json.dumps(
+                            {
+                                "strategy": "low_gradient_blob_height_clusters",
+                                "enabled": bool(self.blob_split_height_border_enabled),
+                                "method": split_method_used,
+                                "original_blob_count": len(blob_rows),
+                                "eligible_blob_count": int(fragment_result.get("eligible_blob_count") or 0),
+                                "height_border_split_blob_count": int(fragment_result.get("height_border_split_blob_count") or 0),
+                                "merge_back_count": int(fragment_result.get("merge_back_count") or 0),
+                                "blobs": split_debug_rows,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    (output_dir / "fragment_merge_debug.json").write_text(
+                        json.dumps(
+                            {
+                                "strategy": "low_gradient_blob_height_clusters",
+                                "method": split_method_used,
+                                "merge_back_count": int(fragment_result.get("merge_back_count") or 0),
+                                "merges": merge_debug_rows,
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    selected_cluster_id_for_rows = (
+                        selected_cluster.get("cluster_id") if isinstance(selected_cluster, dict) else None
+                    )
+
+                    def _cluster_decision(row: dict[str, Any]) -> str:
+                        if selected_cluster_id_for_rows is not None and row.get("cluster_id") == selected_cluster_id_for_rows:
+                            return "selected"
+                        return "rejected" if bool(row.get("rejected")) else "candidate"
+
+                    (output_dir / "blob_height_clusters.json").write_text(
+                        json.dumps(
+                            [
+                                {
+                                    **row,
+                                    "selected": bool(
+                                        selected_cluster_id_for_rows is not None
+                                        and row.get("cluster_id") == selected_cluster_id_for_rows
+                                    ),
+                                    "decision": _cluster_decision(row),
+                                    "component_ids": list(row.get("source_blob_ids") or []),
+                                    "fragment_ids": list(row.get("blob_ids") or []),
+                                    "component_mode": blob_component_mode_used,
+                                    "original_component_count": original_component_count,
+                                    "height_aware_component_count": int(height_aware_connectivity_debug.get("component_count") or original_component_count),
+                                    "split_method": split_method_used,
+                                }
+                                for row in scored_clusters
+                            ],
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    with (output_dir / "blob_cluster_score_table.csv").open("w", encoding="utf-8", newline="") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=[
+                                "selected", "cluster_id", "score", "decision", "rejected_reason",
+                                "blob_count", "fragment_count", "original_blob_count", "split_fragment_count",
+                                "mixed_blob_source_count", "component_mode", "height_aware_component_count", "split_method",
+                                "total_pixels", "area_fraction", "median_z",
+                                "z_mad", "z_mad_weighted", "touches_roi_border_fraction", "touches_frame_border_fraction",
+                                "border_contact", "spatial_coverage",
+                                "mean_centrality", "mean_gradient_p95", "mean_solidity", "mean_compactness",
+                                "centrality_penalty", "object_like_penalty", "fragmentation_penalty",
+                                "height_gate_overlap", "stripe_overlap", "rejected",
+                            ],
+                        )
+                        writer.writeheader()
+                        for row in scored_clusters:
+                            writer.writerow(
+                                {
+                                    **{key: row.get(key) for key in writer.fieldnames},
+                                    "selected": bool(
+                                        selected_cluster_id_for_rows is not None
+                                        and row.get("cluster_id") == selected_cluster_id_for_rows
+                                    ),
+                                    "decision": _cluster_decision(row),
+                                    "component_mode": blob_component_mode_used,
+                                    "height_aware_component_count": int(height_aware_connectivity_debug.get("component_count") or original_component_count),
+                                    "split_method": split_method_used,
+                                }
+                            )
+                    (output_dir / "blob_cluster_selection_debug.json").write_text(
+                        json.dumps(
+                            {
+                                "strategy": "low_gradient_blob_height_clusters",
+                                "selected_cluster_id": selected_cluster.get("cluster_id") if isinstance(selected_cluster, dict) else None,
+                                "selected_blob_ids": selected_cluster.get("blob_ids") if isinstance(selected_cluster, dict) else [],
+                                "selected_source_blob_ids": selected_cluster.get("source_blob_ids") if isinstance(selected_cluster, dict) else [],
+                                "blob_count": len(blob_rows),
+                                "fragment_count": len(fragment_rows),
+                                "component_mode": blob_component_mode_used,
+                                "original_component_count": original_component_count,
+                                "height_aware_component_count": int(height_aware_connectivity_debug.get("component_count") or original_component_count),
+                                "rejected_neighbor_edges": int(height_aware_connectivity_debug.get("rejected_neighbor_edges") or 0),
+                                "split_method": split_method_used,
+                                "eligible_blob_count": int(fragment_result.get("eligible_blob_count") or 0),
+                                "height_border_split_blob_count": int(fragment_result.get("height_border_split_blob_count") or 0),
+                                "histogram_split_blob_count": int(fragment_result.get("histogram_split_blob_count") or 0),
+                                "merge_back_count": int(fragment_result.get("merge_back_count") or 0),
+                                "cluster_count": len(scored_clusters),
+                                "fallback_used": bool(fallback_used),
+                                "fallback_reason": fallback_reason,
+                                "fallback_strategy": fallback_strategy,
+                                "height_splitting_enabled": bool(self.blob_split_by_height_enabled),
+                                "height_splitting_applied": bool(fragment_result.get("using_split_fragments")),
+                                "top_rejected_clusters": [
+                                    {
+                                        "cluster_id": row.get("cluster_id"),
+                                        "score": row.get("score"),
+                                        "rejected_reason": row.get("rejected_reason"),
+                                    }
+                                    for row in scored_clusters
+                                    if bool(row.get("rejected"))
+                                ][:5],
+                                # Per-cluster decision + component/fragment membership and score
+                                # breakdown so the UI can explain "why this cluster" and bridge
+                                # components -> clusters -> selected support without re-deriving it.
+                                "clusters": [
+                                    {
+                                        "cluster_id": row.get("cluster_id"),
+                                        "selected": bool(
+                                            selected_cluster_id_for_rows is not None
+                                            and row.get("cluster_id") == selected_cluster_id_for_rows
+                                        ),
+                                        "decision": _cluster_decision(row),
+                                        "score": row.get("score"),
+                                        "rejected_reason": row.get("rejected_reason"),
+                                        "component_ids": list(row.get("source_blob_ids") or []),
+                                        "fragment_ids": list(row.get("blob_ids") or []),
+                                        "area_fraction": row.get("area_fraction"),
+                                        "median_z": row.get("median_z"),
+                                        "z_mad": row.get("z_mad"),
+                                        "border_contact": row.get("border_contact"),
+                                        "spatial_coverage": row.get("spatial_coverage"),
+                                        "centrality_penalty": row.get("centrality_penalty"),
+                                        "object_like_penalty": row.get("object_like_penalty"),
+                                        "fragmentation_penalty": row.get("fragmentation_penalty"),
+                                        "stripe_overlap": row.get("stripe_overlap"),
+                                        "score_terms": row.get("score_terms"),
+                                    }
+                                    for row in scored_clusters
+                                ],
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                    (output_dir / "reference_surface_candidates.json").write_text(json.dumps(fragment_rows, indent=2), encoding="utf-8")
                     (output_dir / "gradient_debug.json").write_text(json.dumps(gradient_debug, indent=2), encoding="utf-8")
                 else:
                     # ─── low_gradient_depth_plateaus strategy ────────────────
@@ -845,14 +2334,13 @@ class DetectBeltPlaneStage:
                                 continue
                             rejected_plateaus.append(row)
 
-                    # ── Belt-stripe filter (morphological top-hat) ─────────────────────
+                    # ── Belt-stripe filter (local-min top-hat) ─────────────────────
                     # Runs globally over valid_for_fit (NOT just the BG plateau) so
                     # stripes that fall outside the BG plateau band (i.e. above
                     # belt-z, where they actually sit in 3-D) are still detected
                     # and excluded from expanded_plane_mask + downstream foreground.
-                    # The opening-based top-hat keeps object interiors AND edges
-                    # at altitude ≈ 0, so only narrow features (chevron ribs) get
-                    # tagged as stripes.
+                    # Baseline = erode(z); narrow raised ribs survive as positive
+                    # altitude above the local belt minimum.
                     #
                     # Outputs consumed downstream:
                     #   - candidate_mask          ← candidate_mask AND NOT stripes
@@ -894,7 +2382,6 @@ class DetectBeltPlaneStage:
                             k_mad=float(self.belt_stripe_filter_k_mad),
                             fixed_threshold_mm=float(self.belt_stripe_filter_fixed_threshold_mm),
                             min_stripe_fraction=float(self.belt_stripe_filter_min_stripe_fraction),
-                            baseline_mode=str(self.belt_stripe_filter_baseline_mode),
                             bg_plateau_mask=bg_plateau_snapshot_for_filter,
                             z_floor_enabled=bool(self.belt_stripe_filter_z_floor_enabled),
                             z_floor_use_upper_bound=bool(self.belt_stripe_filter_z_floor_use_upper_bound),
@@ -1132,20 +2619,20 @@ class DetectBeltPlaneStage:
             # applicable" message instead of misleading content or a 404.
             plateau_plot_path = output_dir / "background_plateau_plot.png"
             filtered_depth_plot_path = output_dir / "flat_candidate_depth_plot.png"
-            if self.background_detection_strategy != "low_gradient_depth_plateaus":
+            if background_detection_strategy not in {"low_gradient_depth_plateaus", "low_gradient_blob_height_clusters"}:
                 _write_plateau_plot_not_applicable_png(
                     out_path=plateau_plot_path,
-                    strategy=str(self.background_detection_strategy),
+                    strategy=str(background_detection_strategy),
                 )
                 _write_plateau_plot_not_applicable_png(
                     out_path=filtered_depth_plot_path,
-                    strategy=str(self.background_detection_strategy),
+                    strategy=str(background_detection_strategy),
                 )
                 if not (output_dir / "reference_surface_plateaus.json").is_file():
                     (output_dir / "reference_surface_plateaus.json").write_text(
                         json.dumps(
                             {
-                                "strategy": str(self.background_detection_strategy),
+                                "strategy": str(background_detection_strategy),
                                 "plateau_analysis_active": False,
                                 "reason": "plateau analysis only runs for strategy=low_gradient_depth_plateaus",
                                 "plateaus": [],
@@ -1158,7 +2645,7 @@ class DetectBeltPlaneStage:
                     (output_dir / "flat_candidate_histogram.json").write_text(
                         json.dumps(
                             {
-                                "strategy": str(self.background_detection_strategy),
+                                "strategy": str(background_detection_strategy),
                                 "plateau_analysis_active": False,
                                 "reason": "plateau analysis only runs for strategy=low_gradient_depth_plateaus",
                                 "sample_count": 0,
@@ -1190,26 +2677,111 @@ class DetectBeltPlaneStage:
                 if not (output_dir / "belt_baseline_local_min.png").is_file():
                     _write_plateau_plot_not_applicable_png(
                         out_path=output_dir / "belt_baseline_local_min.png",
-                        strategy=str(self.background_detection_strategy),
+                        strategy=str(background_detection_strategy),
                     )
                 if not (output_dir / "belt_altitude_local_min.png").is_file():
                     _write_plateau_plot_not_applicable_png(
                         out_path=output_dir / "belt_altitude_local_min.png",
-                        strategy=str(self.background_detection_strategy),
+                        strategy=str(background_detection_strategy),
                     )
                 if not (output_dir / "belt_altitude_histogram.png").is_file():
                     _write_plateau_plot_not_applicable_png(
                         out_path=output_dir / "belt_altitude_histogram.png",
-                        strategy=str(self.background_detection_strategy),
+                        strategy=str(background_detection_strategy),
                     )
                 if not (output_dir / "belt_altitude_histogram.json").is_file():
                     (output_dir / "belt_altitude_histogram.json").write_text(
-                        json.dumps({"strategy": str(self.background_detection_strategy), "applied": False, "reason": "belt-stripe filter only runs for strategy=low_gradient_depth_plateaus", "sample_count": 0, "bin_counts": [], "bin_edges": [], "threshold_value_mm": 0.0}, indent=2),
+                        json.dumps({"strategy": str(background_detection_strategy), "applied": False, "reason": "belt-stripe filter only runs for strategy=low_gradient_depth_plateaus", "sample_count": 0, "bin_counts": [], "bin_edges": [], "threshold_value_mm": 0.0}, indent=2),
                         encoding="utf-8",
                     )
                 if not (output_dir / "belt_stripe_filter_debug.json").is_file():
                     (output_dir / "belt_stripe_filter_debug.json").write_text(
-                        json.dumps({"strategy": str(self.background_detection_strategy), "applied": False, "reason": "belt-stripe filter only runs for strategy=low_gradient_depth_plateaus"}, indent=2),
+                        json.dumps({"strategy": str(background_detection_strategy), "applied": False, "reason": "belt-stripe filter only runs for strategy=low_gradient_depth_plateaus"}, indent=2),
+                        encoding="utf-8",
+                    )
+                for _name in (
+                    "belt_bg_mask.png",
+                    "unknown_low_gradient_mask.png",
+                    "surface_suppression_mask.png",
+                    "object_search_domain_mask.png",
+                    "belt_stripe_candidates_overlay.png",
+                ):
+                    if not (output_dir / _name).is_file():
+                        cv2.imwrite(str(output_dir / _name), empty_mask)
+                if not (output_dir / "belt_bg_components.json").is_file():
+                    (output_dir / "belt_bg_components.json").write_text(json.dumps([], indent=2), encoding="utf-8")
+                if not (output_dir / "belt_stripe_components.json").is_file():
+                    (output_dir / "belt_stripe_components.json").write_text(json.dumps([], indent=2), encoding="utf-8")
+            if background_detection_strategy != "low_gradient_blob_height_clusters":
+                empty_mask = np.zeros_like(candidate_mask, dtype=np.uint8) if candidate_mask is not None else np.zeros((1, 1), dtype=np.uint8)
+                if not (output_dir / "low_gradient_blob_components_overlay.png").is_file():
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_components_overlay.png"), empty_mask)
+                if not (output_dir / "low_gradient_blob_id_mask.png").is_file():
+                    cv2.imwrite(str(output_dir / "low_gradient_blob_id_mask.png"), empty_mask)
+                for _name in (
+                    "height_border_strength.png",
+                    "height_border_cut_mask.png",
+                    "height_border_fragments_overlay.png",
+                    "height_border_fragments_mask.png",
+                    "height_border_fragments_id_mask.png",
+                    "height_aware_blob_components_overlay.png",
+                    "height_aware_blob_id_mask.png",
+                    "height_aware_connectivity_rejected_edges.png",
+                    "height_split_blob_fragments_overlay.png",
+                    "height_split_blob_fragments_mask.png",
+                    "height_split_blob_id_mask.png",
+                    "selected_blob_cluster_mask.png",
+                    "selected_blob_cluster_pre_refine_mask.png",
+                    "selected_blob_cluster_refined_mask.png",
+                    "rejected_blob_clusters_mask.png",
+                    "selected_blob_cluster_overlay.png",
+                    "rejected_blob_clusters_overlay.png",
+                ):
+                    if not (output_dir / _name).is_file():
+                        cv2.imwrite(str(output_dir / _name), empty_mask)
+                if not (output_dir / "low_gradient_blob_summary.json").is_file():
+                    (output_dir / "low_gradient_blob_summary.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "blob_analysis_active": False, "blobs": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "height_consistent_blob_summary.json").is_file():
+                    (output_dir / "height_consistent_blob_summary.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "height_split_active": False, "fragments": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "height_border_split_debug.json").is_file():
+                    (output_dir / "height_border_split_debug.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "height_border_split_active": False, "blobs": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "fragment_merge_debug.json").is_file():
+                    (output_dir / "fragment_merge_debug.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "merge_active": False, "merges": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "height_split_debug.json").is_file():
+                    (output_dir / "height_split_debug.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "height_split_active": False, "blobs": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "blob_height_clusters.json").is_file():
+                    (output_dir / "blob_height_clusters.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "blob_clustering_active": False, "clusters": []}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "blob_cluster_score_table.csv").is_file():
+                    (output_dir / "blob_cluster_score_table.csv").write_text(
+                        "cluster_id,score,blob_count,fragment_count,original_blob_count,split_fragment_count,mixed_blob_source_count,total_pixels,area_fraction,median_z,z_mad_weighted,touches_roi_border_fraction,touches_frame_border_fraction,mean_centrality,mean_gradient_p95,mean_solidity,mean_compactness,height_gate_overlap,stripe_overlap,rejected,rejected_reason\n",
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "blob_cluster_selection_debug.json").is_file():
+                    (output_dir / "blob_cluster_selection_debug.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "blob_cluster_strategy_active": False}, indent=2),
+                        encoding="utf-8",
+                    )
+                if not (output_dir / "height_aware_connectivity_debug.json").is_file():
+                    (output_dir / "height_aware_connectivity_debug.json").write_text(
+                        json.dumps({"strategy": str(background_detection_strategy), "component_mode": "xy_only", "active": False}, indent=2),
                         encoding="utf-8",
                     )
 
@@ -1281,7 +2853,7 @@ class DetectBeltPlaneStage:
 
             candidate_coverage = float(np.count_nonzero(candidate_mask) / max(1, np.count_nonzero(valid_for_fit)))
             seed_mask = candidate_mask.copy()
-            if self.background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus"}:
+            if background_detection_strategy in {"low_gradient_surface", "low_gradient_depth_plateaus", "low_gradient_bg_and_stripes"}:
                 if candidate_coverage < float(self.reference_surface_min_area_ratio):
                     warnings.append("selected_reference_surface_too_small")
                 if candidate_coverage < 0.02:
@@ -1396,6 +2968,9 @@ class DetectBeltPlaneStage:
         residuals = _plane_residuals(all_valid_points, coeffs) if all_valid_points.size else np.asarray([], dtype=np.float64)
         residual_abs = np.abs(residuals) if residuals.size else np.asarray([0.0], dtype=np.float64)
         residual_map = _residual_map(frame, coeffs)
+        if background_detection_strategy == "low_gradient_bg_and_stripes":
+            expanded_plane_mask = belt_bg_mask.copy()
+            final_plane_inlier_mask = belt_bg_mask.copy()
         if np.count_nonzero(final_plane_inlier_mask):
             belt_mask = final_plane_inlier_mask
         else:
@@ -1469,6 +3044,656 @@ class DetectBeltPlaneStage:
             residual_map[~frame.valid_mask] = 0.0
             warnings.append("constant_z_fallback_used")
 
+        reference_model_inlier_mask = belt_mask.copy()
+        if background_detection_strategy == "low_gradient_bg_and_stripes":
+            reference_model_inlier_mask = belt_bg_mask.copy()
+            reference_suppression_mask = (belt_bg_mask | stripes_mask).copy()
+            surface_suppression_mask = reference_suppression_mask.copy()
+            object_search_domain_mask = valid_for_fit & (~surface_suppression_mask)
+            belt_mask = reference_model_inlier_mask.copy()
+        else:
+            reference_suppression_mask = _resolve_reference_suppression_mask(
+                reference_suppression_mask_policy,
+                selected_support_mask=candidate_mask,
+                expanded_support_mask=expanded_plane_mask,
+                final_model_inlier_mask=reference_model_inlier_mask,
+            )
+        selected_blob_cluster_mask = selected_pre_refine_mask.copy() if background_detection_strategy == "low_gradient_blob_height_clusters" else candidate_mask.copy()
+        candidate_refined_support_mask = selected_refined_mask.copy() if background_detection_strategy == "low_gradient_blob_height_clusters" else candidate_mask.copy()
+        stripe_filtered_reference_support_mask = candidate_mask.copy()
+        selected_reference_support_mask = candidate_mask.copy()
+        reference_model_support_mask = reference_model_inlier_mask.copy()
+        support_removed_by_candidate_refinement = (
+            selected_blob_cluster_mask & (~candidate_refined_support_mask)
+            if background_detection_strategy == "low_gradient_blob_height_clusters"
+            else np.zeros_like(candidate_mask, dtype=bool)
+        )
+        support_removed_by_stripe_filter = (
+            candidate_refined_support_mask & (~stripe_filtered_reference_support_mask)
+            if background_detection_strategy == "low_gradient_blob_height_clusters"
+            else np.zeros_like(candidate_mask, dtype=bool)
+        )
+        support_removed_by_model_residual = selected_reference_support_mask & (~reference_model_support_mask)
+        support_added_by_candidate_refinement = candidate_refined_support_mask & (~selected_blob_cluster_mask)
+        support_added_by_stripe_filter = stripe_filtered_reference_support_mask & (~candidate_refined_support_mask)
+        support_added_by_model_expansion = reference_model_support_mask & (~selected_reference_support_mask)
+        support_removed_by_suppression_policy = reference_model_support_mask & (~reference_suppression_mask)
+        support_added_by_suppression_policy = reference_suppression_mask & (~reference_model_support_mask)
+
+        def _lineage_overlay(source_mask: np.ndarray, removed_mask: np.ndarray, added_mask: np.ndarray | None = None) -> np.ndarray:
+            overlay_img = _height_color_image(frame.z_mm, valid_for_fit)
+            source_mask_bool = np.asarray(source_mask, dtype=bool)
+            removed_mask_bool = np.asarray(removed_mask, dtype=bool)
+            added_mask_bool = np.asarray(added_mask, dtype=bool) if added_mask is not None else np.zeros_like(source_mask_bool, dtype=bool)
+            kept_mask = source_mask_bool & (~removed_mask_bool)
+            overlay_img[kept_mask] = (0, 255, 0)
+            overlay_img[removed_mask_bool] = (0, 0, 255)
+            overlay_img[added_mask_bool] = (255, 0, 0)
+            return overlay_img
+
+        def _mask_step(
+            *,
+            step_id: str,
+            label: str,
+            status: str,
+            enabled: bool,
+            input_mask: np.ndarray | None,
+            output_mask: np.ndarray | None,
+            removed_mask: np.ndarray | None,
+            added_mask: np.ndarray | None,
+            primary_reason: str,
+            input_artifacts: list[str],
+            output_artifacts: list[str],
+            removed_artifacts: list[str],
+            added_artifacts: list[str],
+            parameters: dict[str, Any],
+        ) -> dict[str, Any]:
+            input_pixels = None if input_mask is None else int(np.count_nonzero(input_mask))
+            output_pixels = None if output_mask is None else int(np.count_nonzero(output_mask))
+            input_valid_roi_ratio = None if input_mask is None else float(np.count_nonzero(np.asarray(input_mask, dtype=bool) & valid_for_fit) / max(1, np.count_nonzero(valid_for_fit)))
+            output_valid_roi_ratio = None if output_mask is None else float(np.count_nonzero(np.asarray(output_mask, dtype=bool) & valid_for_fit) / max(1, np.count_nonzero(valid_for_fit)))
+            if removed_mask is None:
+                removed_pixels = None
+                removed_fraction = None
+            else:
+                removed_pixels = int(np.count_nonzero(removed_mask))
+                removed_fraction = None if input_pixels in (None, 0) else float(removed_pixels / max(1, input_pixels))
+            if added_mask is None:
+                added_pixels = None
+                added_fraction = None
+            else:
+                added_pixels = int(np.count_nonzero(added_mask))
+                added_fraction = None if input_pixels in (None, 0) else float(added_pixels / max(1, input_pixels))
+            net_change_pixels = (
+                None
+                if input_pixels is None or output_pixels is None
+                else int(output_pixels - input_pixels)
+            )
+            net_change_fraction = None if input_pixels in (None, 0) or net_change_pixels is None else float(net_change_pixels / max(1, input_pixels))
+            if input_mask is None or output_mask is None:
+                change_type = "unknown"
+            elif status == "skipped" and input_pixels == output_pixels:
+                change_type = "skipped"
+            elif input_pixels == output_pixels and np.array_equal(np.asarray(input_mask, dtype=bool), np.asarray(output_mask, dtype=bool)):
+                change_type = "alias"
+            elif removed_pixels and added_pixels:
+                change_type = "mixed"
+            elif output_pixels > input_pixels:
+                change_type = "expand"
+            elif output_pixels < input_pixels:
+                change_type = "shrink"
+            elif input_pixels == output_pixels:
+                change_type = "same"
+            else:
+                change_type = "unknown"
+            return {
+                "id": step_id,
+                "label": label,
+                "status": status,
+                "enabled": bool(enabled),
+                "input_pixels": input_pixels,
+                "output_pixels": output_pixels,
+                "input_valid_roi_ratio": input_valid_roi_ratio,
+                "output_valid_roi_ratio": output_valid_roi_ratio,
+                "removed_pixels": removed_pixels,
+                "removed_fraction": removed_fraction,
+                "added_pixels": added_pixels,
+                "added_fraction": added_fraction,
+                "net_change_pixels": net_change_pixels,
+                "net_change_fraction": net_change_fraction,
+                "change_type": change_type,
+                "primary_reason": primary_reason,
+                "input_artifacts": input_artifacts,
+                "output_artifacts": output_artifacts,
+                "removed_artifacts": removed_artifacts,
+                "added_artifacts": added_artifacts,
+                "parameters": parameters,
+            }
+
+        resolved_suppression_policy = (
+            "bg_or_stripes" if background_detection_strategy == "low_gradient_bg_and_stripes"
+            else "selected_support" if np.array_equal(reference_suppression_mask, selected_reference_support_mask)
+            else "expanded_support" if np.array_equal(reference_suppression_mask, expanded_plane_mask)
+            else "final_model_inliers" if np.array_equal(reference_suppression_mask, reference_model_support_mask)
+            else "custom"
+        )
+        selected_surface_alias_resolves_to = (
+            "selected_reference_support_mask"
+            if np.count_nonzero(selected_reference_support_mask)
+            else "reference_surface_selected_mask"
+        )
+        reference_support_lineage_steps = [
+            _mask_step(
+                step_id="selected_blob_cluster",
+                label="Selected blob cluster",
+                status="ok",
+                enabled=True,
+                input_mask=None,
+                output_mask=selected_blob_cluster_mask,
+                removed_mask=np.zeros_like(selected_blob_cluster_mask, dtype=bool),
+                added_mask=None,
+                primary_reason=(
+                    f"{selected_cluster.get('cluster_id')} selected by score"
+                    if background_detection_strategy == "low_gradient_blob_height_clusters" and isinstance(selected_cluster, dict)
+                    else "selected support seed resolved"
+                ),
+                input_artifacts=[],
+                output_artifacts=["selected_blob_cluster_mask"],
+                removed_artifacts=[],
+                added_artifacts=[],
+                parameters={
+                    "selected_cluster_id": (
+                        selected_cluster.get("cluster_id")
+                        if background_detection_strategy == "low_gradient_blob_height_clusters" and isinstance(selected_cluster, dict)
+                        else None
+                    ),
+                },
+            ),
+            _mask_step(
+                step_id="candidate_refinement",
+                label="Candidate refinement",
+                status="ok" if bool(self.blob_cluster_refine_by_mad) else "skipped",
+                enabled=bool(self.blob_cluster_refine_by_mad),
+                input_mask=selected_blob_cluster_mask,
+                output_mask=candidate_refined_support_mask,
+                removed_mask=support_removed_by_candidate_refinement,
+                added_mask=support_added_by_candidate_refinement,
+                primary_reason=(
+                    "MAD band refinement applied"
+                    if bool(self.blob_cluster_refine_by_mad)
+                    else "refine_by_mad disabled"
+                ),
+                input_artifacts=["selected_blob_cluster_pre_refine_mask"],
+                output_artifacts=["selected_blob_cluster_refined_mask"],
+                removed_artifacts=["support_removed_by_candidate_refinement"],
+                added_artifacts=["support_added_by_candidate_refinement"],
+                parameters={
+                    "blob_cluster_refine_by_mad": bool(self.blob_cluster_refine_by_mad),
+                    "blob_cluster_refine_mad_k": float(self.blob_cluster_refine_mad_k),
+                    "blob_cluster_refine_mad_floor_mm": float(self.blob_cluster_refine_floor_mm),
+                    "blob_cluster_refine_keep_border_support": bool(self.blob_cluster_refine_keep_border_support),
+                    "blob_cluster_min_total_pixels": int(self.blob_cluster_min_total_pixels),
+                    "blob_cluster_fallback_strategy": str(self.blob_cluster_fallback_strategy),
+                },
+            ),
+            _mask_step(
+                step_id="stripe_suppression",
+                label="Stripe suppression",
+                status="ok" if bool(stripe_info.get("applied")) else ("skipped" if not bool(self.belt_stripe_filter_enabled) else "ok"),
+                enabled=bool(self.belt_stripe_filter_enabled),
+                input_mask=candidate_refined_support_mask,
+                output_mask=stripe_filtered_reference_support_mask,
+                removed_mask=support_removed_by_stripe_filter,
+                added_mask=support_added_by_stripe_filter,
+                primary_reason=(
+                    "belt_stripes_mask removed from support"
+                    if np.count_nonzero(support_removed_by_stripe_filter)
+                    else str(stripe_info.get("skip_reason") or "no stripe pixels removed")
+                ),
+                input_artifacts=["selected_blob_cluster_refined_mask"],
+                output_artifacts=["stripe_filtered_reference_support_mask", "selected_reference_support_mask"],
+                removed_artifacts=["support_removed_by_stripe_filter"],
+                added_artifacts=["support_added_by_stripe_filter"],
+                parameters={
+                    "belt_stripe_filter_enabled": bool(self.belt_stripe_filter_enabled),
+                    "belt_stripe_filter_scope": filter_scope,
+                    "belt_stripe_filter_threshold_mode": str(self.belt_stripe_filter_threshold_mode),
+                    "belt_stripe_filter_min_altitude_mm": float(self.belt_stripe_filter_min_altitude_mm),
+                    "belt_stripe_filter_z_floor_enabled": bool(self.belt_stripe_filter_z_floor_enabled),
+                    "belt_stripe_filter_object_kernel_mm": float(self.belt_stripe_filter_object_kernel_mm),
+                    "belt_stripe_filter_max_stripe_height_mm": float(self.belt_stripe_filter_max_stripe_height_mm),
+                    "belt_stripe_filter_warn_removed_fraction": float(self.belt_stripe_filter_warn_removed_fraction),
+                },
+            ),
+            _mask_step(
+                step_id="reference_model_support",
+                label="Reference model support",
+                status="ok",
+                enabled=True,
+                input_mask=selected_reference_support_mask,
+                output_mask=reference_model_support_mask,
+                removed_mask=support_removed_by_model_residual,
+                added_mask=support_added_by_model_expansion,
+                primary_reason=(
+                    "constant_z residual threshold / model inlier filtering"
+                    if reference_model_type == "constant_z"
+                    else "plane residual threshold / model inlier filtering"
+                ),
+                input_artifacts=["selected_reference_support_mask"],
+                output_artifacts=["reference_model_support_mask", "reference_model_inlier_mask"],
+                removed_artifacts=["support_removed_by_model_residual"],
+                added_artifacts=["support_added_by_model_expansion"],
+                parameters={
+                    "reference_surface_model": str(self.reference_surface_model),
+                    "resolved_reference_surface_model": reference_model_type,
+                    "plane_fit_residual_threshold_mm": float(self.plane_fit_residual_threshold_mm),
+                    "plane_background_residual_tolerance_mode": str(self.plane_background_residual_tolerance_mode),
+                    "plane_background_residual_tolerance_mm": float(self.plane_background_residual_tolerance_mm),
+                    "plane_background_residual_adaptive_multiplier": float(self.plane_background_residual_adaptive_multiplier),
+                    "plane_fit_min_inlier_ratio": float(self.plane_fit_min_inlier_ratio),
+                    "plane_refit_after_expansion": bool(self.plane_refit_after_expansion),
+                },
+            ),
+            _mask_step(
+                step_id="suppression_mask",
+                label="Suppression mask",
+                status="ok",
+                enabled=True,
+                input_mask=reference_model_support_mask,
+                output_mask=reference_suppression_mask,
+                removed_mask=support_removed_by_suppression_policy,
+                added_mask=support_added_by_suppression_policy,
+                primary_reason=f"policy {reference_suppression_mask_policy} resolved to {resolved_suppression_policy}",
+                input_artifacts=["reference_model_support_mask"],
+                output_artifacts=["reference_suppression_mask"],
+                removed_artifacts=["support_removed_by_suppression_policy"],
+                added_artifacts=["support_added_by_suppression_policy"],
+                parameters={
+                    "reference_suppression_mask_policy": reference_suppression_mask_policy,
+                    "resolved_policy": resolved_suppression_policy,
+                },
+            ),
+        ]
+        largest_loss_step = None
+        largest_loss_fraction = 0.0
+        largest_gain_step = None
+        largest_gain_fraction = 0.0
+        for step in reference_support_lineage_steps:
+            frac = step.get("removed_fraction")
+            if isinstance(frac, (int, float)) and float(frac) > largest_loss_fraction:
+                largest_loss_fraction = float(frac)
+                largest_loss_step = str(step.get("id"))
+            gain_frac = step.get("added_fraction")
+            if isinstance(gain_frac, (int, float)) and float(gain_frac) > largest_gain_fraction:
+                largest_gain_fraction = float(gain_frac)
+                largest_gain_step = str(step.get("id"))
+        reference_support_lineage_summary = {
+            "selected_cluster_artifact": "selected_blob_cluster_mask",
+            "selected_reference_support_artifact": "selected_reference_support_mask",
+            "reference_model_support_artifact": "reference_model_support_mask",
+            "reference_suppression_artifact": "reference_suppression_mask",
+            "selected_surface_alias_resolves_to": selected_surface_alias_resolves_to,
+            "selected_surface_alias_role": "selected_support",
+            "largest_support_loss_step": largest_loss_step,
+            "largest_support_loss_fraction": largest_loss_fraction,
+            "largest_support_gain_step": largest_gain_step,
+            "largest_support_gain_fraction": largest_gain_fraction,
+            "selected_cluster_pixels": int(np.count_nonzero(selected_blob_cluster_mask)),
+            "selected_reference_support_pixels": int(np.count_nonzero(selected_reference_support_mask)),
+            "reference_model_support_pixels": int(np.count_nonzero(reference_model_support_mask)),
+            "reference_suppression_pixels": int(np.count_nonzero(reference_suppression_mask)),
+            "selected_cluster_valid_roi_ratio": float(np.count_nonzero(selected_blob_cluster_mask) / max(1, np.count_nonzero(valid_for_fit))),
+            "selected_reference_support_valid_roi_ratio": float(np.count_nonzero(selected_reference_support_mask) / max(1, np.count_nonzero(valid_for_fit))),
+            "reference_model_support_valid_roi_ratio": float(np.count_nonzero(reference_model_support_mask) / max(1, np.count_nonzero(valid_for_fit))),
+            "reference_suppression_valid_roi_ratio": float(np.count_nonzero(reference_suppression_mask) / max(1, np.count_nonzero(valid_for_fit))),
+        }
+        selected_support_lineage = {
+            "stage": "detect_belt_plane",
+            "strategy": background_detection_strategy,
+            "selected_cluster_id": (
+                selected_cluster.get("cluster_id")
+                if background_detection_strategy == "low_gradient_blob_height_clusters" and isinstance(selected_cluster, dict)
+                else None
+            ),
+            "reference_surface_model": str(self.reference_surface_model),
+            "resolved_reference_surface_model": reference_model_type,
+            "reference_suppression_mask_policy": reference_suppression_mask_policy,
+            "resolved_suppression_policy": resolved_suppression_policy,
+            "fallback_used": bool(fallback_used) if background_detection_strategy == "low_gradient_blob_height_clusters" else False,
+            "fallback_reason": fallback_reason if background_detection_strategy == "low_gradient_blob_height_clusters" else None,
+            "selected_surface_alias_resolves_to": selected_surface_alias_resolves_to,
+            "selected_surface_alias_role": "selected_support",
+            "steps": reference_support_lineage_steps,
+            "summary": reference_support_lineage_summary,
+            "warnings": warnings,
+        }
+        rejection_reason_counts: dict[str, int] = {}
+        for row in fragment_rows:
+            if bool(row.get("rejected")):
+                key = str(row.get("rejection_reason") or "rejected")
+                rejection_reason_counts[key] = rejection_reason_counts.get(key, 0) + 1
+        component_formation_debug = {
+            "component_mode": blob_component_mode_used if background_detection_strategy == "low_gradient_blob_height_clusters" else str(self.blob_component_mode),
+            "connectivity": int(self.blob_connectivity),
+            "neighbor_z_tolerance_mm": float(self.blob_neighbor_z_tolerance_mm),
+            "max_local_slope_mm_per_px": float(self.blob_component_max_local_slope_mm_per_px),
+            "use_smoothed_z": bool(self.blob_component_use_smoothed_z),
+            "min_area_px": int(self.blob_component_min_area_px),
+            "components_before_filter": int(height_aware_connectivity_debug.get("component_count") or len(blob_rows)),
+            "components_after_filter": int(len(blob_rows)),
+            "rejected_edges_count": int(height_aware_connectivity_debug.get("rejected_neighbor_edges") or 0),
+            "selected_component_ids": [int(v) for v in (selected_cluster.get("blob_ids") or [])] if isinstance(selected_cluster, dict) else [],
+            "compact_summary": _make_debug_compact_summary(
+                title="Component formation",
+                input_count=int(np.count_nonzero(low_grad_mask)),
+                output_count=int(len(blob_rows)),
+                rejected_reasons=rejection_reason_counts,
+                fallback_used=bool(fallback_used) if background_detection_strategy == "low_gradient_blob_height_clusters" else False,
+                fallback_reason=fallback_reason if background_detection_strategy == "low_gradient_blob_height_clusters" else None,
+                warnings=warnings,
+                key_parameters={
+                    "blob_component_mode": blob_component_mode_used if background_detection_strategy == "low_gradient_blob_height_clusters" else str(self.blob_component_mode),
+                    "blob_connectivity": int(self.blob_connectivity),
+                    "blob_neighbor_z_tolerance_mm": float(self.blob_neighbor_z_tolerance_mm),
+                    "blob_component_max_local_slope_mm_per_px": float(self.blob_component_max_local_slope_mm_per_px),
+                    "blob_component_use_smoothed_z": bool(self.blob_component_use_smoothed_z),
+                },
+                affected_downstream_artifacts=["height_aware_connectivity_rejected_edges", "height_border_fragments_mask", "blob_height_clusters"],
+            ),
+        }
+        height_border_detection_debug = {
+            "threshold_mode": str(self.blob_split_height_border_threshold_mode),
+            "percentile": float(self.blob_split_height_border_percentile),
+            "min_delta_mm": float(self.blob_split_height_border_min_delta_mm),
+            "smoothing_kernel": int(self.blob_split_height_border_smoothing_kernel),
+            "candidate_border_count": int(np.count_nonzero(border_cut_mask)),
+            "accepted_cut_count": int(np.count_nonzero(border_cut_mask)),
+            "rejected_cut_count": max(0, int(np.count_nonzero(height_aware_rejected_edge_mask)) - int(np.count_nonzero(border_cut_mask))),
+            "compact_summary": _make_debug_compact_summary(
+                title="Height-border detection",
+                input_count=int(np.count_nonzero(fragment_labels > 0)) if np.any(fragment_labels > 0) else int(np.count_nonzero(blob_labels > 0)),
+                output_count=int(np.count_nonzero(border_cut_mask)),
+                warnings=warnings,
+                key_parameters={
+                    "blob_split_height_border_threshold_mode": str(self.blob_split_height_border_threshold_mode),
+                    "blob_split_height_border_percentile": float(self.blob_split_height_border_percentile),
+                    "blob_split_height_border_min_delta_mm": float(self.blob_split_height_border_min_delta_mm),
+                    "blob_split_height_border_smoothing_kernel": int(self.blob_split_height_border_smoothing_kernel),
+                },
+                affected_downstream_artifacts=["height_border_fragments_mask", "height_split_blob_fragments_mask"],
+            ),
+        }
+        candidate_support_refinement_debug = {
+            "pre_refine_area_px": int(np.count_nonzero(selected_blob_cluster_mask)),
+            "post_refine_area_px": int(np.count_nonzero(candidate_refined_support_mask)),
+            "removed_by_candidate_refinement_px": int(np.count_nonzero(support_removed_by_candidate_refinement)),
+            "removed_by_mad_px": int(np.count_nonzero(support_removed_by_candidate_refinement)),
+            "removed_by_border_px": 0,
+            "removed_by_min_area_px": 0,
+            "refine_by_mad_enabled": bool(self.blob_cluster_refine_by_mad),
+            "keep_border_support_enabled": bool(self.blob_cluster_refine_keep_border_support),
+            "compact_summary": _make_debug_compact_summary(
+                title="Candidate support refinement",
+                input_count=int(np.count_nonzero(selected_blob_cluster_mask)),
+                output_count=int(np.count_nonzero(candidate_refined_support_mask)),
+                selected_id=str(selected_cluster.get("cluster_id")) if isinstance(selected_cluster, dict) else None,
+                warnings=warnings,
+                key_parameters={
+                    "blob_cluster_refine_by_mad": bool(self.blob_cluster_refine_by_mad),
+                    "blob_cluster_refine_mad_k": float(self.blob_cluster_refine_mad_k),
+                    "blob_cluster_refine_floor_mm": float(self.blob_cluster_refine_floor_mm),
+                    "blob_cluster_refine_keep_border_support": bool(self.blob_cluster_refine_keep_border_support),
+                },
+                affected_downstream_artifacts=["selected_blob_cluster_refined_mask", "support_removed_by_candidate_refinement", "selected_reference_support_mask"],
+            ),
+        }
+        stripe_overlap_with_fit_support_px = int(np.count_nonzero(reference_model_support_mask & stripes_mask))
+        final_support_debug = {
+            "logical_support_area_px": int(np.count_nonzero(selected_blob_cluster_mask)),
+            "fit_support_area_px": int(np.count_nonzero(reference_model_support_mask)),
+            "suppression_mask_area_px": int(np.count_nonzero(reference_suppression_mask)),
+            "bridge_only_area_px": max(0, int(np.count_nonzero(selected_blob_cluster_mask)) - int(np.count_nonzero(selected_reference_support_mask))),
+            "stripe_overlap_with_fit_support_px": stripe_overlap_with_fit_support_px,
+            "fit_support_excludes_stripes": stripe_overlap_with_fit_support_px == 0,
+            "fit_support_excludes_bridge_pixels": int(np.count_nonzero(reference_model_support_mask & (~selected_reference_support_mask))) == 0,
+            "final_model_type": reference_model_type,
+            "fallback_reason": fallback_reason if fallback_used else None,
+            "compact_summary": _make_debug_compact_summary(
+                title="Final support vs fit support",
+                input_count=int(np.count_nonzero(selected_blob_cluster_mask)),
+                output_count=int(np.count_nonzero(reference_model_support_mask)),
+                selected_id=str(selected_cluster.get("cluster_id")) if isinstance(selected_cluster, dict) else None,
+                selected_reason=model_selection_reason,
+                fallback_used=bool(fallback_used),
+                fallback_reason=fallback_reason,
+                warnings=warnings,
+                key_parameters={
+                    "reference_surface_model": str(self.reference_surface_model),
+                    "resolved_reference_surface_model": reference_model_type,
+                    "reference_suppression_mask_policy": reference_suppression_mask_policy,
+                },
+                affected_downstream_artifacts=["reference_model_support_mask", "reference_suppression_mask", "final_plane_inlier_mask"],
+                extra={"stripe_overlap_with_fit_support_px": stripe_overlap_with_fit_support_px},
+            ),
+        }
+        support_loss_waterfall = [
+            _support_loss_row(row_id="valid_roi", label="Valid ROI", substage_id="input", mask_artifact_id="valid_mask", mask=valid_for_fit, previous_mask=None, valid_roi_mask=valid_for_fit, notes="Stage-valid pixels inside ROI."),
+            _support_loss_row(row_id="low_gradient_candidates", label="Low-gradient candidates", substage_id="gradient", mask_artifact_id="low_gradient_mask", mask=low_grad_mask, previous_mask=valid_for_fit, valid_roi_mask=valid_for_fit, parameters_used_summary={"gradient_threshold_percentile": float(self.gradient_threshold_percentile)}),
+            _support_loss_row(row_id="height_gate_candidates", label="Height-gated candidates", substage_id="height_gate", mask_artifact_id="flat_candidate_mask", mask=flat_candidate_mask if 'flat_candidate_mask' in locals() else None, previous_mask=low_grad_mask, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="component_candidates", label="Component candidates", substage_id="component_formation", mask_artifact_id="low_gradient_blob_id_mask", mask=(blob_labels > 0) if 'blob_labels' in locals() else None, previous_mask=flat_candidate_mask if 'flat_candidate_mask' in locals() else low_grad_mask, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="height_aware_components", label="Height-aware components", substage_id="height_aware_connectivity", mask_artifact_id="height_aware_blob_id_mask", mask=(blob_labels > 0) if background_detection_strategy == "low_gradient_blob_height_clusters" else None, previous_mask=(blob_labels > 0) if 'blob_labels' in locals() else None, valid_roi_mask=valid_for_fit, notes="Connectivity-compatible components after rejected Z-connections."),
+            _support_loss_row(row_id="height_border_fragments", label="Height-border fragments", substage_id="blob_splitting", mask_artifact_id="height_border_fragments_mask", mask=border_fragment_mask if 'border_fragment_mask' in locals() else None, previous_mask=(blob_labels > 0) if 'blob_labels' in locals() else None, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="post_merge_fragments", label="Post-merge fragments", substage_id="fragment_merge", mask_artifact_id="height_split_blob_fragments_mask", mask=(fragment_labels > 0) if 'fragment_labels' in locals() else None, previous_mask=border_fragment_mask if 'border_fragment_mask' in locals() else None, valid_roi_mask=valid_for_fit, largest_loss_reason="weak_boundary_merge_disabled" if not bool(self.blob_split_merge_weak_boundaries) else None),
+            _support_loss_row(row_id="height_clusters", label="Height clusters", substage_id="height_clustering", mask_artifact_id="height_split_blob_fragments_mask", mask=np.isin(fragment_labels, [int(row.get("fragment_id") or 0) for row in fragment_rows if not bool(row.get("rejected"))]) if 'fragment_labels' in locals() else None, previous_mask=(fragment_labels > 0) if 'fragment_labels' in locals() else None, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="selected_height_cluster", label="Selected height cluster", substage_id="height_clustering", mask_artifact_id="selected_blob_cluster_mask", mask=selected_blob_cluster_mask, previous_mask=np.isin(fragment_labels, [int(row.get("fragment_id") or 0) for row in fragment_rows if not bool(row.get("rejected"))]) if 'fragment_labels' in locals() else None, valid_roi_mask=valid_for_fit, notes=(str(selected_cluster.get("cluster_id")) if isinstance(selected_cluster, dict) else None)),
+            _support_loss_row(row_id="selected_cluster_pre_refine", label="Selected cluster pre-refine", substage_id="candidate_support_refinement", mask_artifact_id="selected_blob_cluster_pre_refine_mask", mask=selected_blob_cluster_mask, previous_mask=selected_blob_cluster_mask, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="selected_cluster_refined", label="Selected cluster refined", substage_id="candidate_support_refinement", mask_artifact_id="selected_blob_cluster_refined_mask", mask=candidate_refined_support_mask, previous_mask=selected_blob_cluster_mask, valid_roi_mask=valid_for_fit, largest_loss_reason="candidate_refinement"),
+            _support_loss_row(row_id="stripe_filtered_support", label="Stripe-filtered support", substage_id="stripes", mask_artifact_id="stripe_filtered_reference_support_mask", mask=stripe_filtered_reference_support_mask, previous_mask=candidate_refined_support_mask, valid_roi_mask=valid_for_fit, largest_loss_reason="stripe_suppression" if np.count_nonzero(support_removed_by_stripe_filter) else None),
+            _support_loss_row(row_id="final_selected_support", label="Final selected support", substage_id="final_support", mask_artifact_id="selected_reference_support_mask", mask=selected_reference_support_mask, previous_mask=stripe_filtered_reference_support_mask, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="reference_model_fit_support", label="Reference-model fit support", substage_id="final_support", mask_artifact_id="reference_model_support_mask", mask=reference_model_support_mask, previous_mask=selected_reference_support_mask, valid_roi_mask=valid_for_fit, largest_loss_reason="model_residual_filter"),
+            _support_loss_row(row_id="reference_suppression_mask", label="Reference suppression mask", substage_id="final_support", mask_artifact_id="reference_suppression_mask", mask=reference_suppression_mask, previous_mask=reference_model_support_mask, valid_roi_mask=valid_for_fit),
+            _support_loss_row(row_id="plane_inliers", label="Plane inliers", substage_id="plane_fit", mask_artifact_id="final_plane_inlier_mask", mask=final_plane_inlier_mask, previous_mask=reference_model_support_mask, valid_roi_mask=valid_for_fit),
+        ]
+        for index, row in enumerate(support_loss_waterfall):
+            row["order_index"] = index
+        resolved_reference_method = {
+            "preset_id": _reference_method_preset_id(
+                background_detection_strategy=background_detection_strategy,
+                blob_component_mode=str(self.blob_component_mode),
+                blob_split_method=str(self.blob_split_method),
+                reference_surface_model=str(self.reference_surface_model),
+                reference_suppression_mask_policy=reference_suppression_mask_policy,
+                blob_component_use_smoothed_z=bool(self.blob_component_use_smoothed_z),
+                blob_neighbor_z_tolerance_mm=float(self.blob_neighbor_z_tolerance_mm),
+            ),
+            "support_selection_method": support_selection_method,
+            "background_detection_strategy": background_detection_strategy,
+            "blob_component_mode": str(self.blob_component_mode),
+            "blob_split_method": str(self.blob_split_method),
+            "reference_surface_model": str(self.reference_surface_model),
+            "resolved_reference_surface_model": reference_model_type,
+            "reference_suppression_mask_policy": reference_suppression_mask_policy,
+            "fallback_used": model_selection_reason == "auto_constant_z_fallback",
+            "fallback_strategy": "constant_z" if model_selection_reason == "auto_constant_z_fallback" else None,
+        }
+
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.roi",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            parameters={"plane_fit_roi": roi_cfg} if "roi_cfg" in locals() else {},
+            output_artifacts=["plane_fit_roi_mask"],
+            metrics={"roi_pixels": int(np.count_nonzero(roi_mask)), "valid_roi_pixels": int(np.count_nonzero(valid_for_fit))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.height_gate",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            parameters={
+                "background_detection_strategy": background_detection_strategy,
+                "reference_surface_min_area_ratio": float(self.reference_surface_min_area_ratio),
+            },
+            input_artifacts=["plane_fit_roi_mask"],
+            output_artifacts=["height_gate_mask", "flat_candidate_mask", "reference_surface_candidates"],
+            metrics={
+                "height_gate_pixels": int(np.count_nonzero(active_height_gate_mask)),
+                "candidate_pixels": int(np.count_nonzero(candidate_mask)),
+                "candidate_coverage": float(candidate_coverage),
+            },
+            warnings=[warning for warning in warnings if "background_candidate" in warning or "reference_surface" in warning],
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.depth_gradient",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            parameters={"gradient_threshold_percentile": float(self.gradient_threshold_percentile)},
+            input_artifacts=["plane_fit_roi_mask"],
+            output_artifacts=["depth_gradient_magnitude", "low_gradient_mask", "gradient_debug"],
+            metrics={"low_gradient_pixels": int(np.count_nonzero(low_grad_mask))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.depth_plateaus",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="completed" if background_detection_strategy in {"low_gradient_depth_plateaus", "low_gradient_bg_and_stripes"} else "skipped",
+            parameters={"low_gradient_plateau_selection_mode": str(self.low_gradient_plateau_selection_mode)},
+            input_artifacts=["low_gradient_mask"],
+            output_artifacts=["reference_surface_plateaus", "reference_surface_candidates", "background_selected_plateau_mask"],
+            metrics={"selected_plateau_pixels": int(np.count_nonzero(candidate_mask))},
+            diagnostics={"strategy": background_detection_strategy},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.blob_components",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="completed" if background_detection_strategy in {"low_gradient_blob_height_clusters", "low_gradient_bg_and_stripes"} else "skipped",
+            parameters={
+                "blob_component_mode": str(self.blob_component_mode),
+                "blob_connectivity": int(self.blob_connectivity),
+                "blob_component_min_area_px": int(self.blob_component_min_area_px),
+            },
+            input_artifacts=["low_gradient_mask"],
+            output_artifacts=["low_gradient_blob_id_mask", "low_gradient_blob_components_overlay", "height_aware_blob_components_overlay"],
+            metrics={"component_count": int(len(blob_rows)), "selected_component_count": int(len((selected_cluster.get("blob_ids") or []) if isinstance(selected_cluster, dict) else []))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.blob_splitting",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="skipped" if background_detection_strategy != "low_gradient_blob_height_clusters" else "completed",
+            parameters={"blob_split_method": str(self.blob_split_method)},
+            input_artifacts=["low_gradient_blob_id_mask"],
+            output_artifacts=["height_border_fragments_mask", "height_split_blob_fragments_mask", "height_split_debug"],
+            metrics={"fragment_count": int(len(fragment_rows)), "border_cut_pixels": int(np.count_nonzero(border_cut_mask))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.fragment_merge",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="skipped" if background_detection_strategy != "low_gradient_blob_height_clusters" else "completed",
+            parameters={"blob_split_merge_weak_boundaries": bool(self.blob_split_merge_weak_boundaries)},
+            input_artifacts=["height_split_blob_fragments_mask"],
+            output_artifacts=["fragment_merge_debug"],
+            metrics={"merged_fragment_count": int(len(fragment_rows))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.candidate_support_refinement",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="skipped" if not bool(self.blob_cluster_refine_by_mad) else "completed",
+            parameters={
+                "blob_cluster_refine_by_mad": bool(self.blob_cluster_refine_by_mad),
+                "blob_cluster_refine_mad_k": float(self.blob_cluster_refine_mad_k),
+                "blob_cluster_refine_floor_mm": float(self.blob_cluster_refine_floor_mm),
+                "blob_cluster_refine_keep_border_support": bool(self.blob_cluster_refine_keep_border_support),
+            },
+            input_artifacts=["selected_blob_cluster_pre_refine_mask"],
+            output_artifacts=["selected_blob_cluster_refined_mask", "support_removed_by_candidate_refinement"],
+            metrics={
+                "selected_cluster_pixels": int(np.count_nonzero(selected_blob_cluster_mask)),
+                "refined_support_pixels": int(np.count_nonzero(candidate_refined_support_mask)),
+                "removed_pixels": int(np.count_nonzero(support_removed_by_candidate_refinement)),
+            },
+            diagnostics={"selected_cluster_id": selected_cluster.get("cluster_id") if isinstance(selected_cluster, dict) else None},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.stripe_filter",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="skipped" if not bool(self.belt_stripe_filter_enabled) or not bool(stripe_info.get("applied")) else "completed",
+            parameters={
+                "belt_stripe_filter_enabled": bool(self.belt_stripe_filter_enabled),
+                "belt_stripe_filter_scope": filter_scope,
+                "belt_stripe_filter_threshold_mode": str(self.belt_stripe_filter_threshold_mode),
+            },
+            input_artifacts=["selected_blob_cluster_refined_mask"],
+            output_artifacts=["belt_stripes_mask", "stripe_filtered_reference_support_mask", "support_removed_by_stripe_filter"],
+            metrics={
+                "stripe_pixels": int(np.count_nonzero(stripes_mask)),
+                "removed_pixels": int(np.count_nonzero(support_removed_by_stripe_filter)),
+                "output_pixels": int(np.count_nonzero(stripe_filtered_reference_support_mask)),
+                "raw_negative_altitude_pixels": int(
+                    ((stripe_info.get("invariants") or {}).get("raw_negative_altitude_pixel_count") or 0)
+                ),
+                "clamped_negative_altitude_pixels": int(
+                    ((stripe_info.get("invariants") or {}).get("negative_altitude_pixel_count") or 0)
+                ),
+            },
+            diagnostics={"skip_reason": stripe_info.get("skip_reason"), "applied": stripe_info.get("applied")},
+            warnings=[warning for warning in warnings if "stripe" in warning],
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.reference_model_fit",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            status="warning" if warnings else "completed",
+            parameters={
+                "reference_surface_model": str(self.reference_surface_model),
+                "resolved_reference_surface_model": reference_model_type,
+                "plane_fit_residual_threshold_mm": float(self.plane_fit_residual_threshold_mm),
+                "plane_fit_min_inlier_ratio": float(self.plane_fit_min_inlier_ratio),
+            },
+            input_artifacts=["selected_reference_support_mask"],
+            output_artifacts=["belt_plane", "final_plane_inlier_mask", "reference_model_support_mask", "plane_fit_debug"],
+            metrics={
+                "sampled_pixel_count": int(sampled_pixel_count),
+                "inlier_ratio": float(inlier_ratio),
+                "residual_p95_abs_mm": float(stats.get("p95_abs_mm") or 0.0),
+                "reference_model_support_pixels": int(np.count_nonzero(reference_model_support_mask)),
+            },
+            diagnostics={"model_selection_reason": model_selection_reason, "plane_fit_status": status},
+            warnings=warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="detect_belt_plane.final_support",
+            stage_id="detect_belt_plane",
+            parent_id="detect_belt_plane",
+            parameters={
+                "reference_suppression_mask_policy": reference_suppression_mask_policy,
+                "resolved_reference_surface_model": reference_model_type,
+            },
+            input_artifacts=["reference_model_support_mask", "stripe_filtered_reference_support_mask"],
+            output_artifacts=["selected_reference_support_mask", "reference_suppression_mask", "final_support_debug", "support_loss_waterfall"],
+            metrics={
+                "selected_support_pixels": int(np.count_nonzero(selected_reference_support_mask)),
+                "reference_model_support_pixels": int(np.count_nonzero(reference_model_support_mask)),
+                "reference_suppression_pixels": int(np.count_nonzero(reference_suppression_mask)),
+            },
+            diagnostics={"largest_support_loss_step": largest_loss_step, "selected_surface_alias_resolves_to": selected_surface_alias_resolves_to},
+            warnings=warnings,
+        )
+
         context.set_artifact("belt_plane", tuple(float(x) for x in coeffs.tolist()))
         context.set_artifact("plane_model", tuple(float(x) for x in coeffs.tolist()))
         context.set_artifact(
@@ -1486,6 +3711,31 @@ class DetectBeltPlaneStage:
         context.set_artifact("expanded_plane_mask", expanded_plane_mask)
         context.set_artifact("final_plane_inlier_mask", belt_mask)
         context.set_artifact("reference_surface_selected_mask", candidate_mask)
+        context.set_artifact("selected_reference_support_mask", selected_reference_support_mask)
+        context.set_artifact("stripe_filtered_reference_support_mask", stripe_filtered_reference_support_mask)
+        context.set_artifact("support_removed_by_candidate_refinement", support_removed_by_candidate_refinement)
+        context.set_artifact("support_added_by_candidate_refinement", support_added_by_candidate_refinement)
+        context.set_artifact("support_removed_by_stripe_filter", support_removed_by_stripe_filter)
+        context.set_artifact("support_added_by_stripe_filter", support_added_by_stripe_filter)
+        context.set_artifact("reference_model_inlier_mask", reference_model_inlier_mask)
+        context.set_artifact("reference_model_support_mask", reference_model_support_mask)
+        context.set_artifact("belt_bg_mask_array", np.asarray(belt_bg_mask, dtype=bool))
+        context.set_artifact("unknown_low_gradient_mask_array", np.asarray(unknown_low_gradient_mask, dtype=bool))
+        context.set_artifact("surface_suppression_mask_array", np.asarray(reference_suppression_mask, dtype=bool))
+        context.set_artifact("object_search_domain_mask_array", np.asarray(object_search_domain_mask, dtype=bool))
+        context.set_artifact("support_removed_by_model_residual", support_removed_by_model_residual)
+        context.set_artifact("support_added_by_model_expansion", support_added_by_model_expansion)
+        context.set_artifact("reference_suppression_mask", reference_suppression_mask)
+        context.set_artifact("support_removed_by_suppression_policy", support_removed_by_suppression_policy)
+        context.set_artifact("support_added_by_suppression_policy", support_added_by_suppression_policy)
+        context.set_artifact("reference_support_lineage", reference_support_lineage_summary)
+        context.set_artifact("selected_support_lineage", selected_support_lineage)
+        context.set_artifact("component_formation_debug", component_formation_debug)
+        context.set_artifact("height_border_detection_debug", height_border_detection_debug)
+        context.set_artifact("candidate_support_refinement_debug", candidate_support_refinement_debug)
+        context.set_artifact("final_support_debug", final_support_debug)
+        context.set_artifact("support_loss_waterfall", support_loss_waterfall)
+        context.set_artifact("reference_method", resolved_reference_method)
         # Expose the belt-stripes mask so downstream segmentation can
         # subtract surface texture (chevron ribs) from foreground candidates.
         # Set even when empty so consumers always find a well-defined mask.
@@ -1498,6 +3748,12 @@ class DetectBeltPlaneStage:
             "reference_surface_model_type": reference_model_type,
             "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
             "model_selection_reason": model_selection_reason,
+            "reference_method": resolved_reference_method,
+            "support_role_metadata": {
+                "background_model_support_artifact": "belt_bg_mask" if background_detection_strategy == "low_gradient_bg_and_stripes" else "reference_model_support_mask",
+                "surface_suppression_artifact": "surface_suppression_mask" if background_detection_strategy == "low_gradient_bg_and_stripes" else "reference_suppression_mask",
+                "stripes_excluded_from_background_fit": background_detection_strategy == "low_gradient_bg_and_stripes",
+            },
             "equation": {"a": float(coeffs[0]), "b": float(coeffs[1]), "c": float(coeffs[2]), "d": float(coeffs[3])},
             "residual_stats_mm": stats,
             "status": status,
@@ -1524,7 +3780,7 @@ class DetectBeltPlaneStage:
         # verify the lower-belt vs raised-chevron separation against what the
         # plateau analysis actually saw. Only re-emit empty placeholders here
         # for non-plateau strategies so the artifact contract stays stable.
-        if self.background_detection_strategy != "low_gradient_depth_plateaus":
+        if background_detection_strategy != "low_gradient_depth_plateaus":
             empty_mask = np.zeros_like(candidate_mask, dtype=np.uint8)
             if not (output_dir / "background_selected_plateau_mask.png").is_file():
                 cv2.imwrite(str(output_dir / "background_selected_plateau_mask.png"), empty_mask)
@@ -1533,6 +3789,45 @@ class DetectBeltPlaneStage:
         cv2.imwrite(str(output_dir / "background_seed_mask.png"), (seed_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "expanded_plane_mask.png"), (expanded_plane_mask.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "final_plane_inlier_mask.png"), (belt_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "selected_reference_support_mask.png"), (selected_reference_support_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "stripe_filtered_reference_support_mask.png"), (stripe_filtered_reference_support_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_removed_by_candidate_refinement.png"), (support_removed_by_candidate_refinement.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_added_by_candidate_refinement.png"), (support_added_by_candidate_refinement.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_removed_by_stripe_filter.png"), (support_removed_by_stripe_filter.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_added_by_stripe_filter.png"), (support_added_by_stripe_filter.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "reference_model_inlier_mask.png"), (reference_model_inlier_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "reference_model_support_mask.png"), (reference_model_support_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_removed_by_model_residual.png"), (support_removed_by_model_residual.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_added_by_model_expansion.png"), (support_added_by_model_expansion.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "reference_suppression_mask.png"), (reference_suppression_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "belt_bg_mask.png"), (belt_bg_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "unknown_low_gradient_mask.png"), (unknown_low_gradient_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "surface_suppression_mask.png"), (reference_suppression_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "object_search_domain_mask.png"), (object_search_domain_mask.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_removed_by_suppression_policy.png"), (support_removed_by_suppression_policy.astype(np.uint8) * 255))
+        cv2.imwrite(str(output_dir / "support_added_by_suppression_policy.png"), (support_added_by_suppression_policy.astype(np.uint8) * 255))
+        cv2.imwrite(
+            str(output_dir / "support_removed_by_candidate_refinement_overlay.png"),
+            _lineage_overlay(selected_blob_cluster_mask, support_removed_by_candidate_refinement, support_added_by_candidate_refinement),
+        )
+        cv2.imwrite(
+            str(output_dir / "support_removed_by_stripe_filter_overlay.png"),
+            _lineage_overlay(candidate_refined_support_mask, support_removed_by_stripe_filter, support_added_by_stripe_filter),
+        )
+        cv2.imwrite(
+            str(output_dir / "support_removed_by_model_residual_overlay.png"),
+            _lineage_overlay(selected_reference_support_mask, support_removed_by_model_residual, support_added_by_model_expansion),
+        )
+        cv2.imwrite(
+            str(output_dir / "support_removed_by_suppression_policy_overlay.png"),
+            _lineage_overlay(reference_model_support_mask, support_removed_by_suppression_policy, support_added_by_suppression_policy),
+        )
+        (output_dir / "selected_support_lineage.json").write_text(json.dumps(selected_support_lineage, indent=2), encoding="utf-8")
+        (output_dir / "component_formation_debug.json").write_text(json.dumps(component_formation_debug, indent=2), encoding="utf-8")
+        (output_dir / "height_border_detection_debug.json").write_text(json.dumps(height_border_detection_debug, indent=2), encoding="utf-8")
+        (output_dir / "candidate_support_refinement_debug.json").write_text(json.dumps(candidate_support_refinement_debug, indent=2), encoding="utf-8")
+        (output_dir / "final_support_debug.json").write_text(json.dumps(final_support_debug, indent=2), encoding="utf-8")
+        (output_dir / "support_loss_waterfall.json").write_text(json.dumps(support_loss_waterfall, indent=2), encoding="utf-8")
         overlay = _render_belt_plane_overlay(frame, belt_mask)
         cv2.imwrite(str(output_dir / "belt_plane_overlay.png"), overlay)
 
@@ -1549,7 +3844,8 @@ class DetectBeltPlaneStage:
             warnings.append("roi_coverage_too_small")
 
         background_selection_debug = {
-            "background_detection_strategy": self.background_detection_strategy,
+            "background_detection_strategy": background_detection_strategy,
+            "support_selection_method": support_selection_method,
             "inferred_depth_convention": inferred_depth_convention,
             "background_selection_mode": self.background_selection_mode,
             "percentile_thresholds": z_thresholds,
@@ -1569,6 +3865,12 @@ class DetectBeltPlaneStage:
             },
             "height_gate": height_gate_debug,
             "component_stats": component_stats[:40],
+            "surface_roles": {
+                "belt_bg_pixels": int(np.count_nonzero(belt_bg_mask)),
+                "belt_stripe_pixels": int(np.count_nonzero(stripes_mask)),
+                "unknown_low_gradient_pixels": int(np.count_nonzero(unknown_low_gradient_mask)),
+                "suppression_pixels": int(np.count_nonzero(reference_suppression_mask)),
+            },
             "warnings": warnings,
             "roi_inspector": {
                 "enabled": roi_enabled,
@@ -1579,6 +3881,7 @@ class DetectBeltPlaneStage:
                 "candidate_coverage_ratio": roi_candidate_coverage,
                 "selected_surface_coverage_ratio": roi_selected_surface_coverage,
             },
+            "reference_method": resolved_reference_method,
         }
         gradient_debug_path = output_dir / "gradient_debug.json"
         if gradient_debug_path.is_file():
@@ -1608,6 +3911,7 @@ class DetectBeltPlaneStage:
             "reference_surface_model_type": reference_model_type,
             "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
             "model_selection_reason": model_selection_reason,
+            "reference_method": resolved_reference_method,
             "model_residual_mean_mm": float(np.mean(residual_abs)) if residual_abs.size else 0.0,
             "model_residual_p95_mm": float(np.percentile(residual_abs, 95)) if residual_abs.size else 0.0,
             "roi_enabled": roi_enabled,
@@ -1632,9 +3936,10 @@ class DetectBeltPlaneStage:
                 "selected_surface_coverage_ratio": roi_selected_surface_coverage,
             },
             "background_selection": background_selection_debug,
+            "reference_method": resolved_reference_method,
             "config": {
                 "plane_fit_roi": roi_cfg,
-                "background_detection_strategy": self.background_detection_strategy,
+                "background_detection_strategy": background_detection_strategy,
                 "plane_fit_downsample": self.plane_fit_downsample,
                 "background_selection_mode": self.background_selection_mode,
                 "background_percentile": self.background_percentile,
@@ -1656,6 +3961,8 @@ class DetectBeltPlaneStage:
                 "reference_surface_selection_mode": self.reference_surface_selection_mode,
                 "reference_surface_region_mode": self.reference_surface_region_mode,
                 "reference_surface_model": self.reference_surface_model,
+                "reference_suppression_mask_policy": reference_suppression_mask_policy,
+                "support_selection_method": support_selection_method,
                 "reference_surface_height_gate_enabled": self.reference_surface_height_gate_enabled,
                 "reference_surface_height_gate_margin_mm": self.reference_surface_height_gate_margin_mm,
                 "reference_surface_height_gate_min_coverage_ratio": self.reference_surface_height_gate_min_coverage_ratio,
@@ -1678,7 +3985,6 @@ class DetectBeltPlaneStage:
                 "belt_stripe_filter_fixed_threshold_mm": self.belt_stripe_filter_fixed_threshold_mm,
                 "belt_stripe_filter_min_stripe_fraction": self.belt_stripe_filter_min_stripe_fraction,
                 "belt_stripe_filter_scope": self.belt_stripe_filter_scope,
-                "belt_stripe_filter_baseline_mode": self.belt_stripe_filter_baseline_mode,
                 "belt_stripe_filter_z_floor_enabled": self.belt_stripe_filter_z_floor_enabled,
                 "belt_stripe_filter_z_floor_use_upper_bound": self.belt_stripe_filter_z_floor_use_upper_bound,
                 "belt_stripe_filter_z_floor_margin_mm": self.belt_stripe_filter_z_floor_margin_mm,
@@ -1693,9 +3999,50 @@ class DetectBeltPlaneStage:
                 "belt_stripe_filter_z_floor_fallback_lower_percentile": self.belt_stripe_filter_z_floor_fallback_lower_percentile,
                 "belt_stripe_filter_z_floor_fallback_upper_percentile": self.belt_stripe_filter_z_floor_fallback_upper_percentile,
                 "belt_stripe_filter_warn_removed_fraction": self.belt_stripe_filter_warn_removed_fraction,
+                "stripe_min_height_over_base_mm": self.stripe_min_height_over_base_mm,
+                "stripe_max_height_over_base_mm": self.stripe_max_height_over_base_mm,
+                "stripe_min_width_mm": self.stripe_min_width_mm,
+                "stripe_max_width_mm": self.stripe_max_width_mm,
+                "stripe_min_height_width_ratio": self.stripe_min_height_width_ratio,
+                "stripe_max_height_width_ratio": self.stripe_max_height_width_ratio,
+                "stripe_max_width_cv": self.stripe_max_width_cv,
+                "stripe_min_length_width_ratio": self.stripe_min_length_width_ratio,
+                "stripe_max_area_fraction": self.stripe_max_area_fraction,
+                "stripe_component_min_overlap_fraction": self.stripe_component_min_overlap_fraction,
+                "stripe_rule_overlap_enabled": self.stripe_rule_overlap_enabled,
+                "stripe_rule_height_range_enabled": self.stripe_rule_height_range_enabled,
+                "stripe_rule_width_range_enabled": self.stripe_rule_width_range_enabled,
+                "stripe_rule_height_width_ratio_enabled": self.stripe_rule_height_width_ratio_enabled,
+                "stripe_rule_width_cv_enabled": self.stripe_rule_width_cv_enabled,
+                "stripe_rule_length_width_ratio_enabled": self.stripe_rule_length_width_ratio_enabled,
+                "stripe_rule_area_fraction_enabled": self.stripe_rule_area_fraction_enabled,
+                "stripe_height_mm": self.stripe_height_mm,
+                "stripe_height_tolerance_mm": self.stripe_height_tolerance_mm,
                 "low_gradient_plateau_robust_band_mad_k": self.low_gradient_plateau_robust_band_mad_k,
                 "low_gradient_plateau_detection_min_count_floor": self.low_gradient_plateau_detection_min_count_floor,
                 "low_gradient_plateau_detection_min_count_fraction": self.low_gradient_plateau_detection_min_count_fraction,
+                "blob_cluster_min_component_area": self.blob_cluster_min_component_area,
+                "blob_cluster_height_gap_mm": self.blob_cluster_height_gap_mm,
+                "blob_cluster_height_gap_mode": self.blob_cluster_height_gap_mode,
+                "blob_cluster_min_area_fraction": self.blob_cluster_min_area_fraction,
+                "blob_cluster_min_total_pixels": self.blob_cluster_min_total_pixels,
+                "blob_cluster_max_z_mad_mm": self.blob_cluster_max_z_mad_mm,
+                "blob_cluster_merge_close_clusters": self.blob_cluster_merge_close_clusters,
+                "blob_cluster_merge_gap_mm": self.blob_cluster_merge_gap_mm,
+                "blob_cluster_area_weight": self.blob_cluster_area_weight,
+                "blob_cluster_border_weight": self.blob_cluster_border_weight,
+                "blob_cluster_constancy_weight": self.blob_cluster_constancy_weight,
+                "blob_cluster_spatial_coverage_weight": self.blob_cluster_spatial_coverage_weight,
+                "blob_cluster_depth_preference_weight": self.blob_cluster_depth_preference_weight,
+                "blob_cluster_fragmentation_penalty": self.blob_cluster_fragmentation_penalty,
+                "blob_cluster_centrality_penalty": self.blob_cluster_centrality_penalty,
+                "blob_cluster_object_like_penalty": self.blob_cluster_object_like_penalty,
+                "blob_cluster_stripe_overlap_penalty": self.blob_cluster_stripe_overlap_penalty,
+                "blob_cluster_refine_by_mad": self.blob_cluster_refine_by_mad,
+                "blob_cluster_refine_mad_k": self.blob_cluster_refine_mad_k,
+                "blob_cluster_refine_floor_mm": self.blob_cluster_refine_floor_mm,
+                "blob_cluster_refine_keep_border_support": self.blob_cluster_refine_keep_border_support,
+                "blob_cluster_fallback_strategy": self.blob_cluster_fallback_strategy,
                 "low_gradient_surface_support_z_mad_multiplier": self.low_gradient_surface_support_z_mad_multiplier,
                 "low_gradient_surface_support_z_floor_mm": self.low_gradient_surface_support_z_floor_mm,
                 "low_gradient_surface_support_z_mad_floor_mm": self.low_gradient_surface_support_z_mad_floor_mm,
@@ -1721,10 +4068,23 @@ class DetectBeltPlaneStage:
             "plane_coefficients": [float(x) for x in coeffs.tolist()] if reference_model_type == "plane" else None,
             "constant_z_mm": reference_constant_z_mm if reference_model_type == "constant_z" else None,
             "selected_component_id": (gradient_debug.get("selected_component_id") if isinstance(gradient_debug, dict) else None),
+            "selected_cluster_id": (gradient_debug.get("selected_cluster_id") if isinstance(gradient_debug, dict) else None),
             "selected_component_area_ratio": (gradient_debug.get("selected_component_area_ratio") if isinstance(gradient_debug, dict) else None),
+            "selected_cluster_pixels": int(np.count_nonzero(selected_blob_cluster_mask)),
+            "selected_reference_support_pixels": int(np.count_nonzero(selected_reference_support_mask)),
+            "selected_surface_pixels": int(np.count_nonzero(selected_reference_support_mask)),
+            "reference_model_support_pixels": int(np.count_nonzero(reference_model_support_mask)),
+            "reference_suppression_pixels": int(np.count_nonzero(reference_suppression_mask)),
+            "selected_surface_valid_roi_ratio": reference_support_lineage_summary.get("selected_reference_support_valid_roi_ratio"),
+            "reference_model_support_valid_roi_ratio": reference_support_lineage_summary.get("reference_model_support_valid_roi_ratio"),
+            "reference_suppression_valid_roi_ratio": reference_support_lineage_summary.get("reference_suppression_valid_roi_ratio"),
             "model_residual_mean_mm": float(np.mean(residual_abs)) if residual_abs.size else 0.0,
             "model_residual_p95_mm": float(np.percentile(residual_abs, 95)) if residual_abs.size else 0.0,
             "model_selection_reason": model_selection_reason,
+            "selected_surface_alias_resolves_to": selected_surface_alias_resolves_to,
+            "selected_surface_alias_role": "selected_support",
+            "reference_support_lineage": reference_support_lineage_summary,
+            "reference_method": resolved_reference_method,
         }
         (output_dir / "selected_surface_debug.json").write_text(json.dumps(selected_surface_debug, indent=2), encoding="utf-8")
         files = dict(context.get_artifact("files", {}))
@@ -1741,7 +4101,50 @@ class DetectBeltPlaneStage:
                 "low_gradient_mask": "low_gradient_mask.png",
                 "low_gradient_components_overlay": "low_gradient_components_overlay.png",
                 "low_gradient_components": "low_gradient_components.json",
+                "belt_bg_mask": "belt_bg_mask.png",
+                "belt_bg_components": "belt_bg_components.json",
+                "low_gradient_blob_components_overlay": "low_gradient_blob_components_overlay.png",
+                "low_gradient_blob_id_mask": "low_gradient_blob_id_mask.png",
+                "low_gradient_blob_summary": "low_gradient_blob_summary.json",
+                "height_aware_blob_components_overlay": "height_aware_blob_components_overlay.png",
+                "height_aware_blob_id_mask": "height_aware_blob_id_mask.png",
+                "height_aware_connectivity_rejected_edges": "height_aware_connectivity_rejected_edges.png",
+                "height_aware_connectivity_debug": "height_aware_connectivity_debug.json",
+                "component_formation_debug": "component_formation_debug.json",
+                "height_gate_mask": "flat_candidate_mask.png",
+                "height_border_strength": "height_border_strength.png",
+                "height_border_cut_mask": "height_border_cut_mask.png",
+                "height_border_detection_debug": "height_border_detection_debug.json",
+                "height_border_fragments_overlay": "height_border_fragments_overlay.png",
+                "height_border_fragments_mask": "height_border_fragments_mask.png",
+                "height_border_fragments_id_mask": "height_border_fragments_id_mask.png",
+                "height_border_split_debug": "height_border_split_debug.json",
+                "fragment_merge_debug": "fragment_merge_debug.json",
+                "height_split_blob_fragments_overlay": "height_split_blob_fragments_overlay.png",
+                "height_split_blob_fragments_mask": "height_split_blob_fragments_mask.png",
+                "height_split_blob_id_mask": "height_split_blob_id_mask.png",
+                "height_split_debug": "height_split_debug.json",
+                "height_consistent_blob_summary": "height_consistent_blob_summary.json",
+                "blob_height_clusters": "blob_height_clusters.json",
+                "blob_cluster_score_table": "blob_cluster_score_table.csv",
+                "selected_blob_cluster_mask": "selected_blob_cluster_mask.png",
+                "selected_blob_cluster_pre_refine_mask": "selected_blob_cluster_pre_refine_mask.png",
+                "selected_blob_cluster_refined_mask": "selected_blob_cluster_refined_mask.png",
+                "selected_blob_cluster_overlay": "selected_blob_cluster_overlay.png",
+                "support_removed_by_candidate_refinement": "support_removed_by_candidate_refinement.png",
+                "candidate_support_refinement_debug": "candidate_support_refinement_debug.json",
+                "support_added_by_candidate_refinement": "support_added_by_candidate_refinement.png",
+                "support_removed_by_candidate_refinement_overlay": "support_removed_by_candidate_refinement_overlay.png",
+                "rejected_blob_clusters_mask": "rejected_blob_clusters_mask.png",
+                "rejected_blob_clusters_overlay": "rejected_blob_clusters_overlay.png",
+                "blob_cluster_selection_debug": "blob_cluster_selection_debug.json",
                 "reference_surface_selected_mask": "reference_surface_selected_mask.png",
+                "selected_reference_support_mask": "selected_reference_support_mask.png",
+                "final_selected_support_mask": "selected_reference_support_mask.png",
+                "stripe_filtered_reference_support_mask": "stripe_filtered_reference_support_mask.png",
+                "support_removed_by_stripe_filter": "support_removed_by_stripe_filter.png",
+                "support_added_by_stripe_filter": "support_added_by_stripe_filter.png",
+                "support_removed_by_stripe_filter_overlay": "support_removed_by_stripe_filter_overlay.png",
                 "flat_candidate_mask": "flat_candidate_mask.png",
                 "background_selected_plateau_mask": "background_selected_plateau_mask.png",
                 "rejected_raised_structure_mask": "rejected_raised_structure_mask.png",
@@ -1753,6 +4156,11 @@ class DetectBeltPlaneStage:
                 "flat_candidate_depth_plot": "flat_candidate_depth_plot.png",
                 "belt_stripes_mask": "belt_stripes_mask.png",
                 "belt_base_mask": "belt_base_mask.png",
+                "belt_stripe_candidates_overlay": "belt_stripe_candidates_overlay.png",
+                "belt_stripe_components": "belt_stripe_components.json",
+                "unknown_low_gradient_mask": "unknown_low_gradient_mask.png",
+                "surface_suppression_mask": "surface_suppression_mask.png",
+                "object_search_domain_mask": "object_search_domain_mask.png",
                 "belt_stripes_tophat_mask": "belt_stripes_tophat_mask.png",
                 "belt_stripes_shape_mask": "belt_stripes_shape_mask.png",
                 "belt_above_belt_mask": "belt_above_belt_mask.png",
@@ -1769,9 +4177,23 @@ class DetectBeltPlaneStage:
                 "expanded_plane_mask": "expanded_plane_mask.png",
                 "final_plane_inlier_mask": "final_plane_inlier_mask.png",
                 "plane_inlier_mask": "plane_inlier_mask.png",
+                "reference_model_inlier_mask": "reference_model_inlier_mask.png",
+                "reference_model_support_mask": "reference_model_support_mask.png",
+                "final_support_debug": "final_support_debug.json",
+                "support_removed_by_model_residual": "support_removed_by_model_residual.png",
+                "support_added_by_model_expansion": "support_added_by_model_expansion.png",
+                "support_removed_by_model_residual_overlay": "support_removed_by_model_residual_overlay.png",
+                "reference_suppression_mask": "reference_suppression_mask.png",
+                "support_removed_by_suppression_policy": "support_removed_by_suppression_policy.png",
+                "support_added_by_suppression_policy": "support_added_by_suppression_policy.png",
+                "support_removed_by_suppression_policy_overlay": "support_removed_by_suppression_policy_overlay.png",
+                "selected_support_lineage": "selected_support_lineage.json",
+                "support_loss_waterfall": "support_loss_waterfall.json",
                 "plane_fit_debug": "plane_fit_debug.json",
+                "reference_model": "belt_plane.json",
                 "belt_plane_overlay": "belt_plane_overlay.png",
                 "belt_plane_residuals": "belt_plane_residuals.png",
+                "plane_residual_heatmap": "belt_plane_residuals.png",
                 "plane_signed_distance_values": "plane_signed_distance.values.f32",
                 "plane_residual_histogram": "plane_residual_histogram.json",
             }
@@ -1984,6 +4406,106 @@ class DetectBeltPlaneStage:
             metadata={"source": "native_pipeline", "producer": self.name, **background_selection_debug},
         )
         context.add_processing_artifact(
+            artifact_id="reference_model_inlier_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Reference model inlier mask",
+            path="reference_model_inlier_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **background_selection_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="reference_model_support_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Reference model support mask",
+            path="reference_model_support_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_model_residual",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support removed by model residual",
+            path="support_removed_by_model_residual.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "reference_model_support", "role": "removed_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_added_by_model_expansion",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support added by model expansion",
+            path="support_added_by_model_expansion.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "reference_model_support", "role": "added_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_model_residual_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Removed by model residual overlay",
+            path="support_removed_by_model_residual_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "reference_model_support", "role": "difference_overlay", "legend": "Green kept, red removed, blue added"},
+        )
+        context.add_processing_artifact(
+            artifact_id="reference_suppression_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Reference suppression mask",
+            path="reference_suppression_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **background_selection_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_suppression_policy",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support removed by suppression policy",
+            path="support_removed_by_suppression_policy.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "suppression_mask", "role": "removed_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_added_by_suppression_policy",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support added by suppression policy",
+            path="support_added_by_suppression_policy.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "suppression_mask", "role": "added_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_suppression_policy_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Suppression policy difference overlay",
+            path="support_removed_by_suppression_policy_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "suppression_mask", "role": "difference_overlay", "legend": "Green kept, red removed, blue added"},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_support_lineage",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Selected support lineage",
+            path="selected_support_lineage.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_support_lineage},
+        )
+        context.add_processing_artifact(
             artifact_id="depth_gradient_magnitude",
             stage_id="detect_belt_plane",
             kind="image",
@@ -2024,6 +4546,336 @@ class DetectBeltPlaneStage:
             metadata={"source": "native_pipeline", "producer": self.name},
         )
         context.add_processing_artifact(
+            artifact_id="belt_bg_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Belt background mask",
+            path="belt_bg_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "role": "fit_support"},
+        )
+        context.add_processing_artifact(
+            artifact_id="belt_bg_components",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Belt background components",
+            path="belt_bg_components.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="low_gradient_blob_components_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Low-gradient blob components overlay",
+            path="low_gradient_blob_components_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="low_gradient_blob_id_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Low-gradient blob id mask",
+            path="low_gradient_blob_id_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="low_gradient_blob_summary",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Low-gradient blob summary",
+            path="low_gradient_blob_summary.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_aware_blob_components_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-aware blob components overlay",
+            path="height_aware_blob_components_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_aware_blob_id_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-aware blob id mask",
+            path="height_aware_blob_id_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_aware_connectivity_rejected_edges",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-aware connectivity rejected edges",
+            path="height_aware_connectivity_rejected_edges.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_aware_connectivity_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Height-aware connectivity debug",
+            path="height_aware_connectivity_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_strength",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-border strength",
+            path="height_border_strength.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_cut_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-border cut mask",
+            path="height_border_cut_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_fragments_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-border fragments overlay",
+            path="height_border_fragments_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_fragments_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-border fragments mask",
+            path="height_border_fragments_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_fragments_id_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-border fragments id mask",
+            path="height_border_fragments_id_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_split_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Height-border split debug",
+            path="height_border_split_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="fragment_merge_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Fragment merge debug",
+            path="fragment_merge_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_split_blob_fragments_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-split blob fragments overlay",
+            path="height_split_blob_fragments_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_split_blob_fragments_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-split blob fragments mask",
+            path="height_split_blob_fragments_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_split_blob_id_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-split blob id mask",
+            path="height_split_blob_id_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_split_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Height split debug",
+            path="height_split_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_consistent_blob_summary",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Height-consistent blob summary",
+            path="height_consistent_blob_summary.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="blob_height_clusters",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Blob height clusters",
+            path="blob_height_clusters.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="blob_cluster_score_table",
+            stage_id="detect_belt_plane",
+            kind="table",
+            title="Blob cluster score table",
+            path="blob_cluster_score_table.csv",
+            mime_type="text/csv",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_blob_cluster_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Selected blob cluster mask",
+            path="selected_blob_cluster_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_blob_cluster_pre_refine_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Selected blob cluster pre-refine mask",
+            path="selected_blob_cluster_pre_refine_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_blob_cluster_refined_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Selected blob cluster refined mask",
+            path="selected_blob_cluster_refined_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_candidate_refinement",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support removed by candidate refinement",
+            path="support_removed_by_candidate_refinement.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "candidate_refinement", "role": "removed_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_added_by_candidate_refinement",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support added by candidate refinement",
+            path="support_added_by_candidate_refinement.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "candidate_refinement", "role": "added_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_candidate_refinement_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Removed by candidate refinement overlay",
+            path="support_removed_by_candidate_refinement_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "candidate_refinement", "role": "difference_overlay", "legend": "Green kept, red removed, blue added"},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_blob_cluster_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Selected blob cluster overlay",
+            path="selected_blob_cluster_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="rejected_blob_clusters_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Rejected blob clusters mask",
+            path="rejected_blob_clusters_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="rejected_blob_clusters_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Rejected blob clusters overlay",
+            path="rejected_blob_clusters_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="blob_cluster_selection_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Blob cluster selection debug",
+            path="blob_cluster_selection_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
             artifact_id="reference_surface_selected_mask",
             stage_id="detect_belt_plane",
             kind="image",
@@ -2031,7 +4883,57 @@ class DetectBeltPlaneStage:
             path="reference_surface_selected_mask.png",
             mime_type="image/png",
             preview_available=True,
-            metadata={"source": "native_pipeline", "producer": self.name},
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="selected_reference_support_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Selected reference support mask",
+            path="selected_reference_support_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="stripe_filtered_reference_support_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Stripe-filtered reference support mask",
+            path="stripe_filtered_reference_support_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_stripe_filter",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support removed by stripe filter",
+            path="support_removed_by_stripe_filter.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "stripe_suppression", "role": "removed_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_added_by_stripe_filter",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Support added by stripe filter",
+            path="support_added_by_stripe_filter.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "stripe_suppression", "role": "added_pixels"},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_removed_by_stripe_filter_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Removed by stripe filter overlay",
+            path="support_removed_by_stripe_filter_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "lineage_step": "stripe_suppression", "role": "difference_overlay", "legend": "Green kept, red removed, blue added"},
         )
         context.add_processing_artifact(
             artifact_id="flat_candidate_mask",
@@ -2164,6 +5066,56 @@ class DetectBeltPlaneStage:
             metadata={"source": "native_pipeline", "producer": self.name, "role": "belt_support"},
         )
         context.add_processing_artifact(
+            artifact_id="belt_stripe_candidates_overlay",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Belt stripe candidate components",
+            path="belt_stripe_candidates_overlay.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "role": "diagnostic"},
+        )
+        context.add_processing_artifact(
+            artifact_id="belt_stripe_components",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Belt stripe components",
+            path="belt_stripe_components.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="unknown_low_gradient_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Unknown low-gradient mask",
+            path="unknown_low_gradient_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "role": "diagnostic"},
+        )
+        context.add_processing_artifact(
+            artifact_id="surface_suppression_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Surface suppression mask",
+            path="surface_suppression_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "role": "suppression_mask"},
+        )
+        context.add_processing_artifact(
+            artifact_id="object_search_domain_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Object search domain mask",
+            path="object_search_domain_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, "role": "diagnostic"},
+        )
+        context.add_processing_artifact(
             artifact_id="belt_stripes_tophat_mask",
             stage_id="detect_belt_plane",
             kind="image",
@@ -2293,6 +5245,104 @@ class DetectBeltPlaneStage:
             preview_available=True,
             metadata={"source": "native_pipeline", "producer": self.name, **debug_payload},
         )
+        context.add_processing_artifact(
+            artifact_id="component_formation_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Component formation debug",
+            path="component_formation_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **component_formation_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_border_detection_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Height-border detection debug",
+            path="height_border_detection_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **height_border_detection_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="candidate_support_refinement_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Candidate support refinement debug",
+            path="candidate_support_refinement_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **candidate_support_refinement_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="final_support_debug",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Final support debug",
+            path="final_support_debug.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **final_support_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="support_loss_waterfall",
+            stage_id="detect_belt_plane",
+            kind="table",
+            title="Support-loss waterfall",
+            path="support_loss_waterfall.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={
+                "source": "native_pipeline",
+                "producer": self.name,
+                "rows": support_loss_waterfall,
+                "compact_summary": _make_debug_compact_summary(
+                    title="Support-loss waterfall",
+                    input_count=int(np.count_nonzero(valid_for_fit)),
+                    output_count=int(np.count_nonzero(final_plane_inlier_mask)),
+                    selected_id=str(selected_cluster.get("cluster_id")) if isinstance(selected_cluster, dict) else None,
+                    selected_reason=largest_loss_step,
+                    fallback_used=bool(fallback_used),
+                    fallback_reason=fallback_reason,
+                    warnings=warnings,
+                    key_parameters={"reference_surface_model": str(self.reference_surface_model)},
+                    affected_downstream_artifacts=["selected_reference_support_mask", "reference_model_support_mask", "reference_suppression_mask", "final_plane_inlier_mask"],
+                    extra={"largest_loss_step": largest_loss_step, "largest_loss_fraction": largest_loss_fraction},
+                ),
+            },
+        )
+        context.add_processing_artifact(
+            artifact_id="final_selected_support_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Final selected support mask",
+            path="selected_reference_support_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **selected_surface_debug},
+        )
+        context.add_processing_artifact(
+            artifact_id="reference_model",
+            stage_id="detect_belt_plane",
+            kind="json",
+            title="Reference model",
+            path="belt_plane.json",
+            mime_type="application/json",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **plane_json},
+        )
+        context.add_processing_artifact(
+            artifact_id="plane_residual_heatmap",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Plane residual heatmap",
+            path="belt_plane_residuals.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name, **stats},
+        )
+        _enrich_detect_reference_processing_artifacts(context)
 
 
 @dataclass
@@ -2767,6 +5817,104 @@ class NormalizeHeightsToPlaneStage:
             metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **norm_debug}),
         )
 
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane.reference_model_input",
+            stage_id="normalize_heights_to_plane",
+            parent_id="normalize_heights_to_plane",
+            parameters={"normalized_height_sign": str(self.normalized_height_sign)},
+            input_artifacts=["belt_plane", "raw_heightmap_preview"],
+            output_artifacts=["belt_plane"],
+            metrics={
+                "valid_pixels": int(valid_values.size),
+                "model_type_constant_z": bool(model_type == "constant_z"),
+            },
+            diagnostics={"model_type": model_type, "normalization_convention": convention},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane.plane_signed_distance",
+            stage_id="normalize_heights_to_plane",
+            parent_id="normalize_heights_to_plane",
+            parameters={
+                "normalized_clip_negative": bool(self.normalized_clip_negative),
+                "normalized_negative_tolerance_mm": float(self.normalized_negative_tolerance_mm),
+            },
+            input_artifacts=["belt_plane", "raw_heightmap_preview"],
+            output_artifacts=["belt_plane_residuals"],
+            metrics={
+                "signed_distance_min_mm": float(norm_min_mm),
+                "signed_distance_max_mm": float(norm_max_mm),
+                "signed_distance_mean_mm": float(hist_payload["mean_mm"]),
+                "invalid_pixel_count": int(frame.valid_mask.size - np.count_nonzero(frame.valid_mask)),
+            },
+            diagnostics={"normalization_convention": convention, "model_type": model_type},
+            warnings=norm_warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane.height_above_belt",
+            stage_id="normalize_heights_to_plane",
+            parent_id="normalize_heights_to_plane",
+            output_artifacts=["normalized_heightmap", "height_above_belt_raster"],
+            metrics={
+                "valid_pixels": int(valid_values.size),
+                "height_min_mm": float(norm_min_mm),
+                "height_max_mm": float(norm_max_mm),
+                "height_mean_mm": float(hist_payload["mean_mm"]),
+                "background_p95_abs_mm": float(norm_debug["background_height_p95_abs_after_normalization_mm"]),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane.normalized_display_preview",
+            stage_id="normalize_heights_to_plane",
+            parent_id="normalize_heights_to_plane",
+            input_artifacts=["normalized_heightmap"],
+            output_artifacts=["below_reference_mask", "above_threshold_mask", "normalized_heightmap_display", "normalized_heightmap_render_context"],
+            metrics={
+                "below_reference_pixels": int(np.count_nonzero(below_reference_mask)),
+                "above_threshold_pixels": int(np.count_nonzero(above_threshold_mask)),
+                "display_vmin_mm": float(display_vmin),
+                "display_vmax_mm": float(display_vmax),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane.normalization_diagnostics",
+            stage_id="normalize_heights_to_plane",
+            parent_id="normalize_heights_to_plane",
+            output_artifacts=["normalized_height_histogram", "normalization_debug"],
+            metrics={
+                "histogram_bin_count": int(len(hist_payload.get("bin_counts") or [])),
+                "sample_count": int(hist_payload["sample_count"]),
+                "valid_pixel_ratio": float(norm_debug["valid_ratio"]),
+            },
+            diagnostics={"normalization_quality": norm_debug.get("normalization_quality"), "warnings": norm_warnings},
+            warnings=norm_warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="normalize_heights_to_plane",
+            stage_id="normalize_heights_to_plane",
+            parameters={
+                "normalized_clip_negative": bool(self.normalized_clip_negative),
+                "normalized_negative_tolerance_mm": float(self.normalized_negative_tolerance_mm),
+                "below_reference_tolerance_mm": float(self.below_reference_tolerance_mm),
+            },
+            input_artifacts=["belt_plane", "raw_heightmap_preview"],
+            output_artifacts=["normalized_heightmap", "normalized_height_histogram", "normalization_debug"],
+            metrics={
+                "valid_pixels": int(valid_values.size),
+                "invalid_pixels": int(frame.valid_mask.size - np.count_nonzero(frame.valid_mask)),
+                "height_min_mm": float(norm_min_mm),
+                "height_max_mm": float(norm_max_mm),
+                "height_mean_mm": float(hist_payload["mean_mm"]),
+            },
+            diagnostics={"model_type": model_type, "normalization_convention": convention},
+            warnings=norm_warnings,
+        )
+
 
 @dataclass
 class RemoveBeltAndSegmentObjectsStage:
@@ -2802,13 +5950,25 @@ class RemoveBeltAndSegmentObjectsStage:
         cv2.imwrite(str(output_dir / "below_reference_mask.png"), (below_or_on_reference.astype(np.uint8) * 255))
         cv2.imwrite(str(output_dir / "above_threshold_mask.png"), (foreground_before_suppression.astype(np.uint8) * 255))
 
-        plane_mask = np.asarray(
+        surface_suppression = np.asarray(
             context.get_artifact(
-                "reference_surface_selected_mask",
-                context.get_artifact("expanded_plane_mask", context.get_artifact("plane_inlier_mask", np.zeros_like(frame.valid_mask, dtype=bool))),
+                "surface_suppression_mask_array",
+                context.get_artifact("surface_suppression_mask", np.zeros_like(frame.valid_mask, dtype=bool)),
             ),
             dtype=bool,
         )
+        plane_mask = np.asarray(
+            context.get_artifact(
+                "reference_suppression_mask",
+                context.get_artifact(
+                    "reference_surface_selected_mask",
+                    context.get_artifact("expanded_plane_mask", context.get_artifact("plane_inlier_mask", np.zeros_like(frame.valid_mask, dtype=bool))),
+                ),
+            ),
+            dtype=bool,
+        )
+        if np.any(surface_suppression):
+            plane_mask = surface_suppression
         suppressed_plane_pixels = foreground & plane_mask
         if self.suppress_plane_mask_in_segmentation:
             foreground = foreground & (~plane_mask)
@@ -2825,7 +5985,7 @@ class RemoveBeltAndSegmentObjectsStage:
             stripes_bool = np.asarray(stripes_artifact, dtype=bool)
         else:
             stripes_bool = np.zeros_like(frame.valid_mask, dtype=bool)
-        suppressed_stripe_pixels = foreground & stripes_bool
+        suppressed_stripe_pixels = foreground_before_suppression & stripes_bool
         if np.any(stripes_bool):
             foreground = foreground & (~stripes_bool)
         cv2.imwrite(str(output_dir / "plane_suppressed_mask.png"), (foreground.astype(np.uint8) * 255))
@@ -2884,6 +6044,9 @@ class RemoveBeltAndSegmentObjectsStage:
                 "smoothing_kernel": self.smoothing_kernel,
             },
             "plane_suppressed_pixel_count": int(np.count_nonzero(suppressed_plane_pixels)),
+            "suppression_source": "surface_suppression_mask" if np.any(surface_suppression) else "reference_suppression_mask",
+            "surface_suppression_pixel_count": int(np.count_nonzero(plane_mask)),
+            "unknown_low_gradient_suppressed_pixel_count": int(np.count_nonzero(plane_mask & np.asarray(context.get_artifact("unknown_low_gradient_mask_array", np.zeros_like(frame.valid_mask, dtype=bool)), dtype=bool))),
             "below_or_on_reference_pixel_count": int(np.count_nonzero(below_or_on_reference)),
             "connected_components_before_suppression": int(max(num_labels_before - 1, 0)),
             "connected_components_after_suppression": int(max(num_labels_after_suppress - 1, 0)),
@@ -2897,6 +6060,100 @@ class RemoveBeltAndSegmentObjectsStage:
             seg_warnings.append("foreground_coverage_too_high_possible_background_leak")
         seg_debug["warnings"] = seg_warnings
         (output_dir / "segmentation_debug.json").write_text(json.dumps(seg_debug, indent=2), encoding="utf-8")
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects.foreground_thresholding",
+            stage_id="remove_belt_segment_objects",
+            parent_id="remove_belt_segment_objects",
+            parameters={"min_height_mm": float(self.min_height_mm), "max_height_mm": self.max_height_mm},
+            input_artifacts=["normalized_heightmap"],
+            output_artifacts=["foreground_before_plane_suppression", "above_threshold_mask"],
+            metrics={"threshold_active_pixels": int(np.count_nonzero(foreground_before_suppression)), "below_reference_pixels": int(np.count_nonzero(below_or_on_reference))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects.reference_suppression",
+            stage_id="remove_belt_segment_objects",
+            parent_id="remove_belt_segment_objects",
+            status="skipped" if not bool(self.suppress_plane_mask_in_segmentation) else "completed",
+            parameters={
+                "suppress_plane_mask_in_segmentation": bool(self.suppress_plane_mask_in_segmentation),
+                "reference_tolerance_mm": float(self.reference_tolerance_mm),
+            },
+            input_artifacts=["above_threshold_mask", "reference_suppression_mask"],
+            output_artifacts=["plane_suppressed_mask", "rejected_background_residuals", "rejected_belt_stripes"],
+            metrics={
+                "suppressed_plane_pixels": int(np.count_nonzero(suppressed_plane_pixels)),
+                "suppressed_stripe_pixels": int(np.count_nonzero(suppressed_stripe_pixels)),
+                "remaining_foreground_pixels": int(np.count_nonzero(foreground)),
+            },
+            warnings=seg_warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects.stripe_suppression_consumption",
+            stage_id="remove_belt_segment_objects",
+            parent_id="remove_belt_segment_objects",
+            status="skipped" if int(np.count_nonzero(suppressed_stripe_pixels)) == 0 else "completed",
+            input_artifacts=["rejected_belt_stripes", "reference_suppression_mask"],
+            output_artifacts=["rejected_belt_stripes", "plane_suppressed_mask"],
+            metrics={
+                "stripe_rejected_pixels": int(np.count_nonzero(suppressed_stripe_pixels)),
+                "remaining_foreground_pixels": int(np.count_nonzero(foreground)),
+            },
+            diagnostics={"suppression_source": seg_debug.get("suppression_source")},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects.morphology_cleanup",
+            stage_id="remove_belt_segment_objects",
+            parent_id="remove_belt_segment_objects",
+            parameters={"morphology_kernel": int(self.morphology_kernel), "fill_holes": bool(self.fill_holes), "smoothing_kernel": int(self.smoothing_kernel)},
+            input_artifacts=["normalized_height_threshold_mask"],
+            output_artifacts=["cleaned_object_mask"],
+            metrics={"cleaned_mask_pixels": int(np.count_nonzero(cleaned > 0))},
+            warnings=seg_warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects.connected_component_preparation",
+            stage_id="remove_belt_segment_objects",
+            parent_id="remove_belt_segment_objects",
+            parameters={"min_component_area": int(self.min_component_area)},
+            input_artifacts=["cleaned_object_mask"],
+            output_artifacts=["final_object_mask", "connected_components_overlay", "segmentation_debug"],
+            metrics={
+                "final_object_pixels": int(np.count_nonzero(filtered > 0)),
+                "component_count": int(max(num_labels - 1, 0)),
+            },
+            warnings=seg_warnings,
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="remove_belt_segment_objects",
+            stage_id="remove_belt_segment_objects",
+            parameters={
+                "min_height_mm": float(self.min_height_mm),
+                "max_height_mm": self.max_height_mm,
+                "suppress_plane_mask_in_segmentation": bool(self.suppress_plane_mask_in_segmentation),
+                "morphology_kernel": int(self.morphology_kernel),
+                "min_component_area": int(self.min_component_area),
+            },
+            input_artifacts=["normalized_heightmap", "reference_suppression_mask"],
+            output_artifacts=["final_object_mask", "connected_components_overlay", "segmentation_debug"],
+            metrics={
+                "threshold_active_pixels": int(np.count_nonzero(foreground_before_suppression)),
+                "plane_suppressed_pixels": int(np.count_nonzero(suppressed_plane_pixels)),
+                "stripe_rejected_pixels": int(np.count_nonzero(suppressed_stripe_pixels)),
+                "cleaned_mask_pixels": int(np.count_nonzero(cleaned > 0)),
+                "final_object_pixels": int(np.count_nonzero(filtered > 0)),
+                "components_before_cleanup": int(max(num_labels_before - 1, 0)),
+                "components_after_suppression": int(max(num_labels_after_suppress - 1, 0)),
+                "components_after_cleanup": int(max(num_labels - 1, 0)),
+            },
+            diagnostics={"suppression_source": seg_debug.get("suppression_source")},
+            warnings=seg_warnings,
+        )
         context.set_artifact("segmentation_mask", filtered > 0)
         files = dict(context.get_artifact("files", {}))
         files.update(
@@ -2911,6 +6168,7 @@ class RemoveBeltAndSegmentObjectsStage:
                 "plane_suppressed_mask": "plane_suppressed_mask.png",
                 "final_object_mask": "final_object_mask.png",
                 "rejected_background_residuals": "rejected_background_residuals.png",
+                "rejected_belt_stripes": "rejected_belt_stripes.png",
             }
         )
         context.set_artifact("files", files)
@@ -2991,6 +6249,16 @@ class RemoveBeltAndSegmentObjectsStage:
             kind="image",
             title="Rejected background residuals",
             path="rejected_background_residuals.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
+        )
+        context.add_processing_artifact(
+            artifact_id="rejected_belt_stripes",
+            stage_id="remove_belt_segment_objects",
+            kind="image",
+            title="Rejected belt stripes",
+            path="rejected_belt_stripes.png",
             mime_type="image/png",
             preview_available=True,
             metadata=_display_only_meta({"source": "native_pipeline", "producer": self.name, "numeric_source_artifact": "normalized_heightmap.npz"}),
@@ -3100,6 +6368,24 @@ class ExtractConnectedComponentsStage:
             )
         context.set_artifact("components", components)
         context.metrics["object_count"] = len(components)
+        area_values = [int(item.get("area_px") or 0) for item in components if int(item.get("area_px") or 0) > 0]
+        area_summary = _numeric_summary(area_values)
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry.connected_component_extraction",
+            stage_id="geometry",
+            parent_id="geometry",
+            input_artifacts=["final_object_mask"],
+            output_artifacts=["connected_components"],
+            metrics={
+                "component_count": int(len(components)),
+                "accepted_object_count": int(len(components)),
+                "area_min_px": area_summary.get("min"),
+                "area_max_px": area_summary.get("max"),
+                "area_mean_px": area_summary.get("mean"),
+            },
+            diagnostics={"object_ids": [int(item.get("object_id") or 0) for item in components]},
+        )
         context.add_processing_artifact(
             artifact_id="connected_components",
             stage_id="remove_belt_segment_objects",
@@ -3159,6 +6445,58 @@ class FitObjectGeometryStage:
             comp["convex_hull"] = hull
             comp["footprint_area_mm2"] = float(comp["area_px"] * pixel_area)
         context.set_artifact("components", components)
+        contour_count = sum(1 for comp in components if comp.get("contour") is not None)
+        hull_count = sum(1 for comp in components if comp.get("convex_hull") is not None)
+        ellipse_success_count = sum(1 for comp in components if comp.get("ellipse") is not None)
+        ellipse_failure_count = max(0, len(components) - ellipse_success_count)
+        footprint_summary = _numeric_summary(
+            [float(comp.get("footprint_area_mm2") or 0.0) for comp in components if float(comp.get("footprint_area_mm2") or 0.0) > 0.0]
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry.contour_extraction",
+            stage_id="geometry",
+            parent_id="geometry",
+            input_artifacts=["connected_components"],
+            output_artifacts=["contour"],
+            metrics={"component_count": int(len(components)), "contour_count": int(contour_count)},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry.hull_fitting",
+            stage_id="geometry",
+            parent_id="geometry",
+            input_artifacts=["contour"],
+            output_artifacts=["convex_hull"],
+            metrics={"hull_count": int(hull_count), "component_count": int(len(components))},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry.ellipse_fitting",
+            stage_id="geometry",
+            parent_id="geometry",
+            input_artifacts=["contour"],
+            output_artifacts=["fitted_ellipse"],
+            metrics={
+                "ellipse_fit_success_count": int(ellipse_success_count),
+                "ellipse_fit_failure_count": int(ellipse_failure_count),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry",
+            stage_id="geometry",
+            input_artifacts=["connected_components"],
+            output_artifacts=["connected_components", "contour", "convex_hull", "fitted_ellipse"],
+            metrics={
+                "component_count": int(len(components)),
+                "accepted_object_count": int(len(components)),
+                "footprint_area_min_mm2": footprint_summary.get("min"),
+                "footprint_area_max_mm2": footprint_summary.get("max"),
+                "footprint_area_mean_mm2": footprint_summary.get("mean"),
+            },
+            diagnostics={"object_ids": [int(comp.get("object_id") or 0) for comp in components]},
+        )
 
 
 @dataclass
@@ -3311,6 +6649,24 @@ class ComputeHeightMetricsStage:
                 "sphere_vs_ellipsoid_gain": round(sphere_vs_ellipsoid_gain, 6) if sphere_vs_ellipsoid_gain is not None else None,
                 "deformation_score": round(deformation_score, 6) if deformation_score is not None else None,
             }
+            p95_height_mm = float(np.percentile(values, 95)) if values.size else None
+            equivalent_diameter_mm = float(np.sqrt((4.0 * float(comp.get("footprint_area_mm2") or 0.0)) / np.pi)) if float(comp.get("footprint_area_mm2") or 0.0) > 0.0 else None
+            dim_x_mm = float(comp["bbox"][2] * frame.x_resolution_mm)
+            dim_y_mm = float(comp["bbox"][3] * frame.y_resolution_mm)
+            segmentation_coverage = float(np.count_nonzero(mask) / max(1, comp["bbox"][2] * comp["bbox"][3]))
+            derived_sphere_consistency = compute_sphere_consistency_features(
+                sphere_fit=sphere_fit,
+                ellipsoid_fit=ellipsoid_fit,
+                diameter_selected_mm=sphere_diameter_mm if sphere_diameter_mm > 0.0 else None,
+                equivalent_diameter_mm=equivalent_diameter_mm,
+                dim_x_mm=dim_x_mm,
+                dim_y_mm=dim_y_mm,
+                dim_z_mm=float(dim_z_height),
+                height_p95_mm=p95_height_mm,
+                volume_proxy_mm3=float(volume_proxy),
+                segmentation_coverage=segmentation_coverage,
+                border_clipped=None,
+            )
             sphere_consistency = {
                 "radial_height_rmse_mm": round(radial_height_rmse_mm, 6) if radial_height_rmse_mm is not None else None,
                 "radial_height_max_error_mm": round(radial_height_max_error_mm, 6) if radial_height_max_error_mm is not None else None,
@@ -3319,6 +6675,7 @@ class ComputeHeightMetricsStage:
                 "expected_sphere_volume_mm3": round(expected_sphere_volume_mm3, 4),
                 "observed_volume_ratio": round(observed_volume_ratio, 6),
                 "volume_deficit_ratio": round(volume_deficit_ratio, 6),
+                **derived_sphere_consistency,
             }
             damage_metrics = {
                 "surface_roughness_mean": round(surface_roughness_mean, 6),
@@ -3461,6 +6818,89 @@ class ComputeHeightMetricsStage:
                 ),
             )
         context.set_artifact("objects", objects)
+        max_height_values = [
+            float(((item.get("height_above_belt_mm") or {}).get("max_height_mm") or 0.0))
+            for item in objects
+            if isinstance(item.get("height_above_belt_mm"), dict) and ((item.get("height_above_belt_mm") or {}).get("max_height_mm")) is not None
+        ]
+        p95_height_values = [
+            float(((item.get("height_above_belt_mm") or {}).get("p95_height_mm") or 0.0))
+            for item in objects
+            if isinstance(item.get("height_above_belt_mm"), dict) and ((item.get("height_above_belt_mm") or {}).get("p95_height_mm")) is not None
+        ]
+        p99_height_values = [
+            float(((item.get("height_above_belt_mm") or {}).get("p99_height_mm") or 0.0))
+            for item in objects
+            if isinstance(item.get("height_above_belt_mm"), dict) and ((item.get("height_above_belt_mm") or {}).get("p99_height_mm")) is not None
+        ]
+        volume_values = [
+            float(item.get("feature_volume_proxy_mm3") or 0.0)
+            for item in objects
+            if item.get("feature_volume_proxy_mm3") is not None
+        ]
+        dimension_x_values = [float(item.get("dim_x_mm") or 0.0) for item in objects if item.get("dim_x_mm") is not None]
+        dimension_y_values = [float(item.get("dim_y_mm") or 0.0) for item in objects if item.get("dim_y_mm") is not None]
+        dimension_z_values = [float(item.get("dim_z_mm") or 0.0) for item in objects if item.get("dim_z_mm") is not None]
+        deformation_values = [
+            float(item.get("feature_local_curvature_proxy") or 0.0)
+            for item in objects
+            if item.get("feature_local_curvature_proxy") is not None
+        ]
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement.height_metrics",
+            stage_id="measurement",
+            parent_id="measurement",
+            input_artifacts=["height_above_belt_raster", "connected_components"],
+            metrics={
+                "object_count": int(len(objects)),
+                "max_height_min_mm": _numeric_summary(max_height_values).get("min"),
+                "max_height_max_mm": _numeric_summary(max_height_values).get("max"),
+                "max_height_mean_mm": _numeric_summary(max_height_values).get("mean"),
+                "p95_height_max_mm": _numeric_summary(p95_height_values).get("max"),
+                "p99_height_max_mm": _numeric_summary(p99_height_values).get("max"),
+            },
+            diagnostics={"object_ids": [int(item.get("object_id") or 0) for item in objects]},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement.volume_proxy",
+            stage_id="measurement",
+            parent_id="measurement",
+            input_artifacts=["height_above_belt_raster"],
+            metrics={
+                "object_count": int(len(objects)),
+                "volume_proxy_min_mm3": _numeric_summary(volume_values).get("min"),
+                "volume_proxy_max_mm3": _numeric_summary(volume_values).get("max"),
+                "volume_proxy_mean_mm3": _numeric_summary(volume_values).get("mean"),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement.dimensions",
+            stage_id="measurement",
+            parent_id="measurement",
+            input_artifacts=["connected_components"],
+            metrics={
+                "object_count": int(len(objects)),
+                "dim_x_max_mm": _numeric_summary(dimension_x_values).get("max"),
+                "dim_y_max_mm": _numeric_summary(dimension_y_values).get("max"),
+                "dim_z_max_mm": _numeric_summary(dimension_z_values).get("max"),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement.deformation_sphericity",
+            stage_id="measurement",
+            parent_id="measurement",
+            input_artifacts=["connected_components", "height_above_belt_raster"],
+            metrics={
+                "object_count": int(len(objects)),
+                "deformation_min": _numeric_summary(deformation_values).get("min"),
+                "deformation_max": _numeric_summary(deformation_values).get("max"),
+                "deformation_mean": _numeric_summary(deformation_values).get("mean"),
+            },
+        )
 
 
 @dataclass
@@ -3702,6 +7142,30 @@ class ValidateKnownObjectScale25DStage:
             preview_available=True,
             metadata=_numeric_source_meta({"source": "native_pipeline", "producer": self.name, **result}),
         )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement.correction_calibration_context",
+            stage_id="measurement",
+            parent_id="measurement",
+            parameters={
+                "enabled": bool(result.get("enabled", False)),
+                "apply_correction": bool(result.get("applied_correction", False)),
+                "tolerance_percent": result.get("tolerance_percent"),
+            },
+            input_artifacts=["geometry_debug_summary"],
+            output_artifacts=["known_object_scale_validation"],
+            metrics={
+                "correction_applied": bool(result.get("correction_applied", False)),
+                "scale_x": result.get("scale_x"),
+                "scale_y": result.get("scale_y"),
+                "scale_z": result.get("scale_z"),
+            },
+            diagnostics={
+                "status": result.get("status"),
+                "correction_source": result.get("correction_source"),
+                "correction_context_id": result.get("correction_context_id"),
+            },
+        )
 
     def _emit_geometry_debug_artifacts(self, context: PipelineContext, objects: list[dict[str, Any]]) -> None:
         output_dir: Path = context.require_artifact("output_dir")
@@ -3762,6 +7226,35 @@ class ValidateKnownObjectScale25DStage:
                     "semantic_type": "geometry_debug",
                 }
             ),
+        )
+        invariant_warning_count = sum(
+            len(row.get("geometry_invariant_warnings") or [])
+            for row in rows
+            if isinstance(row, dict)
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry.geometry_summary",
+            stage_id="geometry",
+            parent_id="geometry",
+            input_artifacts=["connected_components", "contour", "convex_hull", "fitted_ellipse"],
+            output_artifacts=["geometry_debug_summary"],
+            metrics={
+                "object_count": int(len(rows)),
+                "invariant_warning_count": int(invariant_warning_count),
+            },
+            diagnostics={"object_ids": [int(row.get("object_id") or 0) for row in rows if isinstance(row, dict)]},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="geometry",
+            stage_id="geometry",
+            input_artifacts=["connected_components", "contour", "convex_hull", "fitted_ellipse"],
+            output_artifacts=["geometry_debug_summary"],
+            metrics={
+                "object_count": int(len(rows)),
+                "invariant_warning_count": int(invariant_warning_count),
+            },
         )
 
 
@@ -4178,6 +7671,77 @@ class ComputeMeasurementDiagnosticsStage:
         self._record_artifact(context, "fitted_ellipse", "fitted_ellipse.json", "Fitted ellipse geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
         self._record_artifact(context, "principal_axes", "principal_axes.json", "Principal axes geometry", "projection_pixel", ["height_segmentation"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
         self._record_artifact(context, "radial_profile", "radial_profile.json", "Radial profile", "world_mm", ["height_above_belt_raster"], {"semantic_type": "geometry_intermediate", "artifact_kind": "diagnostics"})
+        feature_warning_count = len(diagnostics_payload.get("feature_warnings") or [])
+        invariant_warning_rows = list(primary.get("geometry_invariant_warnings") or []) if isinstance(primary, dict) else []
+        invariant_warning_count = len(invariant_warning_rows)
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement_diagnostics.feature_vector_generation",
+            stage_id="measurement_diagnostics",
+            parent_id="measurement_diagnostics",
+            input_artifacts=["geometry_debug_summary"],
+            output_artifacts=["feature_vector"],
+            metrics={
+                "feature_count": int(len(features)),
+                "object_count": int(len(objects) if isinstance(objects, list) else 0),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement_diagnostics.quality_flags",
+            stage_id="measurement_diagnostics",
+            parent_id="measurement_diagnostics",
+            input_artifacts=["feature_vector"],
+            output_artifacts=["quality_flags"],
+            metrics={
+                "quality_flag_count": int(len(quality_flags)),
+                "objects_with_warnings": int(1 if feature_warning_count else 0),
+            },
+            diagnostics={"flags": quality_flags},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement_diagnostics.invariant_checks",
+            stage_id="measurement_diagnostics",
+            parent_id="measurement_diagnostics",
+            input_artifacts=["feature_vector", "known_object_scale_validation"],
+            output_artifacts=["feature_provenance"],
+            metrics={
+                "invariant_warning_count": int(invariant_warning_count),
+                "critical_warning_count": int(sum(1 for flag in quality_flags if str((flag or {}).get("severity") or "") == "critical")),
+            },
+            diagnostics={"feature_warning_count": int(feature_warning_count)},
+        )
+        known_object_validation = context.get_artifact("known_object_scale_validation", {})
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement_diagnostics.known_object_validation",
+            stage_id="measurement_diagnostics",
+            parent_id="measurement_diagnostics",
+            parameters=dict(context.get_artifact("stage_params.known_object_25d", {}) or {}),
+            input_artifacts=["known_object_scale_validation", "geometry_debug_summary"],
+            output_artifacts=["measurement_diagnostics"],
+            metrics={
+                "known_object_validation_enabled": bool((known_object_validation or {}).get("enabled", False)) if isinstance(known_object_validation, dict) else False,
+                "scale_x": (known_object_validation or {}).get("scale_x") if isinstance(known_object_validation, dict) else None,
+                "scale_y": (known_object_validation or {}).get("scale_y") if isinstance(known_object_validation, dict) else None,
+                "scale_z": (known_object_validation or {}).get("scale_z") if isinstance(known_object_validation, dict) else None,
+            },
+            diagnostics={"status": (known_object_validation or {}).get("status") if isinstance(known_object_validation, dict) else None},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="measurement_diagnostics",
+            stage_id="measurement_diagnostics",
+            input_artifacts=["geometry_debug_summary", "known_object_scale_validation"],
+            output_artifacts=["measurement_diagnostics", "feature_vector", "feature_provenance", "quality_flags"],
+            metrics={
+                "feature_count": int(len(features)),
+                "quality_flag_count": int(len(quality_flags)),
+                "object_count": int(len(objects) if isinstance(objects, list) else 0),
+                "warning_count": int(feature_warning_count + invariant_warning_count),
+            },
+        )
 
     def _record_artifact(
         self,
@@ -4341,10 +7905,15 @@ class ComputeMeasurementDiagnosticsStage:
         return {"coordinate_space": "world_mm", "radius_bins_px": [float(v) for v in bins.tolist()], "height_mean_by_radius": profile, "x_resolution_mm": float(frame.x_resolution_mm), "y_resolution_mm": float(frame.y_resolution_mm)}
 
     def _build_height_histogram(self, *, normalized: np.ndarray, mask: np.ndarray) -> dict[str, Any]:
-        values = normalized[mask]
+        values = normalized[mask].astype(np.float64, copy=False)
+        values = values[np.isfinite(values)]
         if values.size == 0:
             return {"coordinate_space": "world_mm", "bin_edges": [], "counts": []}
-        counts, edges = np.histogram(values, bins=20)
+        lo = float(np.min(values))
+        hi = float(np.max(values))
+        if hi <= lo:
+            hi = lo + 1e-6
+        counts, edges = np.histogram(values, bins=20, range=(lo, hi))
         return {"coordinate_space": "world_mm", "bin_edges": [float(v) for v in edges.tolist()], "counts": [int(v) for v in counts.tolist()]}
 
     def _estimate_solidity(self, primary: dict[str, Any] | None, *, frame: HeightmapFrame) -> float:
@@ -4622,6 +8191,71 @@ class ClassifyMiningBall25DStage:
         object_count = len(objects)
         decision = "accept" if object_count > 0 and non_ball == 0 else "review"
         canonical = select_dominant_classification({"objects": objects})
+        confidence_values = [
+            float(item.get("confidence") or 0.0)
+            for item in objects
+            if isinstance(item, dict) and item.get("confidence") is not None
+        ]
+        class_distribution: dict[str, int] = {}
+        superclass_distribution: dict[str, int] = {}
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            class_name = str(item.get("class_name") or item.get("label") or "unknown")
+            superclass = str(item.get("superclass") or "unknown")
+            class_distribution[class_name] = class_distribution.get(class_name, 0) + 1
+            superclass_distribution[superclass] = superclass_distribution.get(superclass, 0) + 1
+        sph3d_fallback_count = sum(
+            1
+            for item in objects
+            if isinstance(item, dict) and "sph3d" in str(item.get("classification_reason") or "").lower()
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="classification.primary_heuristic_classifier",
+            stage_id="classification",
+            parent_id="classification",
+            parameters={"rule_set_id": rule_set_id, "rule_set_source": rule_set_source},
+            input_artifacts=["measurement_diagnostics", numeric_source_artifact_id],
+            output_artifacts=["classification_result_25d"],
+            metrics={
+                "object_count": int(object_count),
+                "inference_count": int(inference_count),
+                "inference_duration_ms": float(inference_duration_ms),
+                "fallback_used": bool(fallback_used),
+                "confidence_min": _numeric_summary(confidence_values).get("min"),
+                "confidence_max": _numeric_summary(confidence_values).get("max"),
+                "confidence_mean": _numeric_summary(confidence_values).get("mean"),
+            },
+            diagnostics={"classifier_backend": inference_backend, "fallback_reason": fallback_reason, "class_distribution": class_distribution},
+            warnings=[deployment_diagnostic] if deployment_diagnostic else [],
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="classification.sph3d_fallback",
+            stage_id="classification",
+            parent_id="classification",
+            status="skipped" if sph3d_fallback_count == 0 else "completed",
+            input_artifacts=["classification_result_25d"],
+            output_artifacts=["classification_runtime_diagnostics"],
+            metrics={"fallback_application_count": int(sph3d_fallback_count)},
+            diagnostics={"classifier_backend": inference_backend},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="classification.superclass_aggregation",
+            stage_id="classification",
+            parent_id="classification",
+            input_artifacts=["classification_result_25d"],
+            output_artifacts=["classification_result_25d"],
+            metrics={
+                "object_count": int(object_count),
+                "ball_count": int(ball_count),
+                "non_ball_count": int(non_ball),
+                "confidence": canonical.get("confidence"),
+            },
+            diagnostics={"label": canonical.get("label"), "superclass": canonical.get("superclass"), "superclass_distribution": superclass_distribution},
+        )
         object_feature_payloads = [
             {
                 "feature_group_summaries": item.get("feature_group_summaries") or [],
@@ -4807,6 +8441,38 @@ class ClassifyMiningBall25DStage:
             "inference_duration_ms": inference_duration_ms,
             "execution_timing": {"status": "captured_by_stage_profiler"},
         }
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="classification.explanation_generation",
+            stage_id="classification",
+            parent_id="classification",
+            input_artifacts=["classification_result_25d"],
+            output_artifacts=["classification_explanation", "metric_explanation", "classification_runtime_diagnostics"],
+            metrics={"explanation_object_count": int(len(explanations)), "warning_count": int(len([item for item in [deployment_diagnostic] if item]))},
+            diagnostics={"feature_schema_hash": feature_ordering_hash(), "rule_set_id": rule_set_id},
+            warnings=[deployment_diagnostic] if deployment_diagnostic else [],
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="classification",
+            stage_id="classification",
+            input_artifacts=["feature_vector"],
+            output_artifacts=["classification_result_25d", "classification_explanation", "classification_runtime_diagnostics"],
+            metrics={
+                "object_count": int(object_count),
+                "fallback_application_count": int(sph3d_fallback_count),
+                "confidence_min": _numeric_summary(confidence_values).get("min"),
+                "confidence_max": _numeric_summary(confidence_values).get("max"),
+                "confidence_mean": _numeric_summary(confidence_values).get("mean"),
+            },
+            diagnostics={
+                "dominant_superclass": canonical.get("superclass"),
+                "dominant_label": canonical.get("label"),
+                "class_distribution": class_distribution,
+                "superclass_distribution": superclass_distribution,
+            },
+            warnings=[deployment_diagnostic] if deployment_diagnostic else [],
+        )
         (output_dir / "classification_runtime_diagnostics.json").write_text(json.dumps(runtime_diag_payload, indent=2), encoding="utf-8")
         files = dict(context.get_artifact("files", {}))
         files["classification_explanation"] = "classification_explanation.json"
@@ -5059,6 +8725,73 @@ class Generate25DOverlaysStage:
                 "source": "native_pipeline",
                 "producer": self.name,
                 "classification": classification_result if isinstance(classification_result, dict) else {},
+            },
+        )
+        overlay_width = int(normalized.shape[1]) if normalized.ndim >= 2 else 0
+        overlay_height = int(normalized.shape[0]) if normalized.ndim >= 2 else 0
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="overlay.height_overlay",
+            stage_id="overlay",
+            parent_id="overlay",
+            input_artifacts=["normalized_heightmap"],
+            output_artifacts=["height_overlay"],
+            metrics={
+                "overlay_width_px": overlay_width,
+                "overlay_height_px": overlay_height,
+                "object_annotation_count": int(len(objects) if isinstance(objects, list) else 0),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="overlay.measurement_overlay",
+            stage_id="overlay",
+            parent_id="overlay",
+            input_artifacts=["height_overlay", "final_object_mask"],
+            output_artifacts=["measurement_overlay"],
+            metrics={
+                "overlay_width_px": overlay_width,
+                "overlay_height_px": overlay_height,
+                "object_annotation_count": int(len(objects) if isinstance(objects, list) else 0),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="overlay.classification_overlay",
+            stage_id="overlay",
+            parent_id="overlay",
+            input_artifacts=["measurement_overlay", "classification_result_25d"],
+            output_artifacts=["classification_overlay"],
+            metrics={
+                "overlay_width_px": overlay_width,
+                "overlay_height_px": overlay_height,
+                "classification_overlay_object_count": int(len(objects) if isinstance(objects, list) else 0),
+            },
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="overlay.summary_overlay_metadata",
+            stage_id="overlay",
+            parent_id="overlay",
+            input_artifacts=["classification_result_25d"],
+            output_artifacts=["classification_overlay_metadata"],
+            metrics={
+                "overlay_file_count": 4,
+                "object_count": int(len(objects) if isinstance(objects, list) else 0),
+            },
+            diagnostics={"classification_keys": sorted(list(classification_result.keys())) if isinstance(classification_result, dict) else []},
+        )
+        _runtime_trace_mask_unit(
+            context,
+            unit_id="overlay",
+            stage_id="overlay",
+            input_artifacts=["normalized_heightmap", "final_object_mask", "classification_result_25d"],
+            output_artifacts=["height_overlay", "measurement_overlay", "classification_overlay", "classification_overlay_metadata"],
+            metrics={
+                "overlay_width_px": overlay_width,
+                "overlay_height_px": overlay_height,
+                "overlay_files_emitted": 4,
+                "object_annotation_count": int(len(objects) if isinstance(objects, list) else 0),
             },
         )
 
@@ -5412,7 +9145,6 @@ def _compute_belt_stripe_filter(
     k_mad: float,
     fixed_threshold_mm: float,
     min_stripe_fraction: float,
-    baseline_mode: str = "opening",
     bg_plateau_mask: np.ndarray | None = None,
     z_floor_enabled: bool = False,
     z_floor_use_upper_bound: bool = True,
@@ -5429,21 +9161,18 @@ def _compute_belt_stripe_filter(
 ) -> dict[str, Any]:
     """Separate belt-base pixels from raised surface texture (e.g. chevron ribs).
 
-    Strategy: morphological top-hat (raised) or bottom-hat (recessed) over
-    `domain_mask`. With ``baseline_mode="opening"`` (default) we use a true
-    morphological opening — i.e. ``dilate(erode(z))`` — so a wide object's
-    opening ≈ object_z and altitude ≈ 0 even near the object's edges. Narrow
-    features such as chevron ribs (width < window) are wiped by the opening,
-    so their altitude equals the rib's height above the local belt. With
-    ``baseline_mode="erosion"`` we keep the simpler ``z − erode(z)`` (= local
-    altitude above the lowest neighbour) but be aware that object edges will
-    also be flagged as "raised" — useful only when ``domain_mask`` is already
-    restricted to the belt plateau.
+    Strategy: local-min top-hat (raised) or local-max bottom-hat (recessed)
+    over ``domain_mask``. Baseline is always the erosion/dilation phase only
+    (no opening/closing follow-up), so for raised mode ``baseline[i]`` is the
+    minimum ``z`` in the window and never exceeds ``z[i]`` or neighbours in
+    that window. Narrow raised features such as chevron ribs (width < window)
+    survive as positive altitude above the local belt minimum.
 
     Workflow:
-        baseline = open(z, W)  or  erode(z, W)
+        baseline = erode(z, W)                  # raised
+                 = dilate(z, W)                 # recessed
         altitude = z − baseline                 # raised
-                 = open_max(z, W) − z (= z − closing(z) inverted)  # recessed
+                 = baseline − z                 # recessed
     Then threshold ``altitude`` (Otsu / k·MAD / fixed, clipped to
     ``min_altitude_mm``) to label stripes vs belt base. With
     ``direction="auto"`` both modes are computed and the one with the more
@@ -5474,7 +9203,6 @@ def _compute_belt_stripe_filter(
         "window_px": 0,
         "direction": str(direction),
         "direction_used": None,
-        "baseline_mode": str(baseline_mode),
         "threshold_mode": str(threshold_mode),
         "threshold_value_mm": 0.0,
         "min_altitude_mm": float(min_altitude_mm),
@@ -5517,7 +9245,6 @@ def _compute_belt_stripe_filter(
     base_skeleton["window_px"] = int(window_px)
 
     z_in = np.asarray(z_mm, dtype=np.float32)
-    baseline_mode_norm = str(baseline_mode or "opening").strip().lower()
 
     def _hat(mode: str) -> tuple[np.ndarray, np.ndarray, float]:
         """Compute (baseline, altitude, bimodality_score) for "raised"/"recessed".
@@ -5532,21 +9259,8 @@ def _compute_belt_stripe_filter(
             big = np.full_like(z_in, np.finfo(np.float32).max)
             big[dom] = z_in[dom]
             eroded = cv2.erode(big, kernel, borderType=cv2.BORDER_REPLICATE)
-            # Restore sentinel-tainted cells to z so dilate doesn't spread +inf.
             sentinel_mask = (~np.isfinite(eroded)) | (eroded >= np.finfo(np.float32).max * 0.5)
-            eroded = np.where(sentinel_mask, z_in, eroded)
-            if baseline_mode_norm == "opening":
-                # True morphological opening = dilate(erode). Wide objects'
-                # opening ≈ object_z (max within window sees object_z), so
-                # altitude ≈ 0 at object centres AND edges. Narrow stripes
-                # don't survive the erode so opening ≈ belt_z under them.
-                # Use -inf sentinel so dilate ignores out-of-domain cells.
-                eroded_for_dilate = np.where(dom, eroded, np.finfo(np.float32).min)
-                opened = cv2.dilate(eroded_for_dilate, kernel, borderType=cv2.BORDER_REPLICATE)
-                sentinel_dil = (~np.isfinite(opened)) | (opened <= np.finfo(np.float32).min * 0.5)
-                base = np.where(sentinel_dil, z_in, opened)
-            else:  # "erosion"
-                base = eroded
+            base = np.where(sentinel_mask, z_in, eroded)
             alt = np.zeros_like(z_in)
             alt[dom] = z_in[dom] - base[dom]
         else:  # recessed
@@ -5554,15 +9268,7 @@ def _compute_belt_stripe_filter(
             small[dom] = z_in[dom]
             dilated = cv2.dilate(small, kernel, borderType=cv2.BORDER_REPLICATE)
             sentinel_mask = (~np.isfinite(dilated)) | (dilated <= np.finfo(np.float32).min * 0.5)
-            dilated = np.where(sentinel_mask, z_in, dilated)
-            if baseline_mode_norm == "opening":
-                # Closing = erode(dilate) — symmetric counterpart for recessed.
-                dilated_for_erode = np.where(dom, dilated, np.finfo(np.float32).max)
-                closed = cv2.erode(dilated_for_erode, kernel, borderType=cv2.BORDER_REPLICATE)
-                sentinel_er = (~np.isfinite(closed)) | (closed >= np.finfo(np.float32).max * 0.5)
-                base = np.where(sentinel_er, z_in, closed)
-            else:  # "erosion" → use dilation as baseline (local-max-only)
-                base = dilated
+            base = np.where(sentinel_mask, z_in, dilated)
             alt = np.zeros_like(z_in)
             alt[dom] = base[dom] - z_in[dom]
         # Bimodality score: spread between bulk and tail (p95 − p50). Bigger
@@ -5622,12 +9328,9 @@ def _compute_belt_stripe_filter(
     tophat_count = int(np.count_nonzero(candidate_stripes_tophat))
 
     # ── Shape-based pass (z-floor + binary opening) ────────────────────
-    # Catches two failure modes of the top-hat:
-    #   1. A stripe that grows wider than the kernel: opening preserves it
-    #      (opening ≈ stripe_z), altitude ≈ 0 → top-hat misses it.
-    #   2. A stripe whose dilate window overlaps a taller object: the dilate
-    #      step copies object_z into the baseline at the stripe pixel, so
-    #      altitude turns negative → top-hat misses it.
+    # Catches a failure mode of the erosion top-hat:
+    #   1. A stripe that grows wider than the kernel: erosion baseline ≈
+    #      stripe_z inside the wide rib, altitude ≈ 0 → top-hat misses it.
     # Recipe:
     #   belt_z_upper = upper bound of BG plateau z (max, or p99 — picked so
     #                  the entire belt distribution sits BELOW it; using the
@@ -5812,6 +9515,113 @@ def _compute_belt_stripe_filter(
         "above_belt_mask": above_belt_mask,
         "wide_object_mask": wide_object_mask,
     }
+
+
+def _plane_height_map(frame: HeightmapFrame, coeffs: np.ndarray) -> np.ndarray:
+    h, w = frame.z_mm.shape
+    xx, yy = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
+    x_mm = frame.origin_x_mm + xx * frame.x_resolution_mm
+    y_mm = frame.origin_y_mm + yy * frame.y_resolution_mm
+    a, b, c, d = [float(x) for x in coeffs]
+    denom = c if abs(c) > 1e-9 else 1.0
+    z_plane = (-(a * x_mm + b * y_mm + d) / denom).astype(np.float32)
+    z_plane[~frame.valid_mask] = 0.0
+    return z_plane
+
+
+def _component_width_cv(component_mask: np.ndarray, orientation_deg: float) -> float:
+    ys, xs = np.where(component_mask)
+    if xs.size <= 1 or ys.size <= 1:
+        return 0.0
+    x0 = max(0, int(np.min(xs)) - 2)
+    y0 = max(0, int(np.min(ys)) - 2)
+    x1 = min(component_mask.shape[1], int(np.max(xs)) + 3)
+    y1 = min(component_mask.shape[0], int(np.max(ys)) + 3)
+    patch = component_mask[y0:y1, x0:x1].astype(np.uint8) * 255
+    center = (patch.shape[1] / 2.0, patch.shape[0] / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, float(orientation_deg), 1.0)
+    rotated = cv2.warpAffine(patch, matrix, (patch.shape[1], patch.shape[0]), flags=cv2.INTER_NEAREST)
+    counts = np.count_nonzero(rotated > 0, axis=0).astype(np.float64)
+    counts = counts[counts > 0]
+    if counts.size <= 1:
+        return 0.0
+    mean = float(np.mean(counts))
+    if mean <= 1e-6:
+        return 0.0
+    return float(np.std(counts) / mean)
+
+
+def _component_oriented_metrics(component_mask: np.ndarray, *, pixel_size_mm: float) -> dict[str, float | list[float]]:
+    ys, xs = np.where(component_mask)
+    if xs.size == 0 or ys.size == 0:
+        return {
+            "width_px": 0.0,
+            "length_px": 0.0,
+            "width_mm": 0.0,
+            "length_mm": 0.0,
+            "orientation_deg": 0.0,
+            "width_cv": 0.0,
+            "bbox": [0, 0, 0, 0],
+        }
+    points = np.column_stack((xs.astype(np.float32), ys.astype(np.float32)))
+    rect = cv2.minAreaRect(points)
+    (cx, cy), (rw, rh), angle = rect
+    width_px = float(min(rw, rh))
+    length_px = float(max(rw, rh))
+    orientation_deg = float(angle if rw >= rh else angle + 90.0)
+    if orientation_deg < 0.0:
+        orientation_deg += 180.0
+    width_cv = _component_width_cv(component_mask, orientation_deg)
+    x = int(np.min(xs))
+    y = int(np.min(ys))
+    w = int(np.max(xs) - x + 1)
+    h = int(np.max(ys) - y + 1)
+    return {
+        "width_px": width_px,
+        "length_px": length_px,
+        "width_mm": float(width_px * pixel_size_mm),
+        "length_mm": float(length_px * pixel_size_mm),
+        "orientation_deg": orientation_deg,
+        "width_cv": width_cv,
+        "bbox": [x, y, w, h],
+        "centroid": [float(cx), float(cy)],
+    }
+
+
+def _label_colormap_overlay(labels: np.ndarray) -> np.ndarray:
+    """Colorize a component-id label map so distinct components stay visually distinguishable.
+
+    ``label % 251`` collides badly when there are few, low-valued labels (e.g. blob ids
+    1/10/13/16 all land in the same dark corner of COLORMAP_TURBO). This spreads however many
+    unique labels are present evenly across the colormap's full range instead.
+    """
+    labels = np.asarray(labels, dtype=np.int32)
+    overlay = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
+    unique_labels = np.unique(labels[labels > 0])
+    if unique_labels.size == 0:
+        return overlay
+    positions = np.array([160], dtype=np.uint8) if unique_labels.size == 1 else np.linspace(35, 255, unique_labels.size).astype(np.uint8)
+    remap = np.zeros(int(unique_labels.max()) + 1, dtype=np.uint8)
+    remap[unique_labels] = positions
+    palette_index = remap[np.clip(labels, 0, remap.shape[0] - 1)]
+    overlay = cv2.applyColorMap(palette_index, cv2.COLORMAP_TURBO)
+    overlay[labels <= 0] = (0, 0, 0)
+    return overlay
+
+
+def _surface_role_overlay(
+    z_mm: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    belt_bg_mask: np.ndarray,
+    belt_stripes_mask: np.ndarray,
+    unknown_low_gradient_mask: np.ndarray,
+) -> np.ndarray:
+    overlay = _height_color_image(z_mm, valid_mask)
+    overlay[np.asarray(unknown_low_gradient_mask, dtype=bool)] = (220, 170, 40)
+    overlay[np.asarray(belt_bg_mask, dtype=bool)] = (30, 200, 30)
+    overlay[np.asarray(belt_stripes_mask, dtype=bool)] = (40, 110, 230)
+    return overlay
 
 
 def _adaptive_tick_format(span: float) -> str:
@@ -6482,6 +10292,1316 @@ def _select_low_gradient_component(
     return {"labels": labels, "candidates": candidates}, best_label
 
 
+def _component_solidity(mask: np.ndarray) -> float:
+    mask_u8 = (np.asarray(mask, dtype=np.uint8) * 255)
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    hull = cv2.convexHull(contour)
+    hull_area = float(cv2.contourArea(hull))
+    if hull_area <= 1e-9:
+        return 0.0
+    return float(area / hull_area)
+
+
+def _summarize_low_gradient_component_row(
+    *,
+    component_mask: np.ndarray,
+    component_id: int,
+    gradient: np.ndarray,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    total_valid: int,
+    roi_border: np.ndarray,
+    frame_shape: tuple[int, int],
+    centroid_hint: tuple[float, float] | None = None,
+    min_component_area: int,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    stat_mask = component_mask & valid_mask
+    area = int(np.count_nonzero(stat_mask))
+    if area <= 0:
+        return None
+    ys, xs = np.where(stat_mask)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x = int(np.min(xs))
+    y = int(np.min(ys))
+    w = int(np.max(xs) - x + 1)
+    h = int(np.max(ys) - y + 1)
+    frame_h, frame_w = frame_shape
+    cx_frame = 0.5 * max(0, frame_w - 1)
+    cy_frame = 0.5 * max(0, frame_h - 1)
+    max_center_dist = max(1.0, float(np.hypot(cx_frame, cy_frame)))
+    centroid_x = float(centroid_hint[0]) if centroid_hint is not None else float(np.mean(xs))
+    centroid_y = float(centroid_hint[1]) if centroid_hint is not None else float(np.mean(ys))
+    zvals = z[stat_mask].astype(np.float64)
+    gvals = gradient[stat_mask].astype(np.float64)
+    z_med = float(np.median(zvals))
+    dist_border = float(min(x, y, max(0, frame_w - (x + w)), max(0, frame_h - (y + h))))
+    centrality = float(np.hypot(centroid_x - cx_frame, centroid_y - cy_frame) / max_center_dist)
+    touches_frame_border = bool(x <= 0 or y <= 0 or (x + w) >= frame_w or (y + h) >= frame_h)
+    touches_roi_border = bool(np.any(component_mask & roi_border))
+    gate_overlap = (
+        float(np.count_nonzero(component_mask & np.asarray(height_gate_mask, dtype=bool)) / max(1, area))
+        if height_gate_mask is not None
+        else 0.0
+    )
+    row = {
+        "blob_id": int(component_id),
+        "area_px": area,
+        "area_ratio": float(area / max(1, total_valid)),
+        "median_z": z_med,
+        "mean_z": float(np.mean(zvals)),
+        "std_z": float(np.std(zvals)),
+        "mad_z": float(np.median(np.abs(zvals - z_med))),
+        "z_p05": float(np.percentile(zvals, 5)),
+        "z_p50": float(np.percentile(zvals, 50)),
+        "z_p95": float(np.percentile(zvals, 95)),
+        "gradient_mean": float(np.mean(gvals)) if gvals.size else 0.0,
+        "gradient_p95": float(np.percentile(gvals, 95)) if gvals.size else 0.0,
+        "bbox": [x, y, w, h],
+        "centroid": [centroid_x, centroid_y],
+        "touches_frame_border": touches_frame_border,
+        "touches_roi_border": touches_roi_border,
+        "distance_to_frame_border": dist_border,
+        "aspect_ratio": float(max(w, h) / max(1.0, float(min(w, h)))),
+        "elongation": float((max(w, h) - min(w, h)) / max(1.0, float(max(w, h)))),
+        "solidity": _component_solidity(component_mask),
+        "compactness": float(area / max(1.0, float(w * h))),
+        "overlap_with_roi": float(np.count_nonzero(component_mask & roi_mask) / max(1, area)),
+        "overlap_with_height_gate": gate_overlap,
+        "overlap_with_stripe_mask": 0.0,
+        "centrality": centrality,
+        "z_range_robust": float(np.percentile(zvals, 95) - np.percentile(zvals, 5)) if zvals.size else 0.0,
+        "component_id": int(component_id),
+        "source": "low_gradient_mask",
+        "rejected": area < int(min_component_area),
+        "rejected_reason": "tiny_component" if area < int(min_component_area) else None,
+    }
+    if extra_fields:
+        row.update(extra_fields)
+    return row
+
+
+def _normalize_blob_component_mode(mode: str | None) -> str:
+    value = str(mode or "xy_only").strip().lower()
+    if value in {"xy_only", "height_aware"}:
+        return value
+    return "xy_only"
+
+
+def _effective_blob_neighbor_z_tolerance_mm(
+    *,
+    z: np.ndarray,
+    candidate_mask: np.ndarray,
+    tolerance_mode: str,
+    fixed_tolerance_mm: float,
+    mad_k: float,
+    mad_floor_mm: float,
+) -> tuple[float, dict[str, Any]]:
+    mode = str(tolerance_mode or "fixed").strip().lower()
+    if mode == "mad_adaptive":
+        zvals = z[candidate_mask].astype(np.float64)
+        if zvals.size:
+            med = float(np.median(zvals))
+            mad = float(np.median(np.abs(zvals - med)))
+            tol = max(float(mad_floor_mm), float(mad_k) * max(0.25, mad))
+        else:
+            mad = 0.0
+            tol = float(fixed_tolerance_mm)
+        return tol, {"mode": "mad_adaptive", "mad_mm": mad, "effective_tolerance_mm": tol}
+    return float(fixed_tolerance_mm), {"mode": "fixed", "effective_tolerance_mm": float(fixed_tolerance_mm)}
+
+
+def _prepare_blob_component_z(
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    use_smoothed_z: bool,
+    smoothing_kernel: int,
+) -> np.ndarray:
+    z_work = z.astype(np.float32, copy=True)
+    if not use_smoothed_z:
+        return z_work
+    kernel = max(1, int(smoothing_kernel))
+    if kernel % 2 == 0:
+        kernel += 1
+    fill = float(np.median(z_work[valid_mask])) if np.any(valid_mask) else 0.0
+    filled = np.where(valid_mask, z_work, fill).astype(np.float32)
+    return cv2.GaussianBlur(filled, (kernel, kernel), 0)
+
+
+def _height_aware_blob_neighbor_offsets(connectivity: int) -> list[tuple[int, int]]:
+    offsets = [(0, 1), (1, 0)]
+    if int(connectivity) >= 8:
+        offsets.extend([(1, 1), (1, -1)])
+    return offsets
+
+
+def _pixels_z_compatible_for_blob_edge(
+    za: float,
+    zb: float,
+    *,
+    neighbor_tol_mm: float,
+    allow_gradual_slope: bool,
+    max_local_slope_mm_per_px: float,
+) -> bool:
+    dz = abs(float(za) - float(zb))
+    step_tol = float(neighbor_tol_mm)
+    if allow_gradual_slope:
+        step_tol = max(step_tol, float(max_local_slope_mm_per_px))
+    return dz <= step_tol
+
+
+def _build_height_aware_low_gradient_components(
+    *,
+    low_grad_mask: np.ndarray,
+    gradient: np.ndarray,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    min_component_area: int,
+    min_area_px: int,
+    connectivity: int,
+    neighbor_z_tolerance_mm: float,
+    component_z_tolerance_mm: float,
+    tolerance_mode: str,
+    mad_k: float,
+    mad_floor_mm: float,
+    allow_gradual_slope: bool,
+    max_local_slope_mm_per_px: float,
+    use_smoothed_z: bool,
+    z_smoothing_kernel: int,
+) -> dict[str, Any]:
+    candidate_mask = np.asarray(low_grad_mask, dtype=bool) & np.asarray(valid_mask, dtype=bool)
+    h, w = candidate_mask.shape
+    z_work = _prepare_blob_component_z(z, valid_mask, use_smoothed_z=use_smoothed_z, smoothing_kernel=z_smoothing_kernel)
+    neighbor_tol_mm, tolerance_debug = _effective_blob_neighbor_z_tolerance_mm(
+        z=z_work,
+        candidate_mask=candidate_mask,
+        tolerance_mode=tolerance_mode,
+        fixed_tolerance_mm=neighbor_z_tolerance_mm,
+        mad_k=mad_k,
+        mad_floor_mm=mad_floor_mm,
+    )
+    flat_size = h * w
+    parent = np.arange(flat_size, dtype=np.int32)
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a_idx: int, b_idx: int) -> None:
+        pa = find(a_idx)
+        pb = find(b_idx)
+        if pa != pb:
+            parent[pb] = pa
+
+    accepted_edges = 0
+    rejected_edges = 0
+    rejected_edge_mask = np.zeros((h, w), dtype=bool)
+    offsets = _height_aware_blob_neighbor_offsets(connectivity)
+    candidate_flat = candidate_mask.reshape(-1)
+    z_flat = z_work.reshape(-1)
+    for y in range(h):
+        for x in range(w):
+            if not candidate_mask[y, x]:
+                continue
+            p_idx = y * w + x
+            zp = float(z_flat[p_idx])
+            for dy, dx in offsets:
+                ny, nx = y + dy, x + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                if not candidate_mask[ny, nx]:
+                    continue
+                q_idx = ny * w + nx
+                if q_idx <= p_idx:
+                    continue
+                zq = float(z_flat[q_idx])
+                if _pixels_z_compatible_for_blob_edge(
+                    zp,
+                    zq,
+                    neighbor_tol_mm=neighbor_tol_mm,
+                    allow_gradual_slope=allow_gradual_slope,
+                    max_local_slope_mm_per_px=max_local_slope_mm_per_px,
+                ):
+                    union(p_idx, q_idx)
+                    accepted_edges += 1
+                else:
+                    rejected_edges += 1
+                    rejected_edge_mask[y, x] = True
+                    rejected_edge_mask[ny, nx] = True
+
+    labels = np.zeros((h, w), dtype=np.int32)
+    root_to_label: dict[int, int] = {}
+    next_label = 1
+    for flat_idx in np.flatnonzero(candidate_flat):
+        root = find(int(flat_idx))
+        if root not in root_to_label:
+            root_to_label[root] = next_label
+            next_label += 1
+        y, x = divmod(int(flat_idx), w)
+        labels[y, x] = root_to_label[root]
+
+    small_component_rejected_count = 0
+    for label in sorted(set(root_to_label.values())):
+        component_mask = labels == label
+        area_px = int(np.count_nonzero(component_mask))
+        if area_px < max(1, int(min_area_px)):
+            labels[component_mask] = 0
+            small_component_rejected_count += 1
+
+    total_valid = max(1, int(np.count_nonzero(valid_mask)))
+    roi_border = _roi_border_mask(roi_mask)
+    rows: list[dict[str, Any]] = []
+    kept_ids: list[int] = []
+    rejected_ids: list[int] = []
+    height_aware_fields = {
+        "component_mode": "height_aware",
+        "neighbor_z_tolerance_mm": float(neighbor_tol_mm),
+        "component_z_tolerance_mm": float(component_z_tolerance_mm),
+        "connectivity": int(connectivity),
+        "use_smoothed_z": bool(use_smoothed_z),
+        "accepted_neighbor_edge_count": int(accepted_edges),
+        "rejected_neighbor_edge_count": int(rejected_edges),
+        "component_reference_mode": "local_edge_only",
+    }
+    for label in sorted(int(v) for v in np.unique(labels) if int(v) > 0):
+        mask = labels == label
+        ys, xs = np.where(mask)
+        centroid_hint = (float(np.mean(xs)), float(np.mean(ys))) if xs.size else None
+        row = _summarize_low_gradient_component_row(
+            component_mask=mask,
+            component_id=int(label),
+            gradient=gradient,
+            z=z,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            total_valid=total_valid,
+            roi_border=roi_border,
+            frame_shape=low_grad_mask.shape,
+            centroid_hint=centroid_hint,
+            min_component_area=min_component_area,
+            extra_fields={
+                **height_aware_fields,
+                "source_blob_id": int(label),
+                "fragment_id": int(label),
+                "split_index": 0,
+                "was_split_from_blob": False,
+            },
+        )
+        if row is None:
+            continue
+        rows.append(row)
+        if row["rejected"]:
+            rejected_ids.append(int(label))
+        else:
+            kept_ids.append(int(label))
+
+    connectivity_debug = {
+        "candidate_pixels": int(np.count_nonzero(candidate_mask)),
+        "accepted_neighbor_edges": int(accepted_edges),
+        "rejected_neighbor_edges": int(rejected_edges),
+        "component_count": int(len(rows)),
+        "small_component_rejected_count": int(small_component_rejected_count),
+        "parameters": {
+            "blob_component_mode": "height_aware",
+            "blob_connectivity": int(connectivity),
+            "blob_neighbor_z_tolerance_mm": float(neighbor_z_tolerance_mm),
+            "blob_component_z_tolerance_mm": float(component_z_tolerance_mm),
+            "blob_component_tolerance_mode": str(tolerance_mode),
+            "blob_component_allow_gradual_slope": bool(allow_gradual_slope),
+            "blob_component_max_local_slope_mm_per_px": float(max_local_slope_mm_per_px),
+            "blob_component_min_area_px": int(min_area_px),
+            "blob_component_use_smoothed_z": bool(use_smoothed_z),
+            "blob_component_z_smoothing_kernel": int(z_smoothing_kernel),
+        },
+        "tolerance": tolerance_debug,
+    }
+    return {
+        "labels": labels,
+        "blobs": rows,
+        "kept_ids": kept_ids,
+        "rejected_ids": rejected_ids,
+        "component_mode": "height_aware",
+        "rejected_edge_mask": rejected_edge_mask,
+        "connectivity_debug": connectivity_debug,
+    }
+
+
+def _summarize_low_gradient_blobs(
+    *,
+    low_grad_mask: np.ndarray,
+    gradient: np.ndarray,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    min_component_area: int,
+    component_mode: str = "xy_only",
+    blob_connectivity: int = 8,
+    blob_neighbor_z_tolerance_mm: float = 3.0,
+    blob_component_z_tolerance_mm: float = 8.0,
+    blob_component_tolerance_mode: str = "fixed",
+    blob_component_mad_k: float = 3.0,
+    blob_component_mad_floor_mm: float = 1.0,
+    blob_component_allow_gradual_slope: bool = True,
+    blob_component_max_local_slope_mm_per_px: float = 3.0,
+    blob_component_min_area_px: int = 300,
+    blob_component_use_smoothed_z: bool = True,
+    blob_component_z_smoothing_kernel: int = 3,
+) -> dict[str, Any]:
+    mode = _normalize_blob_component_mode(component_mode)
+    if mode == "height_aware":
+        return _build_height_aware_low_gradient_components(
+            low_grad_mask=low_grad_mask,
+            gradient=gradient,
+            z=z,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            min_component_area=min_component_area,
+            min_area_px=blob_component_min_area_px,
+            connectivity=blob_connectivity,
+            neighbor_z_tolerance_mm=blob_neighbor_z_tolerance_mm,
+            component_z_tolerance_mm=blob_component_z_tolerance_mm,
+            tolerance_mode=blob_component_tolerance_mode,
+            mad_k=blob_component_mad_k,
+            mad_floor_mm=blob_component_mad_floor_mm,
+            allow_gradual_slope=blob_component_allow_gradual_slope,
+            max_local_slope_mm_per_px=blob_component_max_local_slope_mm_per_px,
+            use_smoothed_z=blob_component_use_smoothed_z,
+            z_smoothing_kernel=blob_component_z_smoothing_kernel,
+        )
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(low_grad_mask.astype(np.uint8), connectivity=8)
+    total_valid = max(1, int(np.count_nonzero(valid_mask)))
+    roi_border = _roi_border_mask(roi_mask)
+    rows: list[dict[str, Any]] = []
+    kept_ids: list[int] = []
+    rejected_ids: list[int] = []
+    for label in range(1, num_labels):
+        mask = labels == label
+        row = _summarize_low_gradient_component_row(
+            component_mask=mask,
+            component_id=int(label),
+            gradient=gradient,
+            z=z,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            total_valid=total_valid,
+            roi_border=roi_border,
+            frame_shape=low_grad_mask.shape,
+            centroid_hint=(float(centroids[label][0]), float(centroids[label][1])),
+            min_component_area=min_component_area,
+            extra_fields={
+                "component_mode": "xy_only",
+                "source_blob_id": int(label),
+                "fragment_id": int(label),
+                "split_index": 0,
+                "was_split_from_blob": False,
+            },
+        )
+        if row is None:
+            continue
+        rows.append(row)
+        if row["rejected"]:
+            rejected_ids.append(int(label))
+        else:
+            kept_ids.append(int(label))
+    return {
+        "labels": labels,
+        "blobs": rows,
+        "kept_ids": kept_ids,
+        "rejected_ids": rejected_ids,
+        "component_mode": "xy_only",
+    }
+
+
+def _normalize_blob_split_method(split_enabled: bool, split_method: str | None) -> str:
+    value = str(split_method or "").strip().lower()
+    if not value:
+        return "height_borders" if split_enabled else "disabled"
+    if not split_enabled and value != "disabled":
+        return "disabled"
+    if value in {"disabled", "histogram_gap", "height_borders", "height_borders_then_histogram"}:
+        return value
+    return "height_borders" if split_enabled else "disabled"
+
+
+def _background_like_fragment(row: dict[str, Any]) -> bool:
+    touches_border = bool(row.get("touches_frame_border")) or bool(row.get("touches_roi_border"))
+    centrality = float(row.get("centrality") or 0.0)
+    stripe_overlap = float(row.get("overlap_with_stripe_mask") or 0.0)
+    return bool((touches_border or centrality <= 0.55) and stripe_overlap <= 0.20)
+
+
+def _component_masks_from_binary(mask: np.ndarray) -> list[np.ndarray]:
+    if not np.any(mask):
+        return []
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    out: list[np.ndarray] = []
+    for label in range(1, num_labels):
+        if int(stats[label, cv2.CC_STAT_AREA]) > 0:
+            out.append(labels == label)
+    return out
+
+
+def _merge_fragment_masks_by_weak_boundaries(
+    fragment_masks: list[np.ndarray],
+    *,
+    z: np.ndarray,
+    gradient: np.ndarray,
+    valid_mask: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    total_valid: int,
+    roi_border: np.ndarray,
+    frame_shape: tuple[int, int],
+    min_component_area: int,
+    border_strength: np.ndarray | None,
+    max_median_z_gap_mm: float,
+    max_boundary_strength_mm: float,
+    background_like_only: bool,
+) -> tuple[list[np.ndarray], list[dict[str, Any]], int]:
+    if len(fragment_masks) <= 1:
+        return fragment_masks, [], 0
+    rows = [
+        _summarize_low_gradient_component_row(
+            component_mask=(mask & valid_mask),
+            component_id=index + 1,
+            gradient=gradient,
+            z=z,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            total_valid=total_valid,
+            roi_border=roi_border,
+            frame_shape=frame_shape,
+            min_component_area=min_component_area,
+        )
+        for index, mask in enumerate(fragment_masks)
+    ]
+    parent = list(range(len(fragment_masks)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a_idx: int, b_idx: int) -> None:
+        pa = find(a_idx)
+        pb = find(b_idx)
+        if pa != pb:
+            parent[pb] = pa
+
+    merge_debug: list[dict[str, Any]] = []
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    for i in range(len(fragment_masks)):
+        row_i = rows[i]
+        if row_i is None:
+            continue
+        dilated_i = cv2.dilate(fragment_masks[i].astype(np.uint8), kernel, iterations=1) > 0
+        for j in range(i + 1, len(fragment_masks)):
+            row_j = rows[j]
+            if row_j is None:
+                continue
+            adjacency = dilated_i & cv2.dilate(fragment_masks[j].astype(np.uint8), kernel, iterations=1).astype(bool)
+            if not np.any(adjacency):
+                continue
+            median_gap = abs(float(row_i.get("median_z") or 0.0) - float(row_j.get("median_z") or 0.0))
+            boundary_strength = float(np.mean(border_strength[adjacency])) if border_strength is not None and np.any(adjacency & np.isfinite(border_strength)) else 0.0
+            background_like = _background_like_fragment(row_i) and _background_like_fragment(row_j)
+            should_merge = median_gap <= float(max_median_z_gap_mm) and boundary_strength <= float(max_boundary_strength_mm)
+            if background_like_only and not background_like:
+                should_merge = False
+            merge_debug.append(
+                {
+                    "fragment_a": i + 1,
+                    "fragment_b": j + 1,
+                    "adjacent": True,
+                    "median_z_gap_mm": median_gap,
+                    "boundary_strength_mm": boundary_strength,
+                    "background_like_pair": background_like,
+                    "merged": bool(should_merge),
+                }
+            )
+            if should_merge:
+                union(i, j)
+    groups: dict[int, list[np.ndarray]] = {}
+    for idx, mask in enumerate(fragment_masks):
+        groups.setdefault(find(idx), []).append(mask)
+    merged_masks = [np.logical_or.reduce(group_masks) for group_masks in groups.values()]
+    merge_count = max(0, len(fragment_masks) - len(merged_masks))
+    return merged_masks, merge_debug, merge_count
+
+
+def _histogram_split_fragment_masks(
+    component_mask: np.ndarray,
+    *,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    min_band_fraction: float,
+    min_band_pixels: int,
+    hist_bins: int,
+    split_gap_mm: float,
+    split_merge_gap_mm: float,
+    refine_morphology: bool,
+    open_kernel: int,
+    close_kernel: int,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    mask = component_mask & valid_mask
+    area_px = int(np.count_nonzero(mask))
+    if area_px <= 0:
+        return [], {"split": False, "reason": "empty_fragment"}
+    zvals = z[mask].astype(np.float64)
+    if zvals.size < 2:
+        return [mask], {"split": False, "reason": "insufficient_samples"}
+    z_lo = float(np.percentile(zvals, 2))
+    z_hi = float(np.percentile(zvals, 98))
+    if not np.isfinite(z_lo) or not np.isfinite(z_hi) or z_hi <= z_lo:
+        return [mask], {"split": False, "reason": "degenerate_histogram_range"}
+    clipped = zvals[(zvals >= z_lo) & (zvals <= z_hi)]
+    if clipped.size < 2:
+        clipped = zvals
+    counts, edges = np.histogram(clipped, bins=max(8, int(hist_bins)), range=(z_lo, z_hi))
+    smooth_counts = counts.astype(np.float64).copy()
+    if smooth_counts.size >= 3:
+        smooth_counts[1:-1] = (counts[:-2] + counts[1:-1] + counts[2:]) / 3.0
+    occupied_floor = max(1.0, 0.10 * max(int(min_band_pixels), int(min_band_fraction * area_px)))
+    occupied = smooth_counts >= occupied_floor
+    runs: list[list[int]] = []
+    start: int | None = None
+    for idx, is_occupied in enumerate(occupied.tolist()):
+        if is_occupied and start is None:
+            start = idx
+        elif (not is_occupied) and start is not None:
+            runs.append([start, idx - 1])
+            start = None
+    if start is not None:
+        runs.append([start, len(occupied) - 1])
+    if len(runs) <= 1:
+        return [mask], {"split": False, "reason": "no_significant_height_gap", "counts": counts.tolist(), "edges": edges.tolist()}
+    merged_runs: list[list[int]] = [runs[0]]
+    for s_idx, e_idx in runs[1:]:
+        prev = merged_runs[-1]
+        gap_mm = float(edges[s_idx] - edges[prev[1] + 1])
+        if gap_mm < float(split_gap_mm) or gap_mm <= float(split_merge_gap_mm):
+            prev[1] = e_idx
+        else:
+            merged_runs.append([s_idx, e_idx])
+    out_masks: list[np.ndarray] = []
+    band_debug: list[dict[str, Any]] = []
+    for band_index, (s_idx, e_idx) in enumerate(merged_runs):
+        band_lo = float(edges[s_idx])
+        band_hi = float(edges[e_idx + 1])
+        band_mask = mask & (z >= band_lo)
+        band_mask = band_mask & (z < band_hi if band_index < len(merged_runs) - 1 else z <= band_hi)
+        if refine_morphology and np.count_nonzero(band_mask):
+            u8 = (band_mask.astype(np.uint8) * 255)
+            if int(open_kernel) > 1:
+                u8 = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((max(1, int(open_kernel)), max(1, int(open_kernel))), np.uint8))
+            if int(close_kernel) > 1:
+                u8 = cv2.morphologyEx(u8, cv2.MORPH_CLOSE, np.ones((max(1, int(close_kernel)), max(1, int(close_kernel))), np.uint8))
+            band_mask = (u8 > 0) & mask
+        for component in _component_masks_from_binary(band_mask):
+            pixels = int(np.count_nonzero(component))
+            fraction = float(pixels / max(1, area_px))
+            band_info = {"band_index": band_index, "z_min": band_lo, "z_max": band_hi, "pixels": pixels, "fraction": fraction, "kept": False}
+            if pixels >= int(min_band_pixels) and fraction >= float(min_band_fraction):
+                out_masks.append(component & mask)
+                band_info["kept"] = True
+            band_debug.append(band_info)
+    if len(out_masks) <= 1:
+        return [mask], {"split": False, "reason": "no_valid_bands_after_filtering", "bands": band_debug, "counts": counts.tolist(), "edges": edges.tolist()}
+    return out_masks, {"split": True, "reason": "histogram_gap_split", "bands": band_debug, "counts": counts.tolist(), "edges": edges.tolist()}
+
+
+def _height_border_split_fragment_masks(
+    blob_mask: np.ndarray,
+    *,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    border_mode: str,
+    smoothing_kernel: int,
+    threshold_mode: str,
+    percentile: float,
+    min_delta_mm: float,
+    dilate_kernel: int,
+    close_kernel: int,
+    min_length_px: int,
+    min_fragment_area_px: int,
+    merge_weak_boundaries: bool,
+    merge_max_median_z_gap_mm: float,
+    merge_max_boundary_strength_mm: float,
+    merge_background_like_only: bool,
+    gradient: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    total_valid: int,
+    roi_border: np.ndarray,
+    frame_shape: tuple[int, int],
+    min_component_area: int,
+) -> dict[str, Any]:
+    mask = blob_mask & valid_mask
+    if not np.any(mask):
+        return {"split": False, "reason": "empty_blob_mask", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
+    ys, xs = np.where(mask)
+    pad = max(2, int(max(smoothing_kernel, dilate_kernel, close_kernel)))
+    y0 = max(0, int(np.min(ys)) - pad)
+    y1 = min(mask.shape[0], int(np.max(ys)) + pad + 1)
+    x0 = max(0, int(np.min(xs)) - pad)
+    x1 = min(mask.shape[1], int(np.max(xs)) + pad + 1)
+    local_mask = mask[y0:y1, x0:x1]
+    local_valid = valid_mask[y0:y1, x0:x1]
+    local_z = z[y0:y1, x0:x1].astype(np.float32)
+    local_fill = float(np.median(local_z[local_mask])) if np.any(local_mask) else 0.0
+    local_z_filled = np.where(local_valid, local_z, local_fill).astype(np.float32)
+    if int(smoothing_kernel) > 1:
+        k = max(1, int(smoothing_kernel))
+        if k % 2 == 0:
+            k += 1
+        local_z_filled = cv2.GaussianBlur(local_z_filled, (k, k), 0)
+    mode = str(border_mode or "morphological_gradient").strip().lower()
+    if mode == "sobel_gradient":
+        gx = cv2.Sobel(local_z_filled, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(local_z_filled, cv2.CV_32F, 0, 1, ksize=3)
+        local_strength = np.sqrt(gx * gx + gy * gy).astype(np.float32)
+    elif mode == "local_range":
+        kernel = np.ones((3, 3), np.uint8)
+        local_strength = (cv2.dilate(local_z_filled, kernel) - cv2.erode(local_z_filled, kernel)).astype(np.float32)
+    else:
+        kernel_size = max(3, int(smoothing_kernel))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        local_strength = (cv2.dilate(local_z_filled, kernel) - cv2.erode(local_z_filled, kernel)).astype(np.float32)
+    local_strength = np.where(local_valid, local_strength, 0.0)
+    strength_vals = local_strength[local_mask]
+    if strength_vals.size == 0:
+        return {"split": False, "reason": "no_strength_inside_blob", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
+    threshold_mode_normalized = str(threshold_mode or "percentile").strip().lower()
+    if threshold_mode_normalized == "fixed":
+        threshold_mm = float(min_delta_mm)
+    elif threshold_mode_normalized == "otsu":
+        threshold_mm = max(float(_otsu_threshold(strength_vals)), float(min_delta_mm))
+    else:
+        threshold_mm = max(float(np.percentile(strength_vals, float(np.clip(percentile, 1.0, 99.0)))), float(min_delta_mm))
+    local_cut = (local_strength >= threshold_mm) & local_mask
+    if int(close_kernel) > 1:
+        local_cut = cv2.morphologyEx((local_cut.astype(np.uint8) * 255), cv2.MORPH_CLOSE, np.ones((int(close_kernel), int(close_kernel)), np.uint8)) > 0
+    if int(dilate_kernel) > 1:
+        local_cut = cv2.dilate(local_cut.astype(np.uint8), np.ones((int(dilate_kernel), int(dilate_kernel)), np.uint8), iterations=1) > 0
+    filtered_cut = np.zeros_like(local_cut, dtype=bool)
+    edge_candidate_pixels = int(np.count_nonzero(local_cut))
+    for component in _component_masks_from_binary(local_cut):
+        ys_c, xs_c = np.where(component)
+        length_px = int(max((np.max(xs_c) - np.min(xs_c) + 1) if xs_c.size else 0, (np.max(ys_c) - np.min(ys_c) + 1) if ys_c.size else 0))
+        if length_px >= int(min_length_px):
+            filtered_cut |= component
+    fragment_seed = local_mask & (~filtered_cut)
+    fragment_masks_local = [component for component in _component_masks_from_binary(fragment_seed) if int(np.count_nonzero(component)) >= int(min_fragment_area_px)]
+    if len(fragment_masks_local) <= 1:
+        strength_map = np.zeros_like(z, dtype=np.float32)
+        strength_map[y0:y1, x0:x1] = local_strength
+        cut_mask = np.zeros_like(mask, dtype=bool)
+        cut_mask[y0:y1, x0:x1] = filtered_cut & local_mask
+        return {
+            "split": False,
+            "reason": "no_valid_height_border_split",
+            "fragment_masks": [mask],
+            "strength_map": strength_map,
+            "cut_mask": cut_mask,
+            "fragment_mask": mask.copy(),
+            "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32),
+            "threshold_mm": threshold_mm,
+            "edge_candidate_pixels": edge_candidate_pixels,
+            "cut_pixels": int(np.count_nonzero(filtered_cut & local_mask)),
+            "initial_fragments": len(fragment_masks_local),
+            "kept_fragments": 1,
+            "merged_fragments": 0,
+            "height_border_mean_strength": float(np.mean(strength_vals)),
+            "height_border_max_strength": float(np.max(strength_vals)) if strength_vals.size else 0.0,
+            "merge_debug": [],
+        }
+    fragment_masks_global = []
+    for component in fragment_masks_local:
+        global_mask = np.zeros_like(mask, dtype=bool)
+        global_mask[y0:y1, x0:x1] = component
+        fragment_masks_global.append(global_mask & mask)
+    merge_debug: list[dict[str, Any]] = []
+    merge_count = 0
+    if merge_weak_boundaries:
+        local_strength_global = np.zeros_like(z, dtype=np.float32)
+        local_strength_global[y0:y1, x0:x1] = local_strength
+        fragment_masks_global, merge_debug, merge_count = _merge_fragment_masks_by_weak_boundaries(
+            fragment_masks_global,
+            z=z,
+            gradient=gradient,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            total_valid=total_valid,
+            roi_border=roi_border,
+            frame_shape=frame_shape,
+            min_component_area=min_component_area,
+            border_strength=local_strength_global,
+            max_median_z_gap_mm=merge_max_median_z_gap_mm,
+            max_boundary_strength_mm=merge_max_boundary_strength_mm,
+            background_like_only=merge_background_like_only,
+        )
+    fragment_labels = np.zeros_like(blob_mask, dtype=np.int32)
+    fragment_mask = np.zeros_like(blob_mask, dtype=bool)
+    for index, component in enumerate(fragment_masks_global, start=1):
+        fragment_labels[component] = index
+        fragment_mask |= component
+    strength_map = np.zeros_like(z, dtype=np.float32)
+    strength_map[y0:y1, x0:x1] = local_strength
+    cut_mask = np.zeros_like(mask, dtype=bool)
+    cut_mask[y0:y1, x0:x1] = filtered_cut & local_mask
+    return {
+        "split": len(fragment_masks_global) > 1,
+        "reason": "height_border_split" if len(fragment_masks_global) > 1 else "no_valid_height_border_split",
+        "fragment_masks": fragment_masks_global,
+        "strength_map": strength_map,
+        "cut_mask": cut_mask,
+        "fragment_mask": fragment_mask,
+        "fragment_labels": fragment_labels,
+        "threshold_mm": threshold_mm,
+        "edge_candidate_pixels": edge_candidate_pixels,
+        "cut_pixels": int(np.count_nonzero(filtered_cut & local_mask)),
+        "initial_fragments": len(fragment_masks_local),
+        "kept_fragments": len(fragment_masks_global),
+        "merged_fragments": merge_count,
+        "height_border_mean_strength": float(np.mean(strength_vals)),
+        "height_border_max_strength": float(np.max(strength_vals)) if strength_vals.size else 0.0,
+        "merge_debug": merge_debug,
+    }
+
+
+def _split_low_gradient_blob_candidates_by_height(
+    *,
+    labels: np.ndarray,
+    blob_rows: list[dict[str, Any]],
+    gradient: np.ndarray,
+    z: np.ndarray,
+    valid_mask: np.ndarray,
+    roi_mask: np.ndarray,
+    height_gate_mask: np.ndarray | None,
+    min_component_area: int,
+    split_enabled: bool,
+    split_method: str,
+    split_min_height_range_mm: float,
+    split_min_pixels: int,
+    split_gap_mm: float,
+    split_mode: str,
+    split_hist_bins: int,
+    split_min_band_fraction: float,
+    split_min_band_pixels: int,
+    split_merge_gap_mm: float,
+    split_refine_morphology: bool,
+    split_open_kernel: int,
+    split_close_kernel: int,
+    split_height_border_enabled: bool,
+    split_height_border_mode: str,
+    split_height_border_smoothing_kernel: int,
+    split_height_border_threshold_mode: str,
+    split_height_border_percentile: float,
+    split_height_border_min_delta_mm: float,
+    split_height_border_dilate_kernel: int,
+    split_height_border_close_kernel: int,
+    split_height_border_min_length_px: int,
+    split_min_fragment_area_px: int,
+    split_merge_weak_boundaries: bool,
+    split_merge_max_median_z_gap_mm: float,
+    split_merge_max_boundary_strength_mm: float,
+    split_merge_background_like_only: bool,
+) -> dict[str, Any]:
+    total_valid = max(1, int(np.count_nonzero(valid_mask)))
+    roi_border = _roi_border_mask(roi_mask)
+    fragment_labels = np.zeros_like(labels, dtype=np.int32)
+    border_fragment_labels = np.zeros_like(labels, dtype=np.int32)
+    fragment_rows: list[dict[str, Any]] = []
+    debug_rows: list[dict[str, Any]] = []
+    merge_debug_rows: list[dict[str, Any]] = []
+    kept_ids: list[int] = []
+    rejected_ids: list[int] = []
+    next_fragment_id = 1
+    next_border_fragment_id = 1
+    strength_map = np.zeros_like(z, dtype=np.float32)
+    cut_mask = np.zeros_like(labels, dtype=bool)
+    border_fragment_mask = np.zeros_like(labels, dtype=bool)
+    method = _normalize_blob_split_method(split_enabled, split_method)
+    eligible_blob_count = 0
+    height_border_split_blob_count = 0
+    histogram_split_blob_count = 0
+    merge_back_count = 0
+    warnings: list[str] = []
+
+    def append_fragment(
+        mask: np.ndarray,
+        *,
+        source_blob_id: int,
+        split_index: int,
+        was_split: bool,
+        split_method_value: str,
+        split_stage: str,
+        height_border_split: bool,
+        histogram_split: bool,
+        merge_group_id: int | None,
+        border_mean_strength: float = 0.0,
+        border_max_strength: float = 0.0,
+        boundary_reason: str | None = None,
+    ) -> int | None:
+        nonlocal next_fragment_id
+        if not np.any(mask & valid_mask):
+            return None
+        fragment_id = int(next_fragment_id)
+        next_fragment_id += 1
+        fragment_labels[mask & valid_mask] = fragment_id
+        row = _summarize_low_gradient_component_row(
+            component_mask=(mask & valid_mask),
+            component_id=fragment_id,
+            gradient=gradient,
+            z=z,
+            valid_mask=valid_mask,
+            roi_mask=roi_mask,
+            height_gate_mask=height_gate_mask,
+            total_valid=total_valid,
+            roi_border=roi_border,
+            frame_shape=labels.shape,
+            min_component_area=min_component_area,
+            extra_fields={
+                "fragment_id": fragment_id,
+                "source_blob_id": int(source_blob_id),
+                "split_index": int(split_index),
+                "was_split_from_blob": bool(was_split),
+                "split_method": split_method_value,
+                "split_stage": split_stage,
+                "height_border_split": bool(height_border_split),
+                "histogram_split": bool(histogram_split),
+                "height_border_mean_strength": float(border_mean_strength),
+                "height_border_max_strength": float(border_max_strength),
+                "height_border_boundary_reason": boundary_reason,
+                "merge_group_id": None if merge_group_id is None else int(merge_group_id),
+            },
+        )
+        if row is None:
+            fragment_labels[mask & valid_mask] = 0
+            next_fragment_id -= 1
+            return None
+        fragment_rows.append(row)
+        if row["rejected"]:
+            rejected_ids.append(fragment_id)
+        else:
+            kept_ids.append(fragment_id)
+        return fragment_id
+
+    for blob_row in blob_rows:
+        source_blob_id = int(blob_row.get("blob_id") or 0)
+        blob_mask = (labels == source_blob_id) & valid_mask
+        area_px = int(np.count_nonzero(blob_mask))
+        z_p05 = float(blob_row.get("z_p05") or 0.0)
+        z_p95 = float(blob_row.get("z_p95") or 0.0)
+        z_range_robust = float(z_p95 - z_p05)
+        debug_entry: dict[str, Any] = {
+            "source_blob_id": source_blob_id,
+            "area_px": area_px,
+            "z_p05": z_p05,
+            "z_p50": float(blob_row.get("z_p50") or blob_row.get("median_z") or 0.0),
+            "z_p95": z_p95,
+            "z_range_robust": z_range_robust,
+            "z_mad": float(blob_row.get("mad_z") or 0.0),
+            "eligible": False,
+            "split": False,
+            "method": method,
+            "reason": "disabled",
+            "fragments": [],
+        }
+        if not np.any(blob_mask):
+            debug_entry["reason"] = "empty_blob_mask"
+            debug_rows.append(debug_entry)
+            continue
+        eligible = area_px >= int(split_min_pixels) and z_range_robust >= float(split_min_height_range_mm)
+        debug_entry["eligible"] = bool(eligible)
+        if eligible:
+            eligible_blob_count += 1
+        if method == "disabled" or not eligible:
+            debug_entry["reason"] = "disabled" if method == "disabled" else ("below_min_pixels" if area_px < int(split_min_pixels) else "below_min_height_range")
+            append_fragment(
+                blob_mask,
+                source_blob_id=source_blob_id,
+                split_index=0,
+                was_split=False,
+                split_method_value="disabled",
+                split_stage="none",
+                height_border_split=False,
+                histogram_split=False,
+                merge_group_id=None,
+                boundary_reason=debug_entry["reason"],
+            )
+            debug_rows.append(debug_entry)
+            continue
+
+        current_masks = [blob_mask]
+        current_stage = "original_blob"
+        border_result: dict[str, Any] | None = None
+        if method in {"height_borders", "height_borders_then_histogram"} and bool(split_height_border_enabled):
+            border_result = _height_border_split_fragment_masks(
+                blob_mask,
+                z=z,
+                valid_mask=valid_mask,
+                border_mode=split_height_border_mode,
+                smoothing_kernel=split_height_border_smoothing_kernel,
+                threshold_mode=split_height_border_threshold_mode,
+                percentile=split_height_border_percentile,
+                min_delta_mm=split_height_border_min_delta_mm,
+                dilate_kernel=split_height_border_dilate_kernel,
+                close_kernel=split_height_border_close_kernel,
+                min_length_px=split_height_border_min_length_px,
+                min_fragment_area_px=split_min_fragment_area_px,
+                merge_weak_boundaries=split_merge_weak_boundaries,
+                merge_max_median_z_gap_mm=split_merge_max_median_z_gap_mm,
+                merge_max_boundary_strength_mm=split_merge_max_boundary_strength_mm,
+                merge_background_like_only=split_merge_background_like_only,
+                gradient=gradient,
+                roi_mask=roi_mask,
+                height_gate_mask=height_gate_mask,
+                total_valid=total_valid,
+                roi_border=roi_border,
+                frame_shape=labels.shape,
+                min_component_area=min_component_area,
+            )
+            strength_map = np.maximum(strength_map, np.asarray(border_result.get("strength_map"), dtype=np.float32))
+            cut_mask |= np.asarray(border_result.get("cut_mask"), dtype=bool)
+            if border_result.get("split"):
+                height_border_split_blob_count += 1
+                current_masks = [np.asarray(mask, dtype=bool) for mask in (border_result.get("fragment_masks") or []) if np.any(mask)]
+                current_stage = "height_borders"
+                local_border_labels = np.asarray(border_result.get("fragment_labels"), dtype=np.int32)
+                for local_id in sorted(int(v) for v in np.unique(local_border_labels) if int(v) > 0):
+                    border_fragment_labels[local_border_labels == local_id] = next_border_fragment_id
+                    next_border_fragment_id += 1
+                border_fragment_mask |= np.asarray(border_result.get("fragment_mask"), dtype=bool)
+            merge_debug_rows.extend(
+                [
+                    {"source_blob_id": source_blob_id, **entry}
+                    for entry in list(border_result.get("merge_debug") or [])
+                ]
+            )
+            merge_back_count += int(border_result.get("merged_fragments") or 0)
+            debug_entry.update(
+                {
+                    "threshold_mm": border_result.get("threshold_mm"),
+                    "edge_candidate_pixels": border_result.get("edge_candidate_pixels"),
+                    "cut_pixels": border_result.get("cut_pixels"),
+                    "initial_fragments": border_result.get("initial_fragments"),
+                    "kept_fragments": border_result.get("kept_fragments"),
+                    "merged_fragments": border_result.get("merged_fragments"),
+                    "height_border_mean_strength": border_result.get("height_border_mean_strength"),
+                    "height_border_max_strength": border_result.get("height_border_max_strength"),
+                }
+            )
+            if not border_result.get("split") and method == "height_borders":
+                debug_entry["reason"] = border_result.get("reason") or "no_valid_height_border_split"
+            elif border_result.get("split"):
+                debug_entry["reason"] = "height_border_split"
+
+        final_masks: list[np.ndarray] = []
+        split_index = 0
+        for base_mask in current_masks:
+            if method in {"histogram_gap", "height_borders_then_histogram"}:
+                hist_masks, hist_debug = _histogram_split_fragment_masks(
+                    base_mask,
+                    z=z,
+                    valid_mask=valid_mask,
+                    min_band_fraction=split_min_band_fraction,
+                    min_band_pixels=split_min_band_pixels,
+                    hist_bins=split_hist_bins,
+                    split_gap_mm=split_gap_mm,
+                    split_merge_gap_mm=split_merge_gap_mm,
+                    refine_morphology=split_refine_morphology,
+                    open_kernel=split_open_kernel,
+                    close_kernel=split_close_kernel,
+                )
+                if hist_debug.get("split"):
+                    histogram_split_blob_count += 1
+                    final_masks.extend(hist_masks)
+                else:
+                    final_masks.append(base_mask)
+                if method == "histogram_gap":
+                    debug_entry["histogram"] = hist_debug
+            else:
+                final_masks.append(base_mask)
+        if not final_masks:
+            final_masks = [blob_mask]
+        if not np.any(border_fragment_mask & blob_mask):
+            border_fragment_mask |= blob_mask
+            border_fragment_labels[blob_mask] = next_border_fragment_id
+            next_border_fragment_id += 1
+
+        fragment_ids_for_blob: list[int] = []
+        any_border_split = bool(border_result and border_result.get("split"))
+        any_histogram_split = method in {"histogram_gap", "height_borders_then_histogram"} and len(final_masks) > len(current_masks)
+        for component_idx, component_mask in enumerate(final_masks):
+            component_mask = np.asarray(component_mask, dtype=bool) & blob_mask & valid_mask
+            if int(np.count_nonzero(component_mask)) < max(1, int(split_min_fragment_area_px)):
+                continue
+            fragment_id = append_fragment(
+                component_mask,
+                source_blob_id=source_blob_id,
+                split_index=split_index,
+                was_split=bool(any_border_split or any_histogram_split),
+                split_method_value=method,
+                split_stage=current_stage if current_stage != "original_blob" else ("histogram_gap" if any_histogram_split else "none"),
+                height_border_split=bool(any_border_split),
+                histogram_split=bool(any_histogram_split),
+                merge_group_id=component_idx + 1 if any_border_split else None,
+                border_mean_strength=float(border_result.get("height_border_mean_strength") or 0.0) if border_result else 0.0,
+                border_max_strength=float(border_result.get("height_border_max_strength") or 0.0) if border_result else 0.0,
+                boundary_reason=str(debug_entry.get("reason") or ""),
+            )
+            split_index += 1
+            if fragment_id is not None:
+                fragment_ids_for_blob.append(fragment_id)
+        if len(fragment_ids_for_blob) <= 1 and (any_border_split or any_histogram_split):
+            fragment_labels[np.isin(fragment_labels, fragment_ids_for_blob)] = 0
+            fragment_rows[:] = [row for row in fragment_rows if int(row.get("fragment_id") or 0) not in set(fragment_ids_for_blob)]
+            kept_ids[:] = [frag_id for frag_id in kept_ids if frag_id not in set(fragment_ids_for_blob)]
+            rejected_ids[:] = [frag_id for frag_id in rejected_ids if frag_id not in set(fragment_ids_for_blob)]
+            next_fragment_id -= len(fragment_ids_for_blob)
+            fragment_ids_for_blob = []
+            append_fragment(
+                blob_mask,
+                source_blob_id=source_blob_id,
+                split_index=0,
+                was_split=False,
+                split_method_value="disabled",
+                split_stage="none",
+                height_border_split=False,
+                histogram_split=False,
+                merge_group_id=None,
+                boundary_reason="fallback_to_original_blob",
+            )
+            debug_entry["reason"] = "no_valid_split"
+        debug_entry["split"] = len(fragment_ids_for_blob) > 1
+        debug_entry["fragments"] = fragment_ids_for_blob
+        if not debug_entry["split"] and not str(debug_entry.get("reason") or "").startswith("below_"):
+            debug_entry["reason"] = str(debug_entry.get("reason") or "no_valid_split")
+        debug_rows.append(debug_entry)
+
+    using_split_fragments = bool(any(bool(row.get("was_split_from_blob")) for row in fragment_rows))
+    if method != "disabled" and not using_split_fragments:
+        warnings.append("height splitting produced no valid fragments; using original blob components")
+    return {
+        "labels": fragment_labels,
+        "fragments": fragment_rows,
+        "kept_ids": kept_ids,
+        "rejected_ids": rejected_ids,
+        "debug": debug_rows,
+        "using_split_fragments": using_split_fragments,
+        "method": method,
+        "eligible_blob_count": eligible_blob_count,
+        "height_border_split_blob_count": height_border_split_blob_count,
+        "histogram_split_blob_count": histogram_split_blob_count,
+        "merge_back_count": merge_back_count,
+        "height_border_strength": strength_map,
+        "height_border_cut_mask": cut_mask,
+        "height_border_fragment_labels": border_fragment_labels,
+        "height_border_fragment_mask": border_fragment_mask,
+        "merge_debug": merge_debug_rows,
+        "warnings": warnings,
+    }
+
+
+def _cluster_low_gradient_blobs_by_height(
+    blobs: list[dict[str, Any]],
+    *,
+    height_gap_mm: float,
+    height_gap_mode: str,
+    merge_close_clusters: bool,
+    merge_gap_mm: float,
+) -> list[dict[str, Any]]:
+    accepted = [row for row in blobs if not bool(row.get("rejected"))]
+    if not accepted:
+        return []
+    ordered = sorted(accepted, key=lambda row: (float(row.get("median_z") or 0.0), -int(row.get("area_px") or 0)))
+    adaptive_gap = float(height_gap_mm)
+    if str(height_gap_mode).lower() == "adaptive":
+        mads = [float(row.get("mad_z") or 0.0) for row in ordered]
+        adaptive_gap = max(float(height_gap_mm), float(np.median(mads) * 2.0) if mads else float(height_gap_mm))
+    clusters: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for row in ordered:
+        if not current:
+            current = [row]
+            continue
+        gap = abs(float(row.get("median_z") or 0.0) - float(current[-1].get("median_z") or 0.0))
+        if gap <= adaptive_gap:
+            current.append(row)
+        else:
+            clusters.append({"blob_rows": current[:]})
+            current = [row]
+    if current:
+        clusters.append({"blob_rows": current[:]})
+
+    if merge_close_clusters and len(clusters) > 1:
+        merged: list[dict[str, Any]] = [clusters[0]]
+        for cluster in clusters[1:]:
+            prev = merged[-1]
+            prev_z = float(np.average([float(row.get("median_z") or 0.0) for row in prev["blob_rows"]], weights=[max(1, int(row.get("area_px") or 0)) for row in prev["blob_rows"]]))
+            cur_z = float(np.average([float(row.get("median_z") or 0.0) for row in cluster["blob_rows"]], weights=[max(1, int(row.get("area_px") or 0)) for row in cluster["blob_rows"]]))
+            if abs(cur_z - prev_z) <= float(merge_gap_mm):
+                prev["blob_rows"].extend(cluster["blob_rows"])
+            else:
+                merged.append(cluster)
+        clusters = merged
+
+    out: list[dict[str, Any]] = []
+    for index, cluster in enumerate(clusters, start=1):
+        rows = list(cluster["blob_rows"])
+        total_pixels = int(sum(int(row.get("area_px") or 0) for row in rows))
+        weights = np.asarray([max(1, int(row.get("area_px") or 0)) for row in rows], dtype=np.float64)
+        medians = np.asarray([float(row.get("median_z") or 0.0) for row in rows], dtype=np.float64)
+        mad_vals = np.asarray([float(row.get("mad_z") or 0.0) for row in rows], dtype=np.float64)
+        p05_vals = [float(row.get("z_p05") or 0.0) for row in rows]
+        p95_vals = [float(row.get("z_p95") or 0.0) for row in rows]
+        out.append(
+            {
+                "cluster_id": f"cluster_{index:03d}",
+                "blob_ids": [int(row.get("blob_id") or 0) for row in rows],
+                "source_blob_ids": sorted({int(row.get("source_blob_id") or row.get("blob_id") or 0) for row in rows}),
+                "blob_count": int(len(rows)),
+                "fragment_count": int(len(rows)),
+                "original_blob_count": int(len({int(row.get("source_blob_id") or row.get("blob_id") or 0) for row in rows})),
+                "split_fragment_count": int(sum(1 for row in rows if bool(row.get("was_split_from_blob")))),
+                "mixed_blob_source_count": int(
+                    sum(
+                        1
+                        for source_blob_id in {int(row.get("source_blob_id") or row.get("blob_id") or 0) for row in rows}
+                        if sum(1 for row in rows if int(row.get("source_blob_id") or row.get("blob_id") or 0) == source_blob_id) > 1
+                    )
+                ),
+                "total_pixels": total_pixels,
+                "area_fraction": 0.0,
+                "median_z": float(np.average(medians, weights=weights)),
+                "mean_z": float(np.average(np.asarray([float(row.get("mean_z") or 0.0) for row in rows]), weights=weights)),
+                "z_mad_weighted": float(np.average(mad_vals, weights=weights)),
+                "z_min": float(min(p05_vals)) if p05_vals else 0.0,
+                "z_max": float(max(p95_vals)) if p95_vals else 0.0,
+                "touches_roi_border_fraction": float(sum(1 for row in rows if row.get("touches_roi_border")) / max(1, len(rows))),
+                "touches_frame_border_fraction": float(sum(1 for row in rows if row.get("touches_frame_border")) / max(1, len(rows))),
+                "mean_centrality": float(np.average(np.asarray([float(row.get("centrality") or 0.0) for row in rows]), weights=weights)),
+                "mean_gradient_p95": float(np.average(np.asarray([float(row.get("gradient_p95") or 0.0) for row in rows]), weights=weights)),
+                "mean_solidity": float(np.average(np.asarray([float(row.get("solidity") or 0.0) for row in rows]), weights=weights)),
+                "mean_compactness": float(np.average(np.asarray([float(row.get("compactness") or 0.0) for row in rows]), weights=weights)),
+                "height_gate_overlap": float(np.average(np.asarray([float(row.get("overlap_with_height_gate") or 0.0) for row in rows]), weights=weights)),
+                "stripe_overlap": float(np.average(np.asarray([float(row.get("overlap_with_stripe_mask") or 0.0) for row in rows]), weights=weights)),
+                "blob_rows": rows,
+            }
+        )
+    return out
+
+
+def _score_blob_height_clusters(
+    clusters: list[dict[str, Any]],
+    *,
+    valid_pixel_count: int,
+    min_area_fraction: float,
+    min_total_pixels: int,
+    max_z_mad_mm: float,
+    area_weight: float,
+    border_weight: float,
+    constancy_weight: float,
+    spatial_coverage_weight: float,
+    depth_preference_weight: float,
+    fragmentation_penalty: float,
+    centrality_penalty: float,
+    object_like_penalty: float,
+    stripe_overlap_penalty: float,
+    inferred_depth_preference: str = "lower_z",
+) -> list[dict[str, Any]]:
+    total_valid = max(1, int(valid_pixel_count))
+    if not clusters:
+        return []
+    z_values = np.asarray([float(row.get("median_z") or 0.0) for row in clusters], dtype=np.float64)
+    z_min = float(np.min(z_values))
+    z_max = float(np.max(z_values))
+    z_span = max(1e-6, z_max - z_min)
+    scored: list[dict[str, Any]] = []
+    for row in clusters:
+        total_pixels = int(row.get("total_pixels") or 0)
+        area_fraction = float(total_pixels / total_valid)
+        row["area_fraction"] = area_fraction
+        constancy = 1.0 / (1.0 + max(0.0, float(row.get("z_mad_weighted") or 0.0)) + max(0.0, float(row.get("mean_gradient_p95") or 0.0)))
+        border_term = 0.5 * float(row.get("touches_roi_border_fraction") or 0.0) + 0.5 * float(row.get("touches_frame_border_fraction") or 0.0)
+        coverage_term = min(1.0, area_fraction / max(1e-6, float(min_area_fraction)))
+        med_z = float(row.get("median_z") or 0.0)
+        depth_term = (z_max - med_z) / z_span if inferred_depth_preference == "lower_z" else (med_z - z_min) / z_span
+        fragment_count = max(1.0, float(row.get("fragment_count") or row.get("blob_count") or 1))
+        fragmentation_term = max(0.0, fragment_count - 1.0) / fragment_count
+        centrality_term = float(row.get("mean_centrality") or 0.0)
+        object_like_term = max(0.0, float(row.get("mean_solidity") or 0.0) - 0.90) + max(0.0, float(row.get("mean_compactness") or 0.0) - 0.85)
+        stripe_term = float(row.get("stripe_overlap") or 0.0)
+        score = (
+            float(area_weight) * area_fraction
+            + float(border_weight) * border_term
+            + float(constancy_weight) * constancy
+            + float(spatial_coverage_weight) * coverage_term
+            + float(depth_preference_weight) * depth_term
+            - float(fragmentation_penalty) * fragmentation_term
+            - float(centrality_penalty) * centrality_term
+            - float(object_like_penalty) * object_like_term
+            - float(stripe_overlap_penalty) * stripe_term
+        )
+        rejected_reason = None
+        if total_pixels < int(min_total_pixels):
+            rejected_reason = "cluster_below_min_total_pixels"
+        elif area_fraction < float(min_area_fraction):
+            rejected_reason = "cluster_below_min_area_fraction"
+        elif float(row.get("z_mad_weighted") or 0.0) > float(max_z_mad_mm):
+            rejected_reason = "cluster_above_max_z_mad"
+        scored_row = {
+            **row,
+            "score": float(score),
+            "score_terms": {
+                "area": float(area_weight) * area_fraction,
+                "border": float(border_weight) * border_term,
+                "constancy": float(constancy_weight) * constancy,
+                "spatial_coverage": float(spatial_coverage_weight) * coverage_term,
+                "depth_preference": float(depth_preference_weight) * depth_term,
+                "fragmentation_penalty": -float(fragmentation_penalty) * fragmentation_term,
+                "centrality_penalty": -float(centrality_penalty) * centrality_term,
+                "object_like_penalty": -float(object_like_penalty) * object_like_term,
+                "stripe_overlap_penalty": -float(stripe_overlap_penalty) * stripe_term,
+            },
+            # Additive, UI-facing explanation fields. These are diagnostics only
+            # and do not affect `score` or the selection decision below.
+            "border_contact": bool(border_term > 0.0),
+            "spatial_coverage": float(coverage_term),
+            "centrality_penalty": float(centrality_term),
+            "object_like_penalty": float(object_like_term),
+            "fragmentation_penalty": float(fragmentation_term),
+            "stripe_overlap": float(stripe_term),
+            "z_mad": float(row.get("z_mad_weighted") or 0.0),
+            "rejected": rejected_reason is not None,
+            "rejected_reason": rejected_reason,
+        }
+        scored.append(scored_row)
+    return sorted(scored, key=lambda item: (-float(item.get("score") or 0.0), str(item.get("cluster_id") or "")))
+
+
 def _write_depth_plot_png(
     z_values: np.ndarray,
     *,
@@ -6716,35 +11836,7 @@ def _radial_boundary_uniformity_from_contour_mm(contour_mm: list[list[float]] | 
 
 
 def _fit_sphere_least_squares(points_xyz_mm: np.ndarray) -> dict[str, Any]:
-    if points_xyz_mm.ndim != 2 or points_xyz_mm.shape[1] != 3 or points_xyz_mm.shape[0] < 8:
-        return {"valid": False}
-    xyz = np.asarray(points_xyz_mm, dtype=np.float64)
-    x = xyz[:, 0]
-    y = xyz[:, 1]
-    z = xyz[:, 2]
-    a = np.column_stack((2.0 * x, 2.0 * y, 2.0 * z, np.ones_like(x)))
-    b = x * x + y * y + z * z
-    try:
-        sol, *_ = np.linalg.lstsq(a, b, rcond=None)
-    except Exception:
-        return {"valid": False}
-    cx, cy, cz, c0 = [float(v) for v in sol.tolist()]
-    radius_sq = cx * cx + cy * cy + cz * cz + c0
-    if radius_sq <= 0.0:
-        return {"valid": False}
-    radius = float(np.sqrt(radius_sq))
-    dist = np.sqrt(np.sum((xyz - np.asarray([cx, cy, cz], dtype=np.float64)) ** 2, axis=1))
-    residual = dist - radius
-    return {
-        "valid": True,
-        "center_mm": [round(cx, 4), round(cy, 4), round(cz, 4)],
-        "radius_mm": round(radius, 4),
-        "rmse_mm": round(float(np.sqrt(np.mean(residual ** 2))), 4),
-        "max_error_mm": round(float(np.max(np.abs(residual))), 4),
-        "mean_residual_mm": round(float(np.mean(residual)), 4),
-        "point_count": int(xyz.shape[0]),
-        "residuals_mm": residual,
-    }
+    return fit_sphere_least_squares(points_xyz_mm)
 
 
 def _fit_ellipsoid_pca(points_xyz_mm: np.ndarray) -> dict[str, Any]:
@@ -6886,6 +11978,19 @@ def _metric(item: dict[str, Any], key: str) -> float | None:
         group = item.get("surface_geometry") if isinstance(item.get("surface_geometry"), dict) else {}
         return _safe_float(group.get(key))
     if key in {"radial_height_rmse_mm", "radial_height_max_error_mm", "surface_completeness_ratio", "observed_volume_ratio", "volume_deficit_ratio"}:
+        group = item.get("sphere_consistency") if isinstance(item.get("sphere_consistency"), dict) else {}
+        return _safe_float(group.get(key))
+    if key in {
+        "surface_sphere_fit_rmse_norm",
+        "surface_sphere_fit_residual_p95_norm",
+        "surface_sphere_fit_residual_mad_norm",
+        "surface_sphere_radius_error_norm",
+        "surface_sphere_center_depth_ratio",
+        "surface_visible_cap_fraction",
+        "surface_volume_fill_ratio",
+        "surface_sphere_vs_ellipsoid_gain",
+        "surface_sphere_fit_confidence",
+    }:
         group = item.get("sphere_consistency") if isinstance(item.get("sphere_consistency"), dict) else {}
         return _safe_float(group.get(key))
     if key in {"surface_roughness_mean", "surface_roughness_std", "surface_roughness_score", "flat_region_ratio", "surface_discontinuity_score", "high_curvature_ratio"}:
@@ -7061,6 +12166,14 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
     damage_group = item.get("damage_metrics") if isinstance(item.get("damage_metrics"), dict) else {}
     radial_cv = _safe_float(footprint_group.get("radial_cv"))
     sphere_fit_rmse = _safe_float(surface_group.get("sphere_fit_rmse_mm"))
+    sphere_rmse_norm = _safe_float(consistency_group.get("surface_sphere_fit_rmse_norm"))
+    sphere_p95_norm = _safe_float(consistency_group.get("surface_sphere_fit_residual_p95_norm"))
+    sphere_mad_norm = _safe_float(consistency_group.get("surface_sphere_fit_residual_mad_norm"))
+    sphere_radius_error_norm = _safe_float(consistency_group.get("surface_sphere_radius_error_norm"))
+    visible_cap_fraction = _safe_float(consistency_group.get("surface_visible_cap_fraction"))
+    volume_fill_ratio = _safe_float(consistency_group.get("surface_volume_fill_ratio"))
+    ellipsoid_gain = _safe_float(consistency_group.get("surface_sphere_vs_ellipsoid_gain") or surface_group.get("sphere_vs_ellipsoid_gain"))
+    sphere_fit_confidence = _safe_float(consistency_group.get("surface_sphere_fit_confidence"))
     radial_height_rmse = _safe_float(consistency_group.get("radial_height_rmse_mm"))
     volume_deficit = _safe_float(consistency_group.get("volume_deficit_ratio"))
     flat_region_ratio = _safe_float(damage_group.get("flat_region_ratio"))
@@ -7358,16 +12471,144 @@ def _classification_explanation_for_object(item: dict[str, Any]) -> dict[str, An
         rules.append(
             _rule(
                 rule_id="surface.sphere_fit_rmse",
-                label="Sphere fit RMSE",
-                description="Visible surface points should fit a sphere with low residuals.",
+                label="Raw sphere-fit RMSE",
+                description="Visible-surface sphere-fit RMSE in millimeters. Scale-dependent and visible-surface-only; prefer normalized sphere-consistency features for classification.",
                 metric_key="sphere_fit_rmse_mm",
                 value=sphere_fit_rmse,
                 comparator="<=",
                 expected={"max": 8.0},
                 passed=sphere_fit_rmse <= 8.0,
+                severity="info",
+                contribution="neutral",
+                message="Raw sphere-fit RMSE recorded; use normalized residuals and plausibility checks for ballness.",
+            )
+        )
+    if sphere_rmse_norm is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_rmse_norm",
+                label="Normalized sphere-fit RMSE",
+                description="Scale-normalized visible-surface sphere residual.",
+                metric_key="surface_sphere_fit_rmse_norm",
+                value=sphere_rmse_norm,
+                comparator="<=",
+                expected={"max": 0.15},
+                passed=sphere_rmse_norm <= 0.15,
                 severity="warning",
-                contribution="positive" if sphere_fit_rmse <= 8.0 else "negative",
-                message="Sphere fit residual is within range." if sphere_fit_rmse <= 8.0 else "Sphere fit residual indicates deformation/damage.",
+                contribution="positive" if sphere_rmse_norm <= 0.15 else "negative",
+                message="Low normalized sphere RMSE supports ball-like surface." if sphere_rmse_norm <= 0.15 else "Elevated normalized sphere RMSE argues against a clean spherical cap.",
+            )
+        )
+    if sphere_radius_error_norm is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_radius_error",
+                label="Sphere radius plausibility",
+                description="Absolute mismatch between fitted sphere diameter and selected/reference diameter, normalized by diameter.",
+                metric_key="surface_sphere_radius_error_norm",
+                value=sphere_radius_error_norm,
+                comparator="<=",
+                expected={"max": 0.25},
+                passed=sphere_radius_error_norm <= 0.25,
+                severity="warning",
+                contribution="positive" if sphere_radius_error_norm <= 0.25 else "negative",
+                message="Fitted sphere radius is physically plausible." if sphere_radius_error_norm <= 0.25 else "High radius error argues against a complete ball geometry.",
+            )
+        )
+    if volume_fill_ratio is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.volume_fill_ratio",
+                label="Volume fill ratio",
+                description="Measured volume proxy divided by expected sphere or spherical-cap volume.",
+                metric_key="surface_volume_fill_ratio",
+                value=volume_fill_ratio,
+                comparator=">=",
+                expected={"min": 0.45},
+                passed=volume_fill_ratio >= 0.45,
+                severity="warning",
+                contribution="positive" if volume_fill_ratio >= 0.45 else "negative",
+                message="Volume fill supports a ball-like mass." if volume_fill_ratio >= 0.45 else "Low volume fill ratio suggests fragment, truncation, or scrap.",
+            )
+        )
+    if ellipsoid_gain is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_vs_ellipsoid_gain",
+                label="Sphere vs ellipsoid gain",
+                description="Relative RMSE improvement when fitting an ellipsoid instead of a sphere.",
+                metric_key="surface_sphere_vs_ellipsoid_gain",
+                value=ellipsoid_gain,
+                comparator="<=",
+                expected={"max": 0.35},
+                passed=ellipsoid_gain <= 0.35,
+                severity="warning",
+                contribution="positive" if ellipsoid_gain <= 0.35 else "negative",
+                message="Ellipsoid does not materially improve the fit." if ellipsoid_gain <= 0.35 else "High ellipsoid gain suggests deformation or non-spherical shape.",
+            )
+        )
+    if sphere_fit_confidence is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_fit_confidence",
+                label="Sphere fit confidence",
+                description="Heuristic confidence score combining fit coverage, normalized residuals, radius plausibility, and segmentation quality.",
+                metric_key="surface_sphere_fit_confidence",
+                value=sphere_fit_confidence,
+                comparator=">=",
+                expected={"min": 0.55},
+                passed=sphere_fit_confidence >= 0.55,
+                severity="info",
+                contribution="positive" if sphere_fit_confidence >= 0.55 else "negative",
+                message="Sphere-fit diagnostics are trustworthy enough for sphere-based reasoning." if sphere_fit_confidence >= 0.55 else "Low sphere-fit confidence should reduce trust in sphere-based decisions.",
+            )
+        )
+    if sphere_p95_norm is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_residual_p95_norm",
+                label="Sphere residual P95 / diameter",
+                description="Robust high-error sphere residual normalized by reference diameter.",
+                metric_key="surface_sphere_fit_residual_p95_norm",
+                value=sphere_p95_norm,
+                comparator="<=",
+                expected={"max": 0.20},
+                passed=sphere_p95_norm <= 0.20,
+                severity="info",
+                contribution="positive" if sphere_p95_norm <= 0.20 else "negative",
+                message="Tail sphere residuals remain modest." if sphere_p95_norm <= 0.20 else "Large tail residuals indicate local non-spherical structure.",
+            )
+        )
+    if sphere_mad_norm is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.sphere_residual_mad_norm",
+                label="Sphere residual MAD / diameter",
+                description="Robust residual dispersion normalized by reference diameter.",
+                metric_key="surface_sphere_fit_residual_mad_norm",
+                value=sphere_mad_norm,
+                comparator="<=",
+                expected={"max": 0.12},
+                passed=sphere_mad_norm <= 0.12,
+                severity="info",
+                contribution="positive" if sphere_mad_norm <= 0.12 else "negative",
+                message="Robust residual dispersion supports a spherical cap." if sphere_mad_norm <= 0.12 else "Dispersed sphere residuals suggest irregular surface geometry.",
+            )
+        )
+    if visible_cap_fraction is not None:
+        rules.append(
+            _rule(
+                rule_id="consistency.visible_cap_fraction",
+                label="Visible spherical cap fraction",
+                description="P95 height relative to fitted sphere diameter; distinguishes shallow caps from fuller balls.",
+                metric_key="surface_visible_cap_fraction",
+                value=visible_cap_fraction,
+                comparator=">=",
+                expected={"min": 0.35},
+                passed=visible_cap_fraction >= 0.35,
+                severity="info",
+                contribution="positive" if visible_cap_fraction >= 0.35 else "negative",
+                message="Visible cap coverage supports ball-like geometry." if visible_cap_fraction >= 0.35 else "Shallow visible cap suggests fragment or truncated object.",
             )
         )
     if radial_height_rmse is not None:

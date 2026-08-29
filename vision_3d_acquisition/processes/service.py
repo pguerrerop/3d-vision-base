@@ -149,6 +149,7 @@ class ProcessService:
             step_reports=reports,
             source_artifact_id="source_rgb_image",
             persisted=True,
+            existing_artifacts=all_artifacts,
         )
         all_artifacts.extend(persisted)
 
@@ -342,6 +343,7 @@ class ProcessService:
             step_reports=reports,
             source_artifact_id="source_rgb_image",
             persisted=False,
+            existing_artifacts=all_artifacts,
         )
         all_artifacts.extend(persisted)
         artifact_payload = normalize_processing_artifacts(
@@ -397,7 +399,13 @@ class ProcessService:
         step_reports: list[Any],
         source_artifact_id: str,
         persisted: bool,
+        existing_artifacts: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
+        existing_metadata_by_id = {
+            str(item.get("artifact_id")): dict(item.get("metadata") or {})
+            for item in (existing_artifacts or [])
+            if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+        }
         step_by_id = {item.step_id: item for item in step_reports if hasattr(item, "step_id")}
 
         def alg(step_id: str, fallback: str) -> str:
@@ -441,6 +449,7 @@ class ProcessService:
                     "preview_available": True,
                     "generated": "explicit",
                     "metadata": {
+                        **existing_metadata_by_id.get(artifact_id, {}),
                         "step_id": step_id,
                         "algorithm_key": algorithm_key,
                         "source_artifact_id": source_artifact_id,
@@ -485,12 +494,16 @@ class ProcessService:
                 )
 
         if isinstance(state.get("morphology_metrics"), dict):
+            metrics_path = run_dir / "morphology_metrics.json"
+            metrics_path.write_text(json.dumps(state["morphology_metrics"], indent=2), encoding="utf-8")
             emitted.append(
                 {
                     "artifact_id": "morphology_metrics",
                     "stage_id": "morphology",
                     "kind": "metric",
                     "title": "Morphology metrics",
+                    "path": str(metrics_path.relative_to(self.settings.data_dir)),
+                    "mime_type": "application/json",
                     "generated": "explicit",
                     "preview_available": False,
                     "metadata": {
@@ -498,6 +511,7 @@ class ProcessService:
                         "algorithm_key": alg("morphology", "image_2d.segment.morphology"),
                         "source_artifact_id": source_artifact_id,
                         "semantic_kind": "morphology_metrics",
+                        "coordinate_space": "image_pixel",
                         "effective_params": step_effective_params("morphology"),
                         **dict(state["morphology_metrics"]),
                     },
@@ -521,6 +535,7 @@ class ProcessService:
                         "algorithm_key": alg("morphology", "image_2d.segment.morphology"),
                         "source_artifact_id": source_artifact_id,
                         "semantic_kind": "morphology_debug_json",
+                        "coordinate_space": "image_pixel",
                         "effective_params": step_effective_params("morphology"),
                         **dict(state["morphology_debug_json"]),
                     },
@@ -544,6 +559,7 @@ class ProcessService:
                         "algorithm_key": alg("blob_detection", "image_2d.detect.blob_contours"),
                         "source_artifact_id": source_artifact_id,
                         "semantic_kind": "blob_contours",
+                        "coordinate_space": "image_pixel",
                     },
                 }
             )
@@ -574,6 +590,7 @@ class ProcessService:
                         "algorithm_key": alg("blob_detection", "image_2d.detect.blob_contours"),
                         "source_artifact_id": source_artifact_id,
                         "semantic_kind": "blob_metrics",
+                        "coordinate_space": "image_pixel",
                         "entries": blob_rows,
                         "rejected_count": int(blob_metrics_payload.get("rejected_count") or rejected_count),
                         "summary": blob_metrics_payload.get("stats"),

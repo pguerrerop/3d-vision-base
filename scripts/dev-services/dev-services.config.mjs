@@ -94,7 +94,7 @@ export function getDevServicesConfig() {
         healthPaths: ["/api/health"],
         filter: ["scripts/run_api.py", "vision_3d_acquisition.api.main:app"],
         cwd: repoRoot,
-        command: [python, "scripts/run_api.py"],
+        command: ["env", "API_RELOAD=false", python, "scripts/run_api.py"],
       },
       {
         key: "trispector_ftp",

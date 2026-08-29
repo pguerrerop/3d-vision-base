@@ -26,9 +26,9 @@ def parse_trispector_2_5d_image(input_file: Path, output_dir: Path) -> dict[str,
     h = h_full // 3
     reflectance = arr[:h, :]
     payload = arr[h:, :]
-    flat = payload.reshape(-1).astype(np.uint16)
-    pairs = flat[: (flat.size // 2) * 2].reshape(-1, 2)
-    height16 = (pairs[:, 1] * 256 + pairs[:, 0]).reshape(h, w)
+    low = payload[0::2, :].astype(np.uint16)
+    high = payload[1::2, :].astype(np.uint16)
+    height16 = (high * 256 + low).reshape(h, w)
 
     reflectance_path = output_dir / "reflectance.png"
     heightmap_path = output_dir / "height16.tif"

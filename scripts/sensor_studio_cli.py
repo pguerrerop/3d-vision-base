@@ -37,6 +37,149 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _validation_service(data_dir: Path):
+    from vision_3d_acquisition.validation import ValidationService  # noqa: WPS433
+    return ValidationService(_settings(data_dir))
+
+
+def cmd_validation_list_suites(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).list_suites(), indent=2))
+    return 0
+
+
+def cmd_validation_compare(args: argparse.Namespace) -> int:
+    result = _validation_service(args.data_dir).compare(args.baseline_id, candidate_run_id=args.candidate_run_id)
+    print(json.dumps(result, indent=2))
+    return 1 if result["status"] == "regression" else 0
+
+
+def cmd_validation_run_suite(args: argparse.Namespace) -> int:
+    report = _validation_service(args.data_dir).execute_suite(args.suite_id, {"candidate_run_id": args.candidate_run_id, "recipe_id": args.recipe_id})
+    print(json.dumps(report, indent=2))
+    return 1 if report["status"] in {"failed", "completed_with_regressions"} else 0
+
+
+def cmd_validation_inspect_execution(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).get_execution(args.execution_id), indent=2))
+    return 0
+
+
+def cmd_validation_rebuild_indexes(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).rebuild_indexes(), indent=2))
+    return 0
+
+
+def cmd_validation_verify_integrity(args: argparse.Namespace) -> int:
+    result = _validation_service(args.data_dir).verify_integrity()
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 2
+
+
+def cmd_validation_inspect_suite(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).get_suite(args.suite_id), indent=2)); return 0
+
+
+def cmd_validation_coverage(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).coverage(args.suite_id), indent=2)); return 0
+
+
+def cmd_validation_archive_restore(args: argparse.Namespace) -> int:
+    service = _validation_service(args.data_dir); result = service.restore_suite(args.suite_id) if args.command == "restore-suite" else service.archive_suite(args.suite_id)
+    print(json.dumps(result, indent=2)); return 0
+
+
+def cmd_validation_baseline_history(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).baseline_history(take_id=args.take_id, pipeline_id=args.pipeline_id, artifact_id=args.artifact_id), indent=2)); return 0
+
+
+def cmd_validation_set_baseline_active(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).set_active(args.baseline_id, args.command == "activate-baseline"), indent=2)); return 0
+
+
+def cmd_validation_promote(args: argparse.Namespace) -> int:
+    result = _validation_service(args.data_dir).promote_comparison(args.execution_id, args.case_id, args.comparison_id, {"activate": args.activate, "notes": args.notes, "carry_forward_policy": not args.reset_policy, "reviewed_by": args.reviewed_by})
+    print(json.dumps(result, indent=2)); return 0
+
+
+def cmd_validation_update_suite(args: argparse.Namespace) -> int:
+    payload = {key: value for key, value in {"name":args.name,"description":args.description,"status":args.status}.items() if value is not None}
+    print(json.dumps(_validation_service(args.data_dir).update_suite(args.suite_id, payload), indent=2)); return 0
+
+
+def cmd_validation_duplicate_suite(args: argparse.Namespace) -> int:
+    print(json.dumps(_validation_service(args.data_dir).duplicate_suite(args.suite_id), indent=2)); return 0
+
+
+def cmd_validation_case(args: argparse.Namespace) -> int:
+    service=_validation_service(args.data_dir)
+    resolution={"mode":args.resolution_mode}
+    if args.resolution_mode=="pinned": resolution["baseline_id"]=args.baseline_id
+    if args.resolution_mode=="allowed_versions": resolution["allowed_baseline_ids"]=args.allowed_baseline_id
+    payload={"enabled":args.enabled,"tags":args.tag,"notes":args.notes,"baseline_resolution":resolution}
+    if args.command=="add-case":
+        payload.update({"take_id":args.take_id,"baseline_ids":args.baseline_id_list or ([args.baseline_id] if args.baseline_id else [])}); result=service.add_case(args.suite_id,payload)
+    elif args.command=="update-case": result=service.update_case(args.suite_id,args.case_id,payload)
+    else: result=service.delete_case(args.suite_id,args.case_id)
+    print(json.dumps(result,indent=2)); return 0
+
+
+def cmd_validation_list_executions(args: argparse.Namespace) -> int:
+    rows=_validation_service(args.data_dir).list_executions()
+    if args.suite_id: rows=[row for row in rows if row.get("suite_id")==args.suite_id]
+    print(json.dumps(rows,indent=2)); return 0
+
+
+def cmd_validation_smoke(args: argparse.Namespace) -> int:
+    """Deterministic local smoke: acquisition, processing, approval, and comparison."""
+    from vision_3d_acquisition.apps.ball_inspection_25d import run_ball_inspection_25d_flow  # noqa: WPS433
+    from vision_3d_acquisition.synthetic import create_synthetic_25d_take  # noqa: WPS433
+    take_id, _ = create_synthetic_25d_take(args.data_dir, session_id="validation_smoke", seed=25)
+    run_ball_inspection_25d_flow(args.data_dir, take_id=take_id)
+    store = _validation_service(args.data_dir)
+    resolved = store._resolve(take_id=take_id, pipeline_id=PIPELINE_ID_25D, run_id="latest")
+    candidates = ["final_selected_support_mask", "final_object_mask", "normalized_heightmap", "measurement_diagnostics", "classification_explanation"]
+    artifact_map = {str(item.get("artifact_id")): item for item in resolved.get("artifacts", []) if isinstance(item, dict)}
+    baseline_ids: list[str] = []
+    for artifact_id in candidates:
+        artifact = artifact_map.get(artifact_id)
+        if not artifact:
+            continue
+        policy = {"comparator": "binary_mask", "min_iou": 0.97, "max_removed_fraction": 0.01} if artifact_id.endswith("mask") else {}
+        if artifact_id == "final_object_mask": policy["blocksDownstreamOnFailure"] = True
+        approved = store.create_baselines({"take_id": take_id, "pipeline_id": PIPELINE_ID_25D, "run_id": "latest", "approval_scope": "artifact", "stage_id": artifact.get("stage_id"), "processing_unit_id": artifact.get("processing_unit_id"), "artifact_id": artifact_id, "notes": "deterministic validation smoke", "comparison_policy": policy})
+        baseline_ids.extend(item["id"] for item in approved["baselines"])
+    if not baseline_ids:
+        print(json.dumps({"ok": False, "take_id": take_id, "reason": "no comparison-eligible artifacts"}, indent=2))
+        return 2
+    suite = store.create_suite({"name": "validation smoke", "pipeline_id": PIPELINE_ID_25D, "description": "Temporary deterministic smoke suite"})
+    # Keep the smoke suite focused on the deterministic segmentation contract;
+    # the other approved artifacts establish coverage without making expected
+    # downstream semantic changes obscure the intended first divergence.
+    store.add_case(suite["id"], {"take_id": take_id, "baseline_ids": [baseline_ids[candidates.index("final_object_mask")]]})
+    unchanged = store.execute_suite(suite["id"], {"candidate_run_id": "latest"})
+    # Deliberately empty segmentation foreground. Baselines remain snapshots of
+    # the first run while the normal pipeline creates a new candidate output.
+    run_ball_inspection_25d_flow(args.data_dir, take_id=take_id, stage_params={"remove_belt_segment_objects": {"min_height_mm": 100.0}})
+    changed = store.execute_suite(suite["id"], {"candidate_run_id": "latest"})
+    changed_case = changed["cases"][0] if changed.get("cases") else {}
+    divergence = changed_case.get("first_divergence") or {}
+    expected = changed_case.get("status") == "regression" and divergence.get("artifact_id") == "final_object_mask"
+    # Promotion is explicit: version 2 is created from the reviewed candidate;
+    # the service deactivates v1 only as part of this explicit promotion.
+    changed_artifact = next((item for item in store._resolve(take_id=take_id, pipeline_id=PIPELINE_ID_25D, run_id="latest").get("artifacts", []) if isinstance(item, dict) and item.get("artifact_id") == "final_object_mask"), None)
+    promoted = store.create_baselines({"take_id": take_id, "pipeline_id": PIPELINE_ID_25D, "run_id": "latest", "approval_scope": "artifact", "stage_id": (changed_artifact or {}).get("stage_id"), "artifact_id": "final_object_mask", "notes": "smoke promotion v2", "comparison_policy": {"comparator":"binary_mask","min_iou":0.97,"max_removed_fraction":0.01}})["baselines"][0]
+    cases_path = store.root / "suites" / suite["id"] / "cases.json"
+    case_rows = _read_json(cases_path)
+    old_mask_baseline = baseline_ids[candidates.index("final_object_mask")]
+    for case_row in case_rows:
+        case_row["baseline_ids"] = [promoted["id"] if item == old_mask_baseline else item for item in case_row.get("baseline_ids", [])]
+    cases_path.write_text(json.dumps(case_rows, indent=2) + "\n", encoding="utf-8")
+    promoted_report = store.execute_suite(suite["id"], {"candidate_run_id": "latest"})
+    ok = unchanged["cases"][0]["status"] == "pass" and expected and promoted["version"] == 2 and store.get_baseline(baseline_ids[candidates.index("final_object_mask")])["status"] == "inactive" and promoted_report["cases"][0]["status"] == "pass"
+    print(json.dumps({"ok": ok, "take_id": take_id, "baseline_count": len(baseline_ids), "unchanged_status": unchanged["cases"][0]["status"], "changed_status": changed_case.get("status"), "first_divergence": divergence, "promoted_baseline": {"id":promoted["id"],"version":promoted["version"],"status":promoted["status"]}, "post_promotion_status": promoted_report["cases"][0]["status"]}, indent=2))
+    return 0 if ok else 1
+
+
 def _print_summary(header: str, rows: list[tuple[str, object]]) -> None:
     print(header)
     for key, value in rows:
@@ -202,8 +345,226 @@ def cmd_25d_validate_api(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_25d_smoke_contract_recipe_compare(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.debug.contract_recipe_compare_smoke import run_25d_contract_recipe_compare_smoke  # noqa: WPS433
+
+    summary = run_25d_contract_recipe_compare_smoke(args.data_dir)
+    _print_summary(
+        "25D contract/recipe/compare smoke workflow complete",
+        [
+            ("pipeline_id", summary.get("pipeline_id")),
+            ("contract_ok", summary.get("contract_validation", {}).get("ok")),
+            ("recipe_compare_id", summary.get("recipe_compare_id")),
+            ("run_compare_id", summary.get("run_compare_id")),
+            ("comparison_index_count", summary.get("comparison_index_count")),
+            ("mask_changed_percent", (summary.get("mask_pixel_diff") or {}).get("changed_percent")),
+        ],
+    )
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+def cmd_25d_demo_contract_workflow(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.debug.demo_contract_workflow import run_25d_demo_contract_workflow  # noqa: WPS433
+
+    summary = run_25d_demo_contract_workflow(args.data_dir)
+    _print_summary(
+        "25D demo contract/recipe/compare/graph workflow ready",
+        [
+            ("pipeline_id", summary.get("pipeline_id")),
+            ("demo_take_id", summary.get("demo_take_id")),
+            ("base_recipe_id", (summary.get("recipes") or {}).get("base_recipe_id")),
+            ("run_compare_id", summary.get("run_compare_id")),
+            ("studio_open_url", summary.get("studio_open_url")),
+            ("comparison_json_path", summary.get("comparison_json_path")),
+        ],
+    )
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+def cmd_25d_demo_partial_rerun_plan(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.debug.demo_partial_rerun_plan import run_25d_demo_partial_rerun_plan  # noqa: WPS433
+
+    summary = run_25d_demo_partial_rerun_plan(args.data_dir)
+    plans = summary.get("partial_rerun_plans") or {}
+    _print_summary(
+        "25D demo partial rerun planner workflow ready",
+        [
+            ("pipeline_id", summary.get("pipeline_id")),
+            ("demo_take_id", summary.get("demo_take_id")),
+            ("default_plan_id", summary.get("default_plan_id")),
+            ("planner_graph_url", summary.get("planner_graph_url")),
+            ("plan_count", len(plans)),
+        ],
+    )
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
+def cmd_25d_demo_partial_rerun_execute(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.debug.demo_partial_rerun_execute import run_25d_demo_partial_rerun_execute  # noqa: WPS433
+
+    summary = run_25d_demo_partial_rerun_execute(args.data_dir)
+    execution = summary.get("partial_rerun_execution") or {}
+    verification = summary.get("verification") or {}
+    _print_summary(
+        "25D demo partial rerun execution workflow ready",
+        [
+            ("pipeline_id", summary.get("pipeline_id")),
+            ("parent_run_id", summary.get("parent_run_id")),
+            ("child_run_id", summary.get("child_run_id")),
+            ("comparison_id", summary.get("comparison_id")),
+            ("boundary_stage_id", execution.get("boundary_stage_id")),
+            ("graph_workspace_url", summary.get("graph_workspace_url")),
+            ("parent_run_url", summary.get("parent_run_url")),
+            ("child_run_url", summary.get("child_run_url")),
+            ("comparison_url", summary.get("comparison_url")),
+            ("verify: child_run_in_listing", verification.get("child_run_in_listing")),
+            ("verify: lineage_resolves_parent", verification.get("lineage_resolves_parent")),
+            ("verify: lineage_resolves_children", verification.get("lineage_resolves_children")),
+            ("verify: artifact_manifest_exists", verification.get("artifact_manifest_exists")),
+            ("verify: comparison_available", verification.get("comparison_available")),
+            ("verify: graph_workspace_url_includes_child_run_id", verification.get("graph_workspace_url_includes_child_run_id")),
+        ],
+    )
+    print(json.dumps(summary, indent=2, default=str))
+    return 0
+
+
 def cmd_25d_inspect_result(args: argparse.Namespace) -> int:
     return _print_result_overview(args.data_dir, args.take_id)
+
+
+def cmd_25d_debug_reference(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.apps.ball_inspection_25d import run_ball_inspection_25d_flow  # noqa: WPS433
+    from vision_3d_acquisition.debug.reference_audit import build_reference_audit_bundle  # noqa: WPS433
+
+    take_id = args.take_id
+    pipeline_id = args.pipeline or PIPELINE_ID_25D
+    result_path = args.data_dir / "processed" / take_id / "result.json"
+
+    stage_params: dict | None = None
+    if args.stage_params:
+        stage_params_path = Path(args.stage_params)
+        if not stage_params_path.is_file():
+            print(f"stage params file not found: {stage_params_path}", file=sys.stderr)
+            return 2
+        stage_params = _read_json(stage_params_path)
+
+    if args.rerun or not result_path.is_file():
+        if not args.rerun and not result_path.is_file():
+            print(
+                f"No processed result found for take_id={take_id!r} at {result_path}. "
+                "Re-run with --rerun to process the take first.",
+                file=sys.stderr,
+            )
+            return 2
+        take_dir = args.data_dir / "incoming" / take_id
+        if not take_dir.is_dir():
+            print(f"take not found in incoming/: {take_dir}", file=sys.stderr)
+            return 2
+        if not (take_dir / "READY").is_file():
+            print(f"take is missing READY marker: {take_dir / 'READY'}", file=sys.stderr)
+            return 2
+        _print_summary(
+            "Re-running 25D pipeline before audit bundle generation",
+            [("take_id", take_id), ("pipeline_id", pipeline_id)],
+        )
+        run_ball_inspection_25d_flow(args.data_dir, take_id=take_id, stage_params=stage_params)
+
+    try:
+        bundle = build_reference_audit_bundle(
+            args.data_dir,
+            take_id=take_id,
+            pipeline_id=pipeline_id,
+            run_id=args.run_id,
+            output_root=args.output_dir,
+            include_overlays=args.include_overlays,
+            include_diffs=args.include_diffs,
+        )
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    support_rows = json.loads((bundle.output_dir / "10_summary" / "support_loss.json").read_text(encoding="utf-8"))
+    top_fraction = sorted(support_rows, key=lambda item: float(item.get("removed_fraction") or 0.0), reverse=True)[:3]
+    top_abs = sorted(support_rows, key=lambda item: int(item.get("removed_pixels") or 0), reverse=True)[:3]
+
+    _print_summary(
+        "25D reference audit bundle generated",
+        [
+            ("output_dir", bundle.output_dir),
+            ("artifacts_copied", bundle.artifacts_copied),
+            ("derived_masks_generated", bundle.derived_masks_generated),
+            ("missing_artifacts", len(bundle.missing_artifacts)),
+            ("index_html", bundle.output_dir / "index.html"),
+        ],
+    )
+    print("Top support losses by removed fraction:")
+    for row in top_fraction:
+        print(
+            f"  - {row.get('step')}: removed_fraction={float(row.get('removed_fraction') or 0.0) * 100:.2f}% "
+            f"removed_pixels={row.get('removed_pixels')}"
+        )
+    print("Top support losses by absolute removed pixels:")
+    for row in top_abs:
+        print(
+            f"  - {row.get('step')}: removed_pixels={row.get('removed_pixels')} "
+            f"removed_fraction={float(row.get('removed_fraction') or 0.0) * 100:.2f}%"
+        )
+
+    if args.open:
+        import webbrowser
+
+        webbrowser.open((bundle.output_dir / "index.html").resolve().as_uri())
+    return 0
+
+
+def cmd_25d_inspect_feature(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.ml.features.surface_sphere_fit_workflow import inspect_take_feature  # noqa: WPS433
+
+    summary = inspect_take_feature(
+        processed_dir=args.data_dir / "processed",
+        take_id=args.take_id,
+        feature_key=args.feature,
+    )
+    _print_summary(
+        "25D feature inspection",
+        [
+            ("take_id", summary.get("take_id")),
+            ("run_id", summary.get("run_id") or "-"),
+            ("pipeline_id", summary.get("pipeline_id") or "-"),
+            ("object_count", summary.get("object_count")),
+            ("objects_with_feature_value", summary.get("objects_with_feature_value")),
+            ("objects_missing_feature", summary.get("objects_missing_feature")),
+            ("backfill_object_count", summary.get("backfill_object_count")),
+            ("min", summary.get("min")),
+            ("max", summary.get("max")),
+            ("mean", summary.get("mean")),
+            ("likely_reason", summary.get("likely_reason") or "-"),
+        ],
+    )
+    print("Locations checked:")
+    for location in summary.get("locations_checked") or []:
+        print(f"  - {location}")
+    if summary.get("feature_vector_path"):
+        print(f"feature_vector.json value: {summary.get('feature_vector_value')}")
+    if summary.get("backfill_sidecar_path"):
+        print(f"backfill sidecar: {summary.get('backfill_sidecar_path')}")
+    print("Per-object:")
+    for item in summary.get("per_object") or []:
+        print(
+            "  - id={id} value={value} location={location} missing_reason={missing_reason}".format(
+                id=item.get("object_id"),
+                value=item.get("value"),
+                location=item.get("location") or "-",
+                missing_reason=item.get("missing_reason") or "-",
+            )
+        )
+    if args.json:
+        print(json.dumps(summary, indent=2, default=str))
+    return 0 if summary.get("found") else 1
 
 
 def cmd_25d_clean(args: argparse.Namespace) -> int:
@@ -1021,6 +1382,49 @@ def cmd_ml_import_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ml_compute_feature(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.ml.features.surface_sphere_fit_workflow import compute_ml_set_feature  # noqa: WPS433
+
+    try:
+        result = compute_ml_set_feature(
+            data_dir=args.data_dir,
+            ml_set_id=args.ml_set_id,
+            feature_key=args.feature,
+            mode=args.mode,
+            dataset_id=args.dataset_id,
+            pipeline_id=args.pipeline_id,
+            dry_run=not bool(args.apply),
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    mode_label = "[APPLY]" if args.apply else "[DRY RUN]"
+    print(mode_label)
+    _print_summary(
+        "ML set feature compute",
+        [
+            ("ml_set_id", result.get("ml_set_id")),
+            ("dataset_id", result.get("dataset_id")),
+            ("feature_key", result.get("feature_key")),
+            ("mode", result.get("mode")),
+            ("take_count", result.get("take_count")),
+        ],
+    )
+    for item in result.get("results") or []:
+        print(
+            "  - {take_id}: status={status} objects_with_value={objects_with_value} entries={entries}".format(
+                take_id=item.get("take_id"),
+                status=item.get("status"),
+                objects_with_value=item.get("objects_with_feature_value", item.get("objects_with_value")),
+                entries=item.get("entries_written"),
+            )
+        )
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+    return 0
+
+
 def cmd_ml_list_rule_sets(args: argparse.Namespace) -> int:
     from vision_3d_acquisition.classifiers.mining_ball_rules import list_available_rule_sets  # noqa: WPS433
 
@@ -1109,6 +1513,31 @@ def cmd_ml_show_active_rule_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _catalog_indexer(data_dir: Path):
+    from vision_3d_acquisition.storage.catalog_index import CatalogIndexer  # noqa: WPS433
+    return CatalogIndexer(_settings(data_dir))
+
+
+def cmd_index_rebuild(args: argparse.Namespace) -> int:
+    report = _catalog_indexer(args.data_dir).rebuild(full=args.full)
+    print(json.dumps(report.as_dict(), indent=2))
+    return 1 if report.take_failures else 0
+
+
+def cmd_index_status(args: argparse.Namespace) -> int:
+    status = _catalog_indexer(args.data_dir).status()
+    print(json.dumps(status, indent=2))
+    return 0 if status["drift"] == 0 else 2
+
+
+def cmd_index_verify(args: argparse.Namespace) -> int:
+    result = _catalog_indexer(args.data_dir).verify(limit=args.limit)
+    if not args.show_all:
+        result = {**result, "mismatched": result["mismatched"][:20]}
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sensor-studio",
@@ -1143,10 +1572,66 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--take-id", required=True, help="Existing take id in data/incoming")
     v.set_defaults(handler=cmd_25d_validate_api)
 
+    smoke = p25d_sub.add_parser(
+        "smoke-contract-recipe-compare",
+        help="Run synthetic 25D contract validation, recipe, and comparison smoke workflow",
+    )
+    smoke.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    smoke.set_defaults(handler=cmd_25d_smoke_contract_recipe_compare)
+
+    demo = p25d_sub.add_parser(
+        "demo-contract-workflow",
+        help="Create a known-good demo scenario for contract/recipe/compare/graph workflow",
+    )
+    demo.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    demo.set_defaults(handler=cmd_25d_demo_contract_workflow)
+
+    demo_plan = p25d_sub.add_parser(
+        "demo-partial-rerun-plan",
+        help="Create a known-good demo scenario for partial rerun planning",
+    )
+    demo_plan.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    demo_plan.set_defaults(handler=cmd_25d_demo_partial_rerun_plan)
+
+    demo_execute = p25d_sub.add_parser(
+        "demo-partial-rerun-execute",
+        help="Create a known-good demo scenario for safe partial rerun execution",
+    )
+    demo_execute.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    demo_execute.set_defaults(handler=cmd_25d_demo_partial_rerun_execute)
+
     i = p25d_sub.add_parser("inspect-result", help="Inspect and summarize processed result.json for a take")
     i.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
     i.add_argument("--take-id", required=True, help="Processed take id in data/processed")
     i.set_defaults(handler=cmd_25d_inspect_result)
+
+    debug_ref = p25d_sub.add_parser(
+        "debug-reference",
+        help="Generate a reproducible 25D reference-surface audit bundle for one take/run",
+    )
+    debug_ref.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    debug_ref.add_argument("--take-id", required=True, help="Take id to audit")
+    debug_ref.add_argument("--run-id", default="latest", help="Processed run id (default: latest)")
+    debug_ref.add_argument("--pipeline", default=PIPELINE_ID_25D, help="Pipeline id to audit")
+    debug_ref.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Audit output root (default: data/debug/25d_reference_audit)",
+    )
+    debug_ref.add_argument("--rerun", action="store_true", help="Re-run the 25D pipeline before generating the bundle")
+    debug_ref.add_argument("--stage-params", default=None, help="Optional stage params JSON used with --rerun")
+    debug_ref.add_argument("--include-overlays", action=argparse.BooleanOptionalAction, default=True)
+    debug_ref.add_argument("--include-diffs", action=argparse.BooleanOptionalAction, default=True)
+    debug_ref.add_argument("--open", action="store_true", help="Open index.html after generation")
+    debug_ref.set_defaults(handler=cmd_25d_debug_reference)
+
+    inspect_feature = p25d_sub.add_parser("inspect-feature", help="Inspect whether a processed take contains a registered feature")
+    inspect_feature.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    inspect_feature.add_argument("--take-id", required=True, help="Processed take id in data/processed")
+    inspect_feature.add_argument("--feature", default="surface_sphere_fit_rmse_mm", help="Feature key to inspect")
+    inspect_feature.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    inspect_feature.set_defaults(handler=cmd_25d_inspect_feature)
 
     cl = p25d_sub.add_parser("clean", help="Remove incoming/processed folders for a take or synthetic session")
     cl.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
@@ -1208,6 +1693,57 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--apply", action="store_true", help="Apply changes (default is dry-run)")
     mode.add_argument("--dry-run", action="store_true", help="Preview changes without writing (default)")
     update_take_session.set_defaults(handler=cmd_acquisition_update_take_session)
+
+    validation = top.add_parser("validation", help="Approved-reference regression suites")
+    validation_sub = validation.add_subparsers(dest="command", required=True)
+    validation_list = validation_sub.add_parser("list-suites", help="List regression suites")
+    validation_list.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_list.set_defaults(handler=cmd_validation_list_suites)
+    validation_run = validation_sub.add_parser("run-suite", help="Compare suite baselines with candidate runs")
+    validation_run.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_run.add_argument("--suite-id", required=True)
+    validation_run.add_argument("--recipe-id", default=None)
+    validation_run.add_argument("--candidate-run-id", default="latest")
+    validation_run.set_defaults(handler=cmd_validation_run_suite)
+    validation_compare = validation_sub.add_parser("compare", help="Compare one baseline to a candidate run")
+    validation_compare.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_compare.add_argument("--baseline-id", required=True)
+    validation_compare.add_argument("--candidate-run-id", required=True)
+    validation_compare.set_defaults(handler=cmd_validation_compare)
+    validation_inspect = validation_sub.add_parser("inspect-execution", help="Inspect a persisted validation execution")
+    validation_inspect.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_inspect.add_argument("--execution-id", required=True)
+    validation_inspect.set_defaults(handler=cmd_validation_inspect_execution)
+    validation_rebuild = validation_sub.add_parser("rebuild-indexes", help="Rebuild validation indexes from canonical records")
+    validation_rebuild.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_rebuild.set_defaults(handler=cmd_validation_rebuild_indexes)
+    validation_verify = validation_sub.add_parser("verify-integrity", help="Verify baseline snapshots, checksums, and suite references")
+    validation_verify.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_verify.set_defaults(handler=cmd_validation_verify_integrity)
+    validation_smoke = validation_sub.add_parser("smoke", help="Run deterministic 2.5D validation baseline smoke workflow")
+    validation_smoke.add_argument("--data-dir", type=Path, default=Path("data"))
+    validation_smoke.set_defaults(handler=cmd_validation_smoke)
+    for command, help_text in (("inspect-suite","Inspect a suite"),("coverage","Show suite coverage"),("archive-suite","Archive a suite"),("restore-suite","Restore an archived suite")):
+        item=validation_sub.add_parser(command,help=help_text); item.add_argument("--data-dir",type=Path,default=Path("data")); item.add_argument("--suite-id",required=True)
+        item.set_defaults(handler=cmd_validation_inspect_suite if command=="inspect-suite" else cmd_validation_coverage if command=="coverage" else cmd_validation_archive_restore)
+    history=validation_sub.add_parser("baseline-history",help="List baseline version history")
+    history.add_argument("--data-dir",type=Path,default=Path("data")); history.add_argument("--take-id"); history.add_argument("--pipeline-id"); history.add_argument("--artifact-id"); history.set_defaults(handler=cmd_validation_baseline_history)
+    for command,help_text in (("activate-baseline","Activate a baseline version"),("deactivate-baseline","Deactivate a baseline version")):
+        item=validation_sub.add_parser(command,help=help_text); item.add_argument("--data-dir",type=Path,default=Path("data")); item.add_argument("--baseline-id",required=True); item.set_defaults(handler=cmd_validation_set_baseline_active)
+    promote=validation_sub.add_parser("promote-comparison",help="Promote an execution comparison candidate to a baseline")
+    promote.add_argument("--data-dir",type=Path,default=Path("data")); promote.add_argument("--execution-id",required=True); promote.add_argument("--case-id",required=True); promote.add_argument("--comparison-id",required=True); promote.add_argument("--activate",action="store_true"); promote.add_argument("--notes",default=""); promote.add_argument("--reviewed-by",default=None); promote.add_argument("--reset-policy",action="store_true"); promote.set_defaults(handler=cmd_validation_promote)
+    update_suite=validation_sub.add_parser("update-suite",help="Update suite name, description, or state")
+    update_suite.add_argument("--data-dir",type=Path,default=Path("data")); update_suite.add_argument("--suite-id",required=True); update_suite.add_argument("--name"); update_suite.add_argument("--description"); update_suite.add_argument("--status",choices=["active","inactive","archived"]); update_suite.set_defaults(handler=cmd_validation_update_suite)
+    duplicate_suite=validation_sub.add_parser("duplicate-suite",help="Duplicate suite and cases")
+    duplicate_suite.add_argument("--data-dir",type=Path,default=Path("data")); duplicate_suite.add_argument("--suite-id",required=True); duplicate_suite.set_defaults(handler=cmd_validation_duplicate_suite)
+    list_exec=validation_sub.add_parser("list-executions",help="List persisted validation executions")
+    list_exec.add_argument("--data-dir",type=Path,default=Path("data")); list_exec.add_argument("--suite-id"); list_exec.set_defaults(handler=cmd_validation_list_executions)
+    add_case=validation_sub.add_parser("add-case",help="Add a baseline-backed regression case")
+    add_case.add_argument("--data-dir",type=Path,default=Path("data")); add_case.add_argument("--suite-id",required=True); add_case.add_argument("--take-id",required=True); add_case.add_argument("--baseline-id",dest="baseline_id_list",action="append",default=[]); add_case.add_argument("--resolution-mode",default="active",choices=["active","pinned","allowed_versions"]); add_case.add_argument("--pinned-baseline-id",dest="baseline_id"); add_case.add_argument("--allowed-baseline-id",action="append",default=[]); add_case.add_argument("--tag",action="append",default=[]); add_case.add_argument("--notes",default=""); add_case.add_argument("--enabled",action=argparse.BooleanOptionalAction,default=True); add_case.set_defaults(handler=cmd_validation_case)
+    update_case=validation_sub.add_parser("update-case",help="Edit a regression case")
+    update_case.add_argument("--data-dir",type=Path,default=Path("data")); update_case.add_argument("--suite-id",required=True); update_case.add_argument("--case-id",required=True); update_case.add_argument("--resolution-mode",required=True,choices=["active","pinned","allowed_versions"]); update_case.add_argument("--baseline-id"); update_case.add_argument("--allowed-baseline-id",action="append",default=[]); update_case.add_argument("--tag",action="append",default=[]); update_case.add_argument("--notes",default=""); update_case.add_argument("--enabled",action=argparse.BooleanOptionalAction,default=True); update_case.set_defaults(handler=cmd_validation_case)
+    remove_case=validation_sub.add_parser("remove-case",help="Remove a case without deleting baselines")
+    remove_case.add_argument("--data-dir",type=Path,default=Path("data")); remove_case.add_argument("--suite-id",required=True); remove_case.add_argument("--case-id",required=True); remove_case.set_defaults(handler=cmd_validation_case, resolution_mode="active", enabled=True, tag=[], notes="", baseline_id=None, allowed_baseline_id=[], baseline_id_list=[])
 
     ml = top.add_parser("ml", help="ML set persistence and membership management")
     ml_sub = ml.add_subparsers(dest="command", required=False)
@@ -1282,6 +1818,24 @@ def build_parser() -> argparse.ArgumentParser:
     mode_reprocess.add_argument("--dry-run", action="store_true", help="Preview only (default)")
     ml_reprocess.set_defaults(handler=cmd_ml_reprocess_set)
 
+    ml_compute_feature = ml_sub.add_parser("compute-feature", help="Reprocess or backfill a registered feature across an ML set")
+    ml_compute_feature.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    ml_compute_feature.add_argument("--ml-set-id", required=True, help="ML set id")
+    ml_compute_feature.add_argument("--dataset-id", default=None, help="Dataset id to disambiguate ML set lookup")
+    ml_compute_feature.add_argument("--feature", default="surface_sphere_fit_rmse_mm", help="Feature key to compute")
+    ml_compute_feature.add_argument(
+        "--mode",
+        required=True,
+        choices=["reprocess", "backfill"],
+        help="reprocess: rerun pipeline; backfill: compute sidecar from existing artifacts",
+    )
+    ml_compute_feature.add_argument("--pipeline-id", default=PIPELINE_ID_25D, help="Pipeline id for reprocess mode")
+    mode_compute = ml_compute_feature.add_mutually_exclusive_group()
+    mode_compute.add_argument("--apply", action="store_true", help="Execute compute/backfill")
+    mode_compute.add_argument("--dry-run", action="store_true", help="Preview only (default)")
+    ml_compute_feature.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
+    ml_compute_feature.set_defaults(handler=cmd_ml_compute_feature)
+
     ml_export = ml_sub.add_parser("export-features", help="Export ML set features from pipeline processing outputs")
     ml_export.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
     ml_export.add_argument("--ml-set-id", required=True, help="ML set id")
@@ -1319,6 +1873,25 @@ def build_parser() -> argparse.ArgumentParser:
     ml_active_rules.add_argument("--classifier-rules", default=None, help="Optional runtime override path")
     ml_active_rules.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
     ml_active_rules.set_defaults(handler=cmd_ml_show_active_rule_set)
+
+    index = top.add_parser("index", help="SQLite catalog index (data/index.db)")
+    index_sub = index.add_subparsers(dest="command", required=False)
+    index.set_defaults(domain="index")
+
+    index_rebuild = index_sub.add_parser("rebuild", help="Build or refresh the catalog index from the filesystem")
+    index_rebuild.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    index_rebuild.add_argument("--full", action="store_true", help="Reproject every take instead of only the stale ones")
+    index_rebuild.set_defaults(handler=cmd_index_rebuild)
+
+    index_status = index_sub.add_parser("status", help="Show schema version, row counts, and drift against disk")
+    index_status.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    index_status.set_defaults(handler=cmd_index_status)
+
+    index_verify = index_sub.add_parser("verify", help="Diff every indexed summary against a fresh filesystem read")
+    index_verify.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    index_verify.add_argument("--limit", type=int, default=None, help="Check only the first N indexed takes")
+    index_verify.add_argument("--show-all", action="store_true", help="List every mismatch instead of the first 20")
+    index_verify.set_defaults(handler=cmd_index_verify)
 
     return parser
 

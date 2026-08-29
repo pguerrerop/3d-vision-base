@@ -18,6 +18,14 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _row_is_trainable(row: dict[str, Any], *, default: bool = True) -> bool:
+    for key in ("trainable", "default_trainable"):
+        value = row.get(key)
+        if value is not None:
+            return bool(value)
+    return bool(row.get("include", default))
+
+
 def _slug(value: str) -> str:
     base = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
     while "--" in base:
@@ -244,7 +252,7 @@ class DatasetService:
             for row in memberships
             if bool(row.get("review_required", False)) and str(row.get("physical_object_id") or "").strip()
         }
-        trainable_splits = {str(row.get("split") or "unassigned") for row in memberships if bool(row.get("trainable", row.get("default_trainable", False)))}
+        trainable_splits = {str(row.get("split") or "unassigned") for row in memberships if _row_is_trainable(row, default=False)}
         split_status = "assigned" if trainable_splits and trainable_splits != {"unassigned"} else "unassigned"
         return {
             "member_count": member_count,
@@ -568,11 +576,7 @@ class DatasetService:
         if not memberships:
             raise ValueError("ml set has no memberships")
 
-        active = [
-            row
-            for row in memberships
-            if bool(row.get("trainable", row.get("default_trainable", row.get("include", True))))
-        ]
+        active = [row for row in memberships if _row_is_trainable(row)]
         if not active:
             raise ValueError("ml set has no trainable memberships")
 
@@ -654,7 +658,7 @@ class DatasetService:
             for row in memberships:
                 copied = dict(row)
                 take_id = str(copied.get("take_id") or "")
-                if bool(copied.get("trainable", copied.get("default_trainable", copied.get("include", True)))) and take_id in split_by_take:
+                if _row_is_trainable(copied) and take_id in split_by_take:
                     copied["split"] = split_by_take[take_id]
                     copied["updated_at"] = now
                 next_rows.append(copied)
@@ -701,8 +705,6 @@ class DatasetService:
             memberships = [row for row in memberships if str(row.get("split") or "unassigned") in allowed_splits]
 
         selected_take_ids = sorted({str(row.get("take_id") or "") for row in memberships if str(row.get("take_id") or "")})
-        if not selected_take_ids:
-            raise ValueError("no memberships selected for reprocessing")
 
         result: dict[str, Any] = {
             "ml_set_id": ml_set_id,
@@ -954,14 +956,11 @@ class DatasetService:
             source_metadata=source_metadata,
         )
 
-        # Keep membership canonical: one take sidecar per dataset/session.
-        target_take_dir = self._session_dir(dataset_id, new_session_id) / "takes" / take_id
-        for did, sid in memberships:
-            stale_take_dir = self._session_dir(did, sid) / "takes" / take_id
-            if stale_take_dir == target_take_dir:
-                continue
-            if stale_take_dir.exists():
-                shutil.rmtree(stale_take_dir, ignore_errors=True)
+        # upsert_take_metadata already pruned the stale sidecars; this keeps the
+        # guarantee explicit at the point a caller asks for a move.
+        self.prune_stale_take_sidecars(
+            take_id, keep=self._session_dir(dataset_id, new_session_id) / "takes" / take_id
+        )
 
         return updated
 
@@ -1083,12 +1082,35 @@ class DatasetService:
         source_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         take_path = self._session_dir(dataset_id, session_id) / "takes" / take_id / "metadata.json"
-        existing = _read_json(take_path) or self.default_take_metadata(take_id, source_metadata)
+        existing = _read_json(take_path)
+        if existing is None:
+            # Filing the take under a session it has not been filed under before.
+            # Carry over whatever it already had rather than starting from the
+            # defaults: seeding from defaults here is what silently dropped the
+            # labels of 421 takes during a bulk move_to_session.
+            existing = self.load_take_metadata(take_id=take_id, source_metadata=source_metadata)
         resolved_dataset = updates["dataset_id"] if "dataset_id" in updates else dataset_id
         resolved_session = updates["session_id"] if "session_id" in updates else session_id
         merged = {**existing, **updates, "take_id": take_id, "dataset_id": resolved_dataset, "session_id": resolved_session}
         _write_json(take_path, merged)
+        self.prune_stale_take_sidecars(take_id, keep=take_path.parent)
         return merged
+
+    def prune_stale_take_sidecars(self, take_id: str, *, keep: Path) -> list[str]:
+        """Enforce one sidecar per take: remove every copy other than ``keep``.
+
+        Membership resolves by taking the first hit while iterating datasets and
+        sessions, so a second sidecar does not merely waste space, it makes the
+        take's labels depend on directory iteration order.
+        """
+        removed: list[str] = []
+        for did, sid in self.resolve_all_take_memberships(take_id):
+            stale = self._session_dir(did, sid) / "takes" / take_id
+            if stale == keep or not stale.exists():
+                continue
+            shutil.rmtree(stale, ignore_errors=True)
+            removed.append(str(stale))
+        return removed
 
     def load_take_metadata(self, *, take_id: str, source_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         did, sid = self.resolve_take_membership(take_id)

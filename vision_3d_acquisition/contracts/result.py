@@ -249,10 +249,11 @@ class ProcessingPipelineInfo(BaseModel):
     name: str
     id: str | None = None
     display_name: str | None = None
+    pipeline_family: str | None = None
     required_modalities: list[CaptureModality] = Field(default_factory=list)
     optional_modalities: list[CaptureModality] = Field(default_factory=list)
     stages: list[dict[str, Any]] = Field(default_factory=list)
-    processing_units: list[ProcessingUnitMetadata] = Field(default_factory=list)
+    processing_units: list[dict[str, Any]] = Field(default_factory=list)
     composition: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -356,6 +357,9 @@ class ProcessingResult(BaseModel):
     acquisition_timestamps: dict[str, str] | None = None
     recipe_version_id: str | None = None
     config_snapshot_hash: str | None = None
+    stage_params: dict[str, Any] = Field(default_factory=dict)
+    recipe_snapshot: dict[str, Any] | None = None
+    processing_unit_trace: dict[str, Any] | None = None
     source_id: str | None = None
     acquisition_group_id: str | None = None
     calibration_profile_id: str | None = None

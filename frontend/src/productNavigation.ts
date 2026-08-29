@@ -1,8 +1,9 @@
-export type ProductArea = "operations" | "studio" | "datasets" | "classifiers" | "feature_analytics" | "superclass_histograms" | "runtime" | "calibration" | "diagnostics" | "take";
+export type ProductArea = "operations" | "studio" | "validation" | "datasets" | "classifiers" | "feature_analytics" | "superclass_histograms" | "runtime" | "calibration" | "diagnostics" | "take";
 
 export const PRODUCT_NAV_ITEMS: Array<{ id: Exclude<ProductArea, "take">; label: string; href: string }> = [
   { id: "operations", label: "Operations", href: "/operations" },
   { id: "studio", label: "Studio", href: "/studio" },
+  { id: "validation", label: "Validation", href: "/validation" },
   { id: "datasets", label: "Datasets", href: "/datasets" },
   { id: "classifiers", label: "Classifiers", href: "/classifiers" },
   { id: "feature_analytics", label: "Feature Analytics", href: "/feature-analytics" },
@@ -16,6 +17,7 @@ export function productAreaForPath(path: string): ProductArea {
   if (path === "/operator" || path === "/operator/inspection") return "operations";
   if (path === "/operations" || path.startsWith("/operations/")) return "operations";
   if (path === "/studio" || path === "/processing-lab") return "studio";
+  if (path === "/validation" || path.startsWith("/validation/")) return "validation";
   if (path === "/datasets" || path.startsWith("/datasets/")) return "datasets";
   if (path === "/classifiers") return "classifiers";
   if (path === "/feature-analytics") return "feature_analytics";

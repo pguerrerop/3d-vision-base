@@ -237,7 +237,8 @@ def test_manifest_and_materialized_memberships_preserve_rich_fields(tmp_path: Pa
     assert membership["label_policy"] == "include"
     assert membership["extra_fields"] == {"note": "keep"}
     review_membership = next(row for row in memberships if row["take_id"] == "2026-05-29T221714_022")
-    assert review_membership["include"] is False
+    assert review_membership["include"] is True
+    assert review_membership["default_trainable"] is False
     assert materialized["validation_report"]["trainable_count"] == 2
 
 

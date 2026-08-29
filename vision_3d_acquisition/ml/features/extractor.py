@@ -15,10 +15,21 @@ def _f(value: Any) -> float:
         return 0.0
 
 
+def _nullable_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if out != out:
+        return None
+    return out
+
+
 def features_from_object(*, obj: dict[str, Any], take_id: str, dataset_id: str | None, session_id: str | None, labels: list[str], validation_status: str | None) -> dict[str, Any]:
     hab = obj.get("height_above_belt_mm") if isinstance(obj.get("height_above_belt_mm"), dict) else {}
     fg = obj.get("footprint_geometry") if isinstance(obj.get("footprint_geometry"), dict) else {}
     sg = obj.get("surface_geometry") if isinstance(obj.get("surface_geometry"), dict) else {}
+    sc = obj.get("sphere_consistency") if isinstance(obj.get("sphere_consistency"), dict) else {}
     dg = obj.get("damage_metrics") if isinstance(obj.get("damage_metrics"), dict) else {}
     row: dict[str, Any] = {
         "take_id": take_id,
@@ -42,6 +53,13 @@ def features_from_object(*, obj: dict[str, Any], take_id: str, dataset_id: str |
         "height_mean_mm": _f(hab.get("mean_height_mm")),
         "footprint_radial_cv": _f(fg.get("radial_cv")),
         "surface_sphere_fit_rmse_mm": _f(sg.get("sphere_fit_rmse_mm")),
+        "surface_sphere_fit_rmse_norm": _nullable_float(sc.get("surface_sphere_fit_rmse_norm")),
+        "surface_sphere_fit_residual_p95_norm": _nullable_float(sc.get("surface_sphere_fit_residual_p95_norm")),
+        "surface_sphere_fit_residual_mad_norm": _nullable_float(sc.get("surface_sphere_fit_residual_mad_norm")),
+        "surface_sphere_radius_error_norm": _nullable_float(sc.get("surface_sphere_radius_error_norm")),
+        "surface_visible_cap_fraction": _nullable_float(sc.get("surface_visible_cap_fraction")),
+        "surface_volume_fill_ratio": _nullable_float(sc.get("surface_volume_fill_ratio")),
+        "surface_sphere_fit_confidence": _nullable_float(sc.get("surface_sphere_fit_confidence")),
         "surface_deformation_score": _f(sg.get("deformation_score")),
         "damage_flat_region_ratio": _f(dg.get("flat_region_ratio")),
         "damage_surface_discontinuity_score": _f(dg.get("surface_discontinuity_score")),
