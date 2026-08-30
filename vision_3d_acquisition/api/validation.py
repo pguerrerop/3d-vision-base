@@ -39,6 +39,10 @@ def get_baseline(baseline_id: str, store: ValidationService = Depends(service)):
 def activate(baseline_id: str, store: ValidationService = Depends(service)): return _error(lambda: store.set_active(baseline_id, True))
 @router.post("/baselines/{baseline_id}/deactivate")
 def deactivate(baseline_id: str, store: ValidationService = Depends(service)): return _error(lambda: store.set_active(baseline_id, False))
+@router.get("/baselines/{baseline_id}/impact")
+def resolution_impact(baseline_id: str, store: ValidationService = Depends(service)):
+    """Which cases would follow this version if it were activated, and which would not."""
+    return _error(lambda: store.resolution_impact(store.get_baseline(baseline_id) or (_ for _ in ()).throw(KeyError(baseline_id))))
 @router.post("/baselines/{baseline_id}/compare")
 def compare(baseline_id: str, candidate_run_id: str, store: ValidationService = Depends(service)): return _error(lambda: store.compare(baseline_id, candidate_run_id=candidate_run_id))
 @router.post("/indexes/rebuild")
