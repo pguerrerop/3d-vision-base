@@ -70,6 +70,8 @@ export function getDevServicesConfig() {
     tmpDir,
     apiPort,
     frontendPort,
+    python,
+    dataDir: path.join(repoRoot, "data"),
     services: [
       {
         key: "frontend",

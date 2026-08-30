@@ -75,7 +75,7 @@ while preserving existing behavior and CLI compatibility.
   - `vision_3d_acquisition.poc.labels` stores independent `data/takes/<take_id>/labels.json`.
   - `vision_3d_acquisition.poc.exports` provides labeled dataset and object-metrics exports.
   - `scripts/poc_tools.py` exposes summary, label, export, and validation helpers.
-- Added lightweight acquisition session model (filesystem-backed, no database):
+- Added lightweight acquisition session model (filesystem-backed at the time; sessions now live in the `data/index.db` catalog):
   - sessions stored under `data/sessions/<session_id>/`
   - `session_id` attached to takes and results
   - API supports session listing, summary, and take filtering

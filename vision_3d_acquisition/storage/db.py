@@ -29,6 +29,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
+
 DB_FILENAME = "index.db"
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 _MIGRATION_PATTERN = re.compile(r"^(\d{3,})_[a-z0-9_]+\.sql$")
@@ -87,8 +92,41 @@ def latest_schema_version() -> int:
     return migrations[-1][0] if migrations else 0
 
 
+@contextmanager
+def _migration_lock(conn: sqlite3.Connection) -> Iterator[None]:
+    """Serialize migrations across processes with a lock file.
+
+    Two processes starting together both read user_version as 0 and both try to
+    create the schema; the loser fails with "table dataset already exists".
+    sqlite3.executescript commits any open transaction before it runs, so the
+    version check cannot be made atomic inside SQLite itself — hence a file lock
+    around the check and the apply.
+    """
+    row = conn.execute("PRAGMA database_list").fetchone()
+    database = row[2] if row and row[2] else ""
+    if not database or fcntl is None:
+        yield
+        return
+    lock_path = Path(f"{database}.migrate.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def migrate(conn: sqlite3.Connection) -> list[int]:
     """Apply pending migrations in order. Returns the versions applied."""
+    if schema_version(conn) >= latest_schema_version():
+        return []
+    with _migration_lock(conn):
+        return _apply_pending(conn)
+
+
+def _apply_pending(conn: sqlite3.Connection) -> list[int]:
+    # Re-read under the lock: another process may have applied these already.
     current = schema_version(conn)
     applied: list[int] = []
     for version, path in available_migrations():

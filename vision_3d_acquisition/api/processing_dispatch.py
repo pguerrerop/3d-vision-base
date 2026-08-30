@@ -174,6 +174,10 @@ def dispatch_take_processing(
     result.calibration_profile_id = str(calibration_profile_id) if calibration_profile_id else None
     write_result_json(output_dir / "result.json", result.model_dump(mode="json"))
     (output_dir / "DONE").touch()
+
+    from vision_3d_acquisition.storage import catalog_sync  # noqa: WPS433 - avoids an import cycle
+
+    catalog_sync.refresh_take(settings.data_dir, take_id)
     return {
         "ok": True,
         "take_id": take_id,

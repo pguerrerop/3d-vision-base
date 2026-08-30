@@ -38,16 +38,42 @@ A single monolithic loop (acquire → process → display → actuate) is simple
 
 For the POC we split **acquisition**, **processing**, and later **UI/API** and **output control** into separate programs that communicate only through agreed filesystem contracts. Each process owns its runtime, logging, and failure domain.
 
-## Why a filesystem queue (POC)
+## Why a filesystem queue
 
-For production you might use a message bus, object store, or database. For the POC we use directories under `data/`:
+The queue itself is still directories under `data/`. What changed is that the
+*metadata* about those directories no longer lives in JSON files next to them:
+datasets, sessions, take labels, ML set membership, physical objects and process
+runs are rows in `data/index.db` (see "Catalog" below). Point clouds, images,
+results and run artifacts stay on disk, and the queue keeps these properties:
 
 - **No extra infrastructure** — works on a laptop or edge box with only disk.
 - **Human-debuggable** — inspect `metadata.json`, PLY, and marker files directly.
 - **Atomic publish** — rename of a complete temp folder is a well-understood pattern on local disk.
 - **Natural backpressure** — processing consumes folders when ready; incoming depth is visible.
 
-Trade-offs (accepted for POC): no cross-host queue without shared storage, weaker ordering guarantees than a dedicated broker, and polling/watch overhead. These can be replaced later while keeping the same logical **take** contract.
+Trade-offs (accepted): no cross-host queue without shared storage, weaker ordering guarantees than a dedicated broker, and polling/watch overhead. These can be replaced later while keeping the same logical **take** contract.
+
+## Catalog (`data/index.db`)
+
+A single SQLite database holds two classes of table:
+
+- **Authoritative** — `dataset`, `experiment_session`, `take_metadata`,
+  `take_label`, `ml_set`, `ml_set_membership`, `physical_object`,
+  `object_annotation`, `process_run`. These exist only here. Each row stores its
+  document verbatim in `payload_json` with the other columns as a queryable
+  projection, so a read returns exactly what was written.
+- **Derived** — `take_index`, `take_modality`. A projection of what is already on
+  disk, rebuildable in full with `sensor-studio index rebuild --full`.
+
+Why it exists: the take listing walked the filesystem for every request and cost
+~800 ms at 753 takes, and appending a process run rewrote one shared JSON
+document from four processes at once, which lost entries and could truncate the
+file. Writers push their changes into the catalog; `sensor-studio index status`
+reports drift and `index rebuild` repairs it.
+
+Escape hatches: `SENSOR_STUDIO_INDEX=off` reverts to the previous filesystem
+layout, and `sensor-studio index export` writes every authoritative document back
+out as that layout.
 
 ## Repository layout
 
@@ -84,9 +110,9 @@ Rules:
 - **contracts** — no I/O, no queue logic; only schemas and serialization.
 - **vision_core** — generic components only; no ball domain imports or business terms.
 - **apps** — owns domain-specific stages (classification decisions, app-level statistics).
-- **poc** — owns operator-facing readiness summaries, dataset labels, validation helpers, and CSV/JSON exports; no database or orchestration framework.
+- **poc** — owns operator-facing readiness summaries, dataset labels, validation helpers, and CSV/JSON exports; reads through `datasets`, never opens the catalog itself.
 - **acquisition** — produces takes; calls `storage.AcquisitionPublisher`, never writes `incoming/<id>/` without staging.
-- **storage** — owns queue semantics; the only place that creates `.tmp`, renames, and touches `READY` for publishes.
+- **storage** — owns queue semantics and the catalog; the only place that creates `.tmp`, renames, and touches `READY` for publishes, and the only place that opens `data/index.db`.
 - **processing** — consumes `incoming/` with `READY`, writes `processed/` (future).
 - **state** — centralizes readers/writers for `data/state/*.json` beyond the minimal publish snapshot (future).
 
@@ -215,7 +241,9 @@ data/
 
 ## Acquisition sessions
 
-Sessions are lightweight filesystem groupings of related takes. They are used for operator trust and repeatable debugging, not as a database replacement.
+Sessions are lightweight groupings of related takes, stored in the catalog's
+`experiment_session` table. They are used for operator trust and repeatable
+debugging; they are not a scheduling or orchestration mechanism.
 
 - Session metadata includes operator, setup, mode, calibration, conveyor speed, encoder flag, notes, and creation timestamp.
 - Live publishing can auto-create a session id when one is not provided.

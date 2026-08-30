@@ -2179,6 +2179,7 @@ def takes(
     is_reference: bool | None = None,
     is_golden_sample: bool | None = None,
     show_archived: bool = False,
+    include_acquisition_processing_status: bool = False,
 ) -> list[TakeSummary]:
     return list_takes(
         settings,
@@ -2196,6 +2197,7 @@ def takes(
         is_reference=is_reference,
         is_golden_sample=is_golden_sample,
         include_archived=show_archived,
+        include_acquisition_processing_status=include_acquisition_processing_status,
     )
 
 
@@ -2223,6 +2225,7 @@ def takes_paged(
     is_reference: bool | None = None,
     is_golden_sample: bool | None = None,
     show_archived: bool = False,
+    include_acquisition_processing_status: bool = False,
     profile: bool = False,
 ) -> TakeSummaryPage:
     payload = list_takes_paged(
@@ -2248,6 +2251,7 @@ def takes_paged(
         is_reference=is_reference,
         is_golden_sample=is_golden_sample,
         include_archived=show_archived,
+        include_acquisition_processing_status=include_acquisition_processing_status,
         profile=profile,
     )
     return TakeSummaryPage(**payload)

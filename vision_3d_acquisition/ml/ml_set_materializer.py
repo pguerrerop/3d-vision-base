@@ -191,15 +191,20 @@ def materialize_ml_set(*, data_dir: Path, ml_set_id: str, dataset_id: str, manif
             "membership_mode": membership_summary["membership_mode"],
         },
     }
-    (dataset_ml_set_path / "ml_set.json").write_text(json.dumps(persisted_ml_set, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Through the service, not the path: the ML set is a row now, and writing the
+    # file directly would leave the stored document behind.
+    dataset_service.docs.write_ml_set(dataset_id, ml_set_id, persisted_ml_set)
 
-    memberships_path = dataset_ml_set_path / "memberships.json"
-    ml_set_json_path = dataset_ml_set_path / "ml_set.json"
+    # Reported for continuity: callers surface these as "where the ML set lives".
+    # They now name the catalog rather than a file on disk.
+    ml_set_json_path = f"sqlite:ml_set/{dataset_id}/{ml_set_id}"
+    memberships_path = f"sqlite:ml_set_membership/{dataset_id}/{ml_set_id}"
+
     errors: list[str] = []
     warnings: list[str] = []
-    if not ml_set_json_path.is_file():
+    if dataset_service.get_ml_set(dataset_id, ml_set_id) is None:
         errors.append("ml_set.json was not written.")
-    if not memberships_path.is_file():
+    if not dataset_service.docs.read_memberships(dataset_id, ml_set_id):
         errors.append("memberships.json was not written.")
     if not memberships:
         errors.append("No memberships were persisted.")

@@ -17,10 +17,9 @@ from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.datasets import DatasetService
 
 
-def _sidecars(settings: ApiSettings, take_id: str) -> list[Path]:
-    return sorted(
-        settings.datasets_dir.glob(f"dataset_*/sessions/session_*/takes/{take_id}/metadata.json")
-    )
+def _memberships(settings: ApiSettings, take_id: str) -> list[tuple[str, str]]:
+    """Where the take is filed, whichever backend is storing it."""
+    return DatasetService(settings.data_dir).resolve_all_take_memberships(take_id)
 
 
 def _labeled_take(settings: ApiSettings, take_id: str) -> DatasetService:
@@ -62,16 +61,14 @@ def test_filing_a_take_under_a_new_session_carries_its_content(
 def test_a_take_never_keeps_two_sidecars(catalog_settings: ApiSettings, write_take) -> None:
     write_take("take_a")
     service = _labeled_take(catalog_settings, "take_a")
-    assert len(_sidecars(catalog_settings, "take_a")) == 1
+    assert _memberships(catalog_settings, "take_a") == [("demo", "origen")]
 
     service.upsert_take_metadata(
         take_id="take_a", dataset_id="demo", session_id="destino", updates={"session_id": "destino"}
     )
 
-    remaining = _sidecars(catalog_settings, "take_a")
-    assert len(remaining) == 1
-    assert "session_destino" in remaining[0].parts
-    assert service.resolve_all_take_memberships("take_a") == [("demo", "destino")]
+    assert _memberships(catalog_settings, "take_a") == [("demo", "destino")]
+    assert service.docs.read_take("demo", "origen", "take_a") is None
 
 
 def test_bulk_move_to_session_preserves_labels(
@@ -94,9 +91,8 @@ def test_bulk_move_to_session_preserves_labels(
     assert response["ok"] is True
     assert response["affected_count"] == 1
 
-    sidecars = _sidecars(catalog_settings, "take_a")
-    assert len(sidecars) == 1
-    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    assert _memberships(catalog_settings, "take_a") == [("demo", "destino")]
+    payload = DatasetService(catalog_settings.data_dir).load_take_metadata(take_id="take_a")
     assert payload["session_id"] == "destino"
     assert payload["semantic_labels"] == ["chatarra"]
     assert payload["superclass_labels"] == ["SCRAP_METAL"]
@@ -116,4 +112,4 @@ def test_update_take_session_id_still_moves_and_prunes(
 
     assert updated["session_id"] == "destino"
     assert updated["semantic_labels"] == ["chatarra"]
-    assert len(_sidecars(catalog_settings, "take_a")) == 1
+    assert _memberships(catalog_settings, "take_a") == [("demo", "destino")]
