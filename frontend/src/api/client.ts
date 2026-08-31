@@ -2258,18 +2258,56 @@ export interface SegmentationPreviewResponse {
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
+export type ValidationComparator =
+  | "binary_mask" | "numeric_raster" | "measurement_table" | "classification"
+  | "json_fields" | "plane_model" | "visual_only" | "not_comparable";
+export type ValidationComparatorSource =
+  | "declared_comparator" | "semantic_type" | "role" | "kind" | "path" | "heuristic" | "unresolved";
+export interface ValidationBaselinePromotion {
+  source_execution_id: string; source_case_id: string; source_comparison_id: string;
+  candidate_run_id: string; candidate_artifact_checksum: string;
+  promoted_at: string; promoted_by?: string | null; notes?: string;
+}
 export interface ValidationBaseline {
   id: string; version: number; status: "active" | "inactive" | string;
   take_id: string; pipeline_id: string; source_run_id: string; stage_id?: string | null;
   processing_unit_id?: string | null; view_id?: string | null; artifact_id?: string | null;
-  review?: { notes?: string; reviewed_at?: string; reviewed_by?: string | null };
+  artifact_kind?: string | null; artifact_semantic_type?: string | null; artifact_role?: string | null;
+  comparator?: ValidationComparator | string; comparator_source?: ValidationComparatorSource | string;
+  artifact_checksum?: string; recipe_fingerprint?: string | null;
+  pipeline_contract_fingerprint?: string | null; comparison_policy?: Record<string, unknown>;
+  created_at?: string; supersedes_baseline_id?: string | null;
+  promotion?: ValidationBaselinePromotion | null;
+  /** Recomputed on read by the history endpoint, not stored on the record. */
+  integrity_state?: "ok" | "invalid" | string;
+  review?: { status?: string; notes?: string; reviewed_at?: string; reviewed_by?: string | null };
 }
+export interface ValidationCaseRequest {
+  take_id?: string; baseline_ids: string[]; baseline_resolution?: ValidationBaselineResolution;
+  enabled?: boolean; tags?: string[]; notes?: string; included_artifacts?: string[];
+}
+/** Every field is optional: omitted ones are preserved by the server. */
+export type ValidationCaseUpdate = Partial<
+  Pick<ValidationSuiteCase, "enabled" | "tags" | "notes" | "included_artifacts" | "baseline_resolution">
+>;
 export type ValidationResolutionMode = "active" | "pinned" | "allowed_versions";
 export interface ValidationBaselineResolution { mode: ValidationResolutionMode; baseline_id?: string | null; allowed_baseline_ids?: string[]; }
 export interface ValidationSuiteCase { id: string; take_id: string; baseline_ids: string[]; baseline_resolution?: ValidationBaselineResolution; enabled: boolean; tags: string[]; notes: string; included_artifacts?: string[]; }
 export interface ValidationSuiteDetail { id: string; name: string; description: string; pipeline_id: string; status: string; cases: ValidationSuiteCase[]; }
 export interface ValidationCoverageArea { area: string; approved: number; missing: number; stale: number; unsupported: number; visual_only: number; coverage_fraction: number; }
-export interface ValidationPromotionResponse { baseline: ValidationBaseline; already_promoted: boolean; previous_active_baseline: ValidationBaseline | null; resulting_active_baseline: ValidationBaseline | null; affected_case_resolution: Record<string, Array<{ suite_id: string; case_id: string }>>; }
+export interface ValidationCaseRef {
+  suite_id: string;
+  case_id: string;
+}
+/** Which cases follow an activation and which are deliberately unaffected. */
+export interface ValidationResolutionImpact {
+  active_cases: ValidationCaseRef[];
+  pinned_cases_unchanged: ValidationCaseRef[];
+  allowed_version_cases_unchanged: ValidationCaseRef[];
+  disabled_cases: ValidationCaseRef[];
+  archived_suites: ValidationCaseRef[];
+}
+export interface ValidationPromotionResponse { baseline: ValidationBaseline; already_promoted: boolean; previous_active_baseline: ValidationBaseline | null; resulting_active_baseline: ValidationBaseline | null; affected_case_resolution: ValidationResolutionImpact; }
 
 async function request<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`);
@@ -2307,6 +2345,19 @@ async function postForm<T>(path: string, body: FormData): Promise<T> {
 async function put<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${message}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
@@ -2361,16 +2412,21 @@ export const api = {
   },
   approveValidationBaseline: (payload: Record<string, unknown>) => post<{ baselines: ValidationBaseline[]; included: string[]; skipped: Array<Record<string, unknown>> }>("/api/validation/baselines", payload),
   compareValidationBaseline: (baselineId: string, candidateRunId: string) => post<Record<string, unknown>>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/compare?candidate_run_id=${encodeURIComponent(candidateRunId)}`, {}),
+  validationBaselineImpact: (baselineId: string) => request<ValidationResolutionImpact>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/impact`),
+  activateValidationBaseline: (baselineId: string) => post<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/activate`, {}),
   deactivateValidationBaseline: (baselineId: string) => post<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/deactivate`, {}),
   validationSuites: () => request<Array<{ id: string; name: string; pipeline_id: string; status: string }>>("/api/validation/suites"),
   validationSuite: (suiteId: string) => request<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}`),
   createValidationSuite: (payload: { name: string; pipeline_id: string; description?: string }) => post<ValidationSuiteDetail>("/api/validation/suites", payload),
-  updateValidationSuite: (suiteId: string, payload: Partial<Pick<ValidationSuiteDetail, "name" | "description" | "status">>) => fetch(`${API_BASE_URL}/api/validation/suites/${encodeURIComponent(suiteId)}`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload) }).then(async response => { if (!response.ok) throw new Error(await response.text()); return response.json() as Promise<ValidationSuiteDetail>; }),
+  updateValidationSuite: (suiteId: string, payload: Partial<Pick<ValidationSuiteDetail, "name" | "description" | "status">>) => put<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}`, payload),
   duplicateValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/duplicate`, {}),
   archiveValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/archive`, {}),
   restoreValidationSuite: (suiteId: string) => post<ValidationSuiteDetail>(`/api/validation/suites/${encodeURIComponent(suiteId)}/restore`, {}),
   validationCoverage: (suiteId: string) => request<{ suite_id: string; case_count: number; areas: ValidationCoverageArea[] }>(`/api/validation/suites/${encodeURIComponent(suiteId)}/coverage`),
   validationSuiteExecutions: (suiteId: string) => request<Array<Record<string, unknown>>>(`/api/validation/suites/${encodeURIComponent(suiteId)}/executions`),
+  addValidationCase: (suiteId: string, payload: ValidationCaseRequest) => post<ValidationSuiteCase>(`/api/validation/suites/${encodeURIComponent(suiteId)}/cases`, payload),
+  updateValidationCase: (suiteId: string, caseId: string, payload: ValidationCaseUpdate) => patch<ValidationSuiteCase>(`/api/validation/suites/${encodeURIComponent(suiteId)}/cases/${encodeURIComponent(caseId)}`, payload),
+  deleteValidationCase: (suiteId: string, caseId: string) => del<{ deleted: string }>(`/api/validation/suites/${encodeURIComponent(suiteId)}/cases/${encodeURIComponent(caseId)}`),
   validationBaselineHistory: (params?: { take_id?: string; pipeline_id?: string; artifact_id?: string }) => {
     const query=new URLSearchParams(); Object.entries(params ?? {}).forEach(([key,value]) => { if (value) query.set(key,value); });
     return request<ValidationBaseline[]>(`/api/validation/baselines/history${query.size ? `?${query}` : ""}`);
