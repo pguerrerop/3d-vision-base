@@ -157,9 +157,11 @@ def test_run_stores_recipe_version_and_config_snapshot_hash(tmp_path: Path) -> N
         ExecuteTakeRequest(pipeline_id="mining_steel_ball_classification_2d", source_id="usb_camera_0", modality="rgb", purpose="manual_debug"),
         settings,
     )
-    entries_path = settings.data_dir / "processes" / "index" / "runs.json"
-    payload = json.loads(entries_path.read_text(encoding="utf-8"))
-    latest = payload["entries"][-1]
+    # Runs live in the catalog now, not in processes/index/runs.json, which is
+    # only a mirror refreshed on rebuild. Read them through the public accessor.
+    from vision_3d_acquisition.processing.status_index import load_process_entries
+
+    latest = load_process_entries(settings.data_dir)[-1]
     assert latest["pipeline_id"] == binding["pipeline_id"]
     assert latest["recipe_version_id"] == recipe["id"]
     assert isinstance(latest["config_snapshot_hash"], str) and len(latest["config_snapshot_hash"]) == 64

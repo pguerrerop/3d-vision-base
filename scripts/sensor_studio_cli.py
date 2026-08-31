@@ -1530,6 +1530,15 @@ def cmd_index_status(args: argparse.Namespace) -> int:
     return 0 if status["drift"] == 0 else 2
 
 
+def cmd_index_export(args: argparse.Namespace) -> int:
+    from vision_3d_acquisition.storage.catalog_export import export_catalog  # noqa: WPS433
+
+    destination = args.to or (args.data_dir / f"export_{datetime.now(UTC):%Y%m%dT%H%M%SZ}")
+    report = export_catalog(args.data_dir, destination)
+    print(json.dumps(report.as_dict(), indent=2))
+    return 0
+
+
 def cmd_index_verify(args: argparse.Namespace) -> int:
     result = _catalog_indexer(args.data_dir).verify(limit=args.limit)
     if not args.show_all:
@@ -1886,6 +1895,13 @@ def build_parser() -> argparse.ArgumentParser:
     index_status = index_sub.add_parser("status", help="Show schema version, row counts, and drift against disk")
     index_status.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
     index_status.set_defaults(handler=cmd_index_status)
+
+    index_export = index_sub.add_parser(
+        "export", help="Write the authoritative documents back out as JSON directories"
+    )
+    index_export.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")
+    index_export.add_argument("--to", type=Path, default=None, help="Destination (default: data/export_<timestamp>)")
+    index_export.set_defaults(handler=cmd_index_export)
 
     index_verify = index_sub.add_parser("verify", help="Diff every indexed summary against a fresh filesystem read")
     index_verify.add_argument("--data-dir", type=Path, default=Path("data"), help="Data root (default: data)")

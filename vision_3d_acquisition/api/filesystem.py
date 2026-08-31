@@ -97,7 +97,20 @@ def list_take_ids(settings: ApiSettings) -> set[str]:
     return take_ids
 
 
-def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
+def get_take_summary(
+    settings: ApiSettings,
+    take_id: str,
+    *,
+    include_acquisition_processing_status: bool = True,
+) -> TakeSummary:
+    """Build a take's summary.
+
+    ``include_acquisition_processing_status`` exists because that one field is
+    the whole payload: it embeds the run's complete result.json, 159 KB at the
+    median and up to 453 KB, against ~1.6 KB for everything else. TakeDetail
+    needs it and asks for it; the listing does not read it and does not, unless
+    a caller explicitly opts in.
+    """
     incoming_dir = settings.incoming_dir / take_id
     processed_dir = settings.processed_dir / take_id
     metadata = read_json(incoming_dir / "metadata.json") or {}
@@ -156,7 +169,11 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     process_entries = process_entries_for_take(settings.data_dir, take_id)
     if process_entries:
         latest_run_status = str(sorted(process_entries, key=lambda item: str(item.get("created_at") or ""), reverse=True)[0].get("status") or "")
-    acquisition_processing = read_acquisition_processing_status(settings.data_dir, take_id)
+    acquisition_processing = (
+        read_acquisition_processing_status(settings.data_dir, take_id)
+        if include_acquisition_processing_status
+        else None
+    )
     return TakeSummary(
         take_id=take_id,
         status=status,
@@ -211,6 +228,22 @@ def get_take_summary(settings: ApiSettings, take_id: str) -> TakeSummary:
     )
 
 
+def _catalog(settings: ApiSettings):
+    """The catalog connection, or None when reads should walk the filesystem.
+
+    Stage 1 serves the listing from data/index.db. SENSOR_STUDIO_INDEX=off falls
+    back to the filesystem scan below, which stays in place for one release so a
+    problem in the index is a restart away from being worked around rather than a
+    revert. An index that has never completed a full scan, or whose take count no
+    longer matches the disk, is not trusted — see catalog_ready_for_reads.
+    """
+    from vision_3d_acquisition.storage import catalog_sync
+
+    if not catalog_sync.catalog_available(settings.data_dir):
+        return None
+    return catalog_sync.catalog_ready_for_reads(settings.data_dir, len(list_take_ids(settings)))
+
+
 def list_takes(
     settings: ApiSettings,
     session_id: str | None = None,
@@ -227,8 +260,42 @@ def list_takes(
     is_reference: bool | None = None,
     is_golden_sample: bool | None = None,
     include_archived: bool = False,
+    include_acquisition_processing_status: bool = False,
 ) -> list[TakeSummary]:
-    takes = [get_take_summary(settings, take_id) for take_id in list_take_ids(settings)]
+    conn = _catalog(settings)
+    if conn is not None:
+        from vision_3d_acquisition.storage import catalog_queries
+
+        return catalog_queries.list_takes(
+            conn,
+            {
+                "settings": settings,
+                "include_acquisition_processing_status": include_acquisition_processing_status,
+                "session_id": session_id,
+                "dataset_id": dataset_id,
+                "validation_status": validation_status,
+                "tag": tag,
+                "semantic_label": semantic_label,
+                "superclass_label": superclass_label,
+                "search": search,
+                "physical_object_id": physical_object_id,
+                "session_type": session_type,
+                "category": category,
+                "reference_type": reference_type,
+                "is_reference": is_reference,
+                "is_golden_sample": is_golden_sample,
+                "include_archived": include_archived,
+            },
+        )
+
+    takes = [
+        get_take_summary(
+            settings,
+            take_id,
+            include_acquisition_processing_status=include_acquisition_processing_status,
+        )
+        for take_id in list_take_ids(settings)
+    ]
     if session_id:
         takes = [take for take in takes if take.session_id == session_id]
     if dataset_id:
@@ -296,8 +363,43 @@ def list_takes_paged(
     is_reference: bool | None = None,
     is_golden_sample: bool | None = None,
     include_archived: bool = False,
+    include_acquisition_processing_status: bool = False,
     profile: bool = False,
 ) -> dict[str, Any]:
+    conn = _catalog(settings)
+    if conn is not None:
+        from vision_3d_acquisition.storage import catalog_queries
+
+        return catalog_queries.list_takes_paged(
+            conn,
+            {
+                "settings": settings,
+                "include_acquisition_processing_status": include_acquisition_processing_status,
+                "limit": limit,
+                "offset": offset,
+                "session_id": session_id,
+                "dataset_id": dataset_id,
+                "validation_status": validation_status,
+                "tag": tag,
+                "semantic_label": semantic_label,
+                "superclass_label": superclass_label,
+                "search": search,
+                "created_from": created_from,
+                "created_to": created_to,
+                "expected_class": expected_class,
+                "split": split,
+                "calibration_linkage_only": calibration_linkage_only,
+                "physical_object_id": physical_object_id,
+                "session_type": session_type,
+                "category": category,
+                "reference_type": reference_type,
+                "is_reference": is_reference,
+                "is_golden_sample": is_golden_sample,
+                "include_archived": include_archived,
+                "profile": profile,
+            },
+        )
+
     total_started_at = time.perf_counter()
     resolved_limit = max(1, min(int(limit), 200))
     resolved_offset = max(0, int(offset))
@@ -463,7 +565,14 @@ def list_takes_paged(
     page_take_ids = [take_id for _created_at, take_id in candidates[resolved_offset : resolved_offset + resolved_limit]]
 
     hydrate_started_at = time.perf_counter()
-    page_items = [get_take_summary(settings, take_id) for take_id in page_take_ids]
+    page_items = [
+        get_take_summary(
+            settings,
+            take_id,
+            include_acquisition_processing_status=include_acquisition_processing_status,
+        )
+        for take_id in page_take_ids
+    ]
     hydrate_page_items_ms = (time.perf_counter() - hydrate_started_at) * 1000.0
     next_offset = resolved_offset + len(page_items)
     has_more = next_offset < len(candidates)

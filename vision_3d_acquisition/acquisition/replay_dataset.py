@@ -330,17 +330,14 @@ class ReplayableAcquisitionService:
         if target is None:
             raise FileNotFoundError(f"Unknown session: {session_id}")
         resolved_dataset_id = str(target.get("dataset_id") or "")
-        takes_dir = self.data_dir / "datasets" / f"dataset_{resolved_dataset_id}" / "sessions" / f"session_{session_id}" / "takes"
         runs: list[dict[str, Any]] = []
-        if takes_dir.is_dir():
-            for child in sorted(takes_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                take_id = child.name
-                incoming_manifest = self.data_dir / "incoming" / take_id / "replay_manifest.json"
-                if not incoming_manifest.is_file():
-                    continue
-                runs.append(self.replay_take(take_id=take_id, pipeline_id=pipeline_id))
+        for _sid, take_id, _payload in self.dataset_service.iter_dataset_takes(
+            resolved_dataset_id, session_id=session_id
+        ):
+            incoming_manifest = self.data_dir / "incoming" / take_id / "replay_manifest.json"
+            if not incoming_manifest.is_file():
+                continue
+            runs.append(self.replay_take(take_id=take_id, pipeline_id=pipeline_id))
         return {
             "dataset_id": resolved_dataset_id,
             "session_id": session_id,

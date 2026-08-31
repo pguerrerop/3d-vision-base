@@ -18,6 +18,20 @@ from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.storage import db
 
 
+@pytest.fixture(autouse=True)
+def _reset_catalog_connections():
+    """Drop the per-process catalog connections between tests.
+
+    catalog_sync caches one connection per data directory, and each test builds a
+    new tmp_path. Without this the cache and its file handles accumulate across
+    the suite, and a test can see a connection opened against another test's
+    directory.
+    """
+    db.close_process_connections()
+    yield
+    db.close_process_connections()
+
+
 @pytest.fixture
 def catalog_data_dir(tmp_path: Path) -> Path:
     return tmp_path / "data"
@@ -40,11 +54,14 @@ def catalog_settings(catalog_data_dir: Path) -> ApiSettings:
 
 @pytest.fixture
 def catalog_conn(catalog_settings: ApiSettings) -> sqlite3.Connection:
-    conn = db.open_catalog(catalog_settings.data_dir)
-    try:
-        yield conn
-    finally:
-        conn.close()
+    """The process connection, not a second one.
+
+    Opening a private connection here deadlocks against the one the code under
+    test uses: the second waits for a write lock the first is holding, and no
+    busy timeout can break it. One connection per process is the rule the code
+    follows, so the tests have to follow it too.
+    """
+    return db.catalog_for_process(catalog_settings.data_dir)
 
 
 @pytest.fixture

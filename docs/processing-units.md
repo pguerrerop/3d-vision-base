@@ -140,7 +140,7 @@ Recommended unit outputs:
 - Pipelines are assembled from reusable units instead of monolithic algorithm blocks.
 - Composition is explicit: `dependencies`, modality requirements, and artifact flow are documented in the registry.
 - Optional and conditional units are represented in metadata before they are implemented.
-- Execution remains in-process and ordered; no distributed scheduler, queue, or database is introduced.
+- Execution remains in-process and ordered; no distributed scheduler or queue is introduced. Run history is recorded in the catalog (`process_run` in `data/index.db`), which replaced a shared JSON index that lost entries when several workers finished at once.
 
 ## Example skeleton
 

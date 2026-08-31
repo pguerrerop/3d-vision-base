@@ -6,6 +6,7 @@ import { killProcessTree } from "./dev-services/process-tree.mjs";
 import { startDetachedService, ensureInstall } from "./dev-services/start-service.mjs";
 import { collectServiceStatus } from "./dev-services/status.mjs";
 import { runInteractiveUi } from "./dev-services/ui.mjs";
+import { reportCatalogDrift } from "./dev-services/catalog-drift.mjs";
 
 const config = getDevServicesConfig();
 fs.mkdirSync(config.tmpDir, { recursive: true });
@@ -148,6 +149,7 @@ async function main() {
   switch (parsed.command) {
     case "status": {
       printStatuses(await getStatuses());
+      reportCatalogDrift(config);
       return;
     }
     case "start": {
@@ -155,6 +157,7 @@ async function main() {
         throw new Error("Usage: npm run dev:services -- start <service-key>");
       }
       console.log(JSON.stringify(await startService(parsed.target, options), null, 2));
+      reportCatalogDrift(config);
       return;
     }
     case "restart": {

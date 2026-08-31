@@ -61,9 +61,6 @@ def append_process_run_index(
 ) -> None:
     if not take_id:
         return
-    path = index_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _read_index(path)
     entry = {
         "take_id": take_id,
         "pipeline_instance_id": pipeline_instance_id,
@@ -89,28 +86,79 @@ def append_process_run_index(
         "recipe_id": recipe_id,
         "summary": dict(run_summary) if run_summary else {},
     }
+    if _store_enabled(data_dir):
+        from vision_3d_acquisition.storage import run_store
+
+        run_store.append_run(data_dir, entry)
+    else:
+        _append_to_json(data_dir, entry)
+
+    _sync_catalog(data_dir, take_id)
+
+
+def _append_to_json(data_dir: Path, entry: dict[str, Any]) -> None:
+    """The pre-stage-2 path: rewrite the whole document to add one entry.
+
+    Kept reachable through SENSOR_STUDIO_INDEX=off for one release. It is the
+    implementation that loses entries when two runs finish at the same time.
+    """
+    path = index_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _read_index(path)
     payload.setdefault("entries", []).append(entry)
     payload["updated_at"] = datetime.now(UTC).isoformat()
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def update_process_run_index_entry(data_dir: Path, run_id: str, **patch: Any) -> None:
-    """Merge patch fields into the index entry matching run_id, e.g. to backfill
-    comparison_id once a comparison is generated after the run was already indexed."""
+    """Merge patch fields into the run matching run_id, e.g. to backfill
+    comparison_id once a comparison is generated after the run was recorded."""
+    if _store_enabled(data_dir):
+        from vision_3d_acquisition.storage import run_store
+
+        touched_take_ids = set(run_store.update_run(data_dir, run_id, patch))
+    else:
+        touched_take_ids = _update_in_json(data_dir, run_id, patch)
+
+    for take_id in sorted(touched_take_ids):
+        _sync_catalog(data_dir, take_id)
+
+
+def _update_in_json(data_dir: Path, run_id: str, patch: dict[str, Any]) -> set[str]:
     path = index_path(data_dir)
     payload = _read_index(path)
     entries = payload.get("entries")
     if not isinstance(entries, list):
-        return
+        return set()
     changed = False
+    touched_take_ids: set[str] = set()
     for entry in entries:
         if isinstance(entry, dict) and str(entry.get("run_id") or "") == run_id:
             entry.update(patch)
             changed = True
+            if entry.get("take_id"):
+                touched_take_ids.add(str(entry["take_id"]))
     if not changed:
-        return
+        return set()
     payload["updated_at"] = datetime.now(UTC).isoformat()
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return touched_take_ids
+
+
+def _store_enabled(data_dir: Path) -> bool:
+    """Whether runs live in SQLite. False reverts to the legacy JSON document."""
+    from vision_3d_acquisition.storage import catalog_sync  # noqa: WPS433 - avoids an import cycle
+
+    return catalog_sync.index_enabled()
+
+
+def _sync_catalog(data_dir: Path, take_id: str | None) -> None:
+    """Tell the catalog a take's run history moved. Best effort; see catalog_sync."""
+    if not take_id:
+        return
+    from vision_3d_acquisition.storage import catalog_sync  # noqa: WPS433 - avoids an import cycle
+
+    catalog_sync.refresh_take(data_dir, take_id)
 
 
 def normalize_run_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -137,20 +185,47 @@ def normalize_run_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_process_entries(data_dir: Path) -> list[dict[str, Any]]:
+    if _store_enabled(data_dir):
+        from vision_3d_acquisition.storage import run_store
+
+        ensure_runs_migrated(data_dir)
+        return run_store.load_runs(data_dir)
+    return _load_entries_from_json(data_dir)
+
+
+def process_entries_for_take(data_dir: Path, take_id: str) -> list[dict[str, Any]]:
+    if _store_enabled(data_dir):
+        from vision_3d_acquisition.storage import run_store
+
+        ensure_runs_migrated(data_dir)
+        return run_store.runs_for_take(data_dir, take_id)
+    return [item for item in _load_entries_from_json(data_dir) if str(item.get("take_id") or "") == take_id]
+
+
+def ensure_runs_migrated(data_dir: Path, conn=None) -> int:
+    """Move runs.json into the table the first time, then never again.
+
+    Emptiness is the migration flag: once a run is stored, runs.json stops being
+    read, so a stale mirror can never overwrite live rows. ``conn`` is passed by
+    callers that already hold a transaction.
+    """
+    from vision_3d_acquisition.storage import run_store
+
+    if not run_store.is_empty(data_dir, conn):
+        return 0
+    legacy = _load_entries_from_json(data_dir)
+    if not legacy:
+        return 0
+    return run_store.import_entries(data_dir, legacy, conn)
+
+
+def _load_entries_from_json(data_dir: Path) -> list[dict[str, Any]]:
     path = index_path(data_dir)
     payload = _read_index(path)
     entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
     if entries:
         return [item for item in entries if isinstance(item, dict)]
-    rebuilt = _rebuild_entries(data_dir)
-    if rebuilt:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"entries": rebuilt, "updated_at": datetime.now(UTC).isoformat(), "rebuilt": True}, indent=2), encoding="utf-8")
-    return rebuilt
-
-
-def process_entries_for_take(data_dir: Path, take_id: str) -> list[dict[str, Any]]:
-    return [item for item in load_process_entries(data_dir) if str(item.get("take_id") or "") == take_id]
+    return _rebuild_entries(data_dir)
 
 
 def summarize_take_processing(data_dir: Path, take_id: str, *, has_3d_done: bool, processed_dir: Path) -> list[dict[str, Any]]:

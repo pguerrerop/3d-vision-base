@@ -325,8 +325,10 @@ def test_update_take_session_id_preserves_dataset_and_cleans_old_membership(tmp_
 
     assert updated["dataset_id"] == "set1"
     assert updated["session_id"] == "s_new"
-    assert not (settings.data_dir / "datasets" / "dataset_set1" / "sessions" / "session_s_old" / "takes" / "take_move").exists()
-    assert (settings.data_dir / "datasets" / "dataset_set1" / "sessions" / "session_s_new" / "takes" / "take_move" / "metadata.json").is_file()
+    # Membership is a row now, not a directory: exactly one, under the new session.
+    assert service.resolve_all_take_memberships("take_move") == [("set1", "s_new")]
+    assert service.docs.read_take("set1", "s_old", "take_move") is None
+    assert service.docs.read_take("set1", "s_new", "take_move")["friendly_name"] == "move me"
 
 
 def test_batch_update_take_session_dry_run_only_plans(tmp_path: Path) -> None:

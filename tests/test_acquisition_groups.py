@@ -130,8 +130,11 @@ def test_process_run_includes_acquisition_group_id(tmp_path: Path) -> None:
         settings,
     )
     assert response["ok"] is True
-    index = json.loads((settings.data_dir / "processes" / "index" / "runs.json").read_text(encoding="utf-8"))
-    latest = index["entries"][-1]
+    # Runs live in the catalog now, not in processes/index/runs.json, which is
+    # only a mirror refreshed on rebuild. Read them through the public accessor.
+    from vision_3d_acquisition.processing.status_index import load_process_entries
+
+    latest = load_process_entries(settings.data_dir)[-1]
     assert latest["acquisition_group_id"] == group["id"]
 
 

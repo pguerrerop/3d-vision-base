@@ -171,7 +171,8 @@ def test_rich_tsv_policy_counts_keep_review_rows_out_of_default_training(tmp_pat
     assert sum(bool(row.get("trainable", False)) for row in memberships) == 156
     assert sum(bool(str(row.get("physical_object_id") or "").strip()) for row in memberships) == 223
     assert len({str(row.get("physical_object_id") or "") for row in memberships if str(row.get("physical_object_id") or "")}) == 42
-    persisted_ml_set = json.loads((settings.data_dir / "datasets" / "dataset_d1" / "ml_sets" / "ml_set_mls_policy" / "ml_set.json").read_text(encoding="utf-8"))
+    # ML sets are rows now, not ml_set.json. Read the stored document.
+    persisted_ml_set = DatasetService(settings.data_dir).get_ml_set("d1", "mls_policy")
     assert persisted_ml_set["membership"]["mode"] == "physical_object_id"
     assert persisted_ml_set["membership_mode"] == "physical_object_id"
     assert persisted_ml_set["membership_count"] == 223

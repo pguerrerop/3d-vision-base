@@ -191,10 +191,44 @@ def test_changed_result_reprojects_only_that_take(
     )
 
 
-def test_metadata_edit_outside_the_take_dir_invalidates_the_row(
+def test_a_metadata_edit_reaches_the_index_immediately(
     catalog_settings: ApiSettings, catalog_conn: sqlite3.Connection, write_take
 ) -> None:
-    """Labels live under data/datasets/, so mtimes on the take dir never move."""
+    """upsert_take_metadata pushes: no rebuild needed for the edit to be visible."""
+    write_take("take_a")
+    service = DatasetService(catalog_settings.data_dir)
+    service.create_dataset(dataset_id="demo", name="Demo")
+    service.create_session(dataset_id="demo", session_id="s1", name="Session 1")
+    service.upsert_take_metadata(
+        take_id="take_a", dataset_id="demo", session_id="s1", updates={"tags": ["one"]}
+    )
+    _indexer(catalog_settings, catalog_conn).rebuild(full=True)
+
+    service.upsert_take_metadata(
+        take_id="take_a", dataset_id="demo", session_id="s1", updates={"tags": ["one", "two"]}
+    )
+
+    summary = json.loads(
+        catalog_conn.execute("SELECT summary_json FROM take_index").fetchone()["summary_json"]
+    )
+    assert summary["tags"] == ["one", "two"]
+    assert [
+        row[0]
+        for row in catalog_conn.execute(
+            "SELECT value FROM take_label WHERE take_id='take_a' AND kind='tag' ORDER BY value"
+        )
+    ] == ["one", "two"]
+
+
+def test_a_missed_push_is_still_caught_by_the_rebuild(
+    catalog_settings: ApiSettings, catalog_conn: sqlite3.Connection, write_take, monkeypatch
+) -> None:
+    """Labels live under data/datasets/, so mtimes on the take dir never move.
+
+    The push is the fast path, not the guarantee: with it disabled the edit still
+    has to be picked up, because that is what stops a missed hook from turning
+    into permanent drift.
+    """
     write_take("take_a")
     service = DatasetService(catalog_settings.data_dir)
     service.create_dataset(dataset_id="demo", name="Demo")
@@ -205,9 +239,12 @@ def test_metadata_edit_outside_the_take_dir_invalidates_the_row(
     indexer = _indexer(catalog_settings, catalog_conn)
     indexer.rebuild(full=True)
 
+    monkeypatch.setenv("SENSOR_STUDIO_INDEX", "off")
     service.upsert_take_metadata(
         take_id="take_a", dataset_id="demo", session_id="s1", updates={"tags": ["one", "two"]}
     )
+    monkeypatch.delenv("SENSOR_STUDIO_INDEX")
+
     report = indexer.rebuild()
 
     assert report.takes_projected == 1
@@ -252,50 +289,50 @@ def test_deleted_take_is_dropped_from_the_index(
 # -------------------------------------------------------------------- drift
 
 
-def test_duplicate_take_metadata_is_recorded_instead_of_dropped(
+def test_migrating_duplicate_sidecars_keeps_one_and_records_the_rest(
     catalog_settings: ApiSettings, catalog_conn: sqlite3.Connection, write_take
 ) -> None:
-    """Legacy drift on disk: the API shows one copy, the index records both.
+    """The one-shot import is the only way a duplicate can still show up.
 
-    DatasetService can no longer produce this state — see
-    tests/test_take_sidecar_canonicalization.py — so the second sidecar is
-    written directly, the way the pre-fix bulk move left it on disk.
+    On disk a take could carry a sidecar under two sessions at once. take_id is
+    a primary key, so the state is unrepresentable in the catalog: the import
+    keeps the first membership — the one the filesystem resolution surfaced — and
+    records the loser rather than dropping it silently.
     """
+    from vision_3d_acquisition.storage import catalog_sync
+
     write_take("take_a")
-    service = DatasetService(catalog_settings.data_dir)
-    service.create_dataset(dataset_id="demo", name="Demo")
-    service.create_session(dataset_id="demo", session_id="s1", name="Session 1")
-    service.create_session(dataset_id="demo", session_id="s2", name="Session 2")
-    service.upsert_take_metadata(
-        take_id="take_a", dataset_id="demo", session_id="s1", updates={"tags": ["from_s1"]}
-    )
-    stray = (
-        catalog_settings.datasets_dir
-        / "dataset_demo"
-        / "sessions"
-        / "session_s2"
-        / "takes"
-        / "take_a"
-        / "metadata.json"
-    )
-    stray.parent.mkdir(parents=True, exist_ok=True)
-    stray.write_text(
-        json.dumps({"take_id": "take_a", "dataset_id": "demo", "session_id": "s2", "tags": ["from_s2"]}),
+    datasets_dir = catalog_settings.datasets_dir
+    (datasets_dir / "dataset_demo").mkdir(parents=True, exist_ok=True)
+    (datasets_dir / "dataset_demo" / "dataset.json").write_text(
+        json.dumps({"id": "demo", "name": "Demo", "created_at": "2026-05-01T00:00:00Z"}),
         encoding="utf-8",
     )
+    for session_id, tag in (("s1", "from_s1"), ("s2", "from_s2")):
+        session_dir = datasets_dir / "dataset_demo" / "sessions" / f"session_{session_id}"
+        (session_dir).mkdir(parents=True, exist_ok=True)
+        (session_dir / "session.json").write_text(
+            json.dumps({"id": session_id, "dataset_id": "demo", "created_at": "2026-05-01T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        take_dir = session_dir / "takes" / "take_a"
+        take_dir.mkdir(parents=True, exist_ok=True)
+        (take_dir / "metadata.json").write_text(
+            json.dumps(
+                {"take_id": "take_a", "dataset_id": "demo", "session_id": session_id, "tags": [tag]}
+            ),
+            encoding="utf-8",
+        )
 
-    report = _indexer(catalog_settings, catalog_conn).rebuild(full=True)
+    counts = catalog_sync.ensure_documents_migrated(catalog_settings.data_dir)
 
-    assert report.take_metadata == 1
-    assert report.take_metadata_conflicts == 1
+    assert counts["takes"] == 1
+    assert catalog_conn.execute("SELECT count(*) FROM take_metadata").fetchone()[0] == 1
     conflict = catalog_conn.execute("SELECT take_id, session_id FROM take_metadata_conflict").fetchone()
     assert conflict["take_id"] == "take_a"
 
-    # Whichever copy the index kept, it is the one the API resolves to.
-    resolved = catalog_conn.execute(
-        "SELECT session_id FROM take_metadata WHERE take_id = 'take_a'"
-    ).fetchone()["session_id"]
-    assert resolved == service.resolve_take_membership("take_a")[1]
+    service = DatasetService(catalog_settings.data_dir)
+    assert len(service.resolve_all_take_memberships("take_a")) == 1
 
 
 def test_process_runs_are_projected_from_the_run_index(
@@ -322,9 +359,10 @@ def test_process_runs_are_projected_from_the_run_index(
     assert (row["take_id"], row["pipeline_family"], row["status"]) == ("take_a", "2d", "success")
 
 
-def test_new_run_invalidates_the_take_row(
+def test_a_new_run_reaches_the_index_immediately(
     catalog_settings: ApiSettings, catalog_conn: sqlite3.Connection, write_take
 ) -> None:
+    """append_process_run_index pushes the take it touched."""
     from vision_3d_acquisition.processing.status_index import append_process_run_index
 
     write_take("take_a")
@@ -341,12 +379,14 @@ def test_new_run_invalidates_the_take_row(
         run_dir=catalog_settings.data_dir / "processes" / "runs" / "pipeline_1" / "run_1",
         created_at="2026-05-19T11:00:00Z",
     )
-    report = indexer.rebuild()
 
-    assert report.takes_projected == 1
     assert (
         catalog_conn.execute(
             "SELECT latest_run_status FROM take_index WHERE take_id = 'take_a'"
         ).fetchone()[0]
         == "success"
     )
+    assert catalog_conn.execute("SELECT count(*) FROM process_run").fetchone()[0] == 1
+
+    # And the pushed row is not left looking stale to the next rebuild.
+    assert indexer.rebuild().takes_projected == 0

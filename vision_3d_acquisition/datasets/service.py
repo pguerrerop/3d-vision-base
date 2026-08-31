@@ -48,24 +48,32 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _documents(data_dir: Path):
+    """The document backend. SQLite unless SENSOR_STUDIO_INDEX turns it off."""
+    from vision_3d_acquisition.datasets.documents import FilesystemDocuments
+    from vision_3d_acquisition.storage import catalog_sync
+
+    if not catalog_sync.index_enabled():
+        return FilesystemDocuments(data_dir)
+
+    from vision_3d_acquisition.storage.dataset_store import SqlDocuments
+
+    catalog_sync.ensure_documents_migrated(data_dir)
+    return SqlDocuments(data_dir)
+
+
 class DatasetService:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.datasets_dir = data_dir / "datasets"
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
+        self.docs = _documents(data_dir)
 
     def list_datasets(self) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        for folder in self.datasets_dir.glob("dataset_*"):
-            if not folder.is_dir():
-                continue
-            payload = _read_json(folder / "dataset.json")
-            if payload:
-                items.append(payload)
-        return sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return self.docs.list_datasets()
 
     def get_dataset(self, dataset_id: str) -> dict[str, Any] | None:
-        return _read_json(self._dataset_dir(dataset_id) / "dataset.json")
+        return self.docs.read_dataset(dataset_id)
 
     def create_dataset(self, *, name: str, description: str | None = None, tags: list[str] | None = None, notes: str | None = None, dataset_id: str | None = None) -> dict[str, Any]:
         did = dataset_id or _slug(name)
@@ -77,7 +85,7 @@ class DatasetService:
             "tags": tags or [],
             "notes": notes,
         }
-        _write_json(self._dataset_dir(did) / "dataset.json", payload)
+        self.docs.write_dataset(did, payload)
         return payload
 
     def update_dataset(self, dataset_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
@@ -85,26 +93,14 @@ class DatasetService:
         if not current:
             return None
         merged = {**current, **{k: v for k, v in updates.items() if v is not None or k == "notes"}}
-        _write_json(self._dataset_dir(dataset_id) / "dataset.json", merged)
+        self.docs.write_dataset(dataset_id, merged)
         return merged
 
     def list_sessions(self, dataset_id: str | None = None) -> list[dict[str, Any]]:
-        sessions: list[dict[str, Any]] = []
-        datasets = [dataset_id] if dataset_id else [item.get("id") for item in self.list_datasets()]
-        for did in datasets:
-            if not isinstance(did, str) or not did:
-                continue
-            sessions_dir = self._dataset_dir(did) / "sessions"
-            if not sessions_dir.is_dir():
-                continue
-            for folder in sessions_dir.glob("session_*"):
-                payload = _read_json(folder / "session.json")
-                if payload:
-                    sessions.append(payload)
-        return sorted(sessions, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return self.docs.list_sessions(dataset_id)
 
     def get_session(self, dataset_id: str, session_id: str) -> dict[str, Any] | None:
-        return _read_json(self._session_dir(dataset_id, session_id) / "session.json")
+        return self.docs.read_session(dataset_id, session_id)
 
     def create_session(
         self,
@@ -141,7 +137,7 @@ class DatasetService:
             "session_type": resolved_session_type,
             "metadata": session_metadata,
         }
-        _write_json(self._session_dir(dataset_id, sid) / "session.json", payload)
+        self.docs.write_session(dataset_id, sid, payload)
         return payload
 
     def create_ml_set(
@@ -173,13 +169,11 @@ class DatasetService:
             "updated_at": now,
             "notes": notes,
         }
-        _write_json(self._ml_set_dir(dataset_id, ml_set_id) / "ml_set.json", payload)
-        if not (self._ml_set_dir(dataset_id, ml_set_id) / "memberships.json").is_file():
-            _write_json(self._ml_set_dir(dataset_id, ml_set_id) / "memberships.json", {"memberships": []})
+        self.docs.write_ml_set(dataset_id, ml_set_id, payload)
         return payload
 
     def get_ml_set(self, dataset_id: str, ml_set_id: str) -> dict[str, Any] | None:
-        return _read_json(self._ml_set_dir(dataset_id, ml_set_id) / "ml_set.json")
+        return self.docs.read_ml_set(dataset_id, ml_set_id)
 
     def resolve_ml_set(self, *, ml_set_id: str, dataset_id: str | None = None) -> dict[str, Any]:
         if dataset_id:
@@ -205,19 +199,13 @@ class DatasetService:
         for did in datasets:
             if not did:
                 continue
-            ml_sets_dir = self._dataset_dir(did) / "ml_sets"
-            if not ml_sets_dir.is_dir():
-                continue
-            for folder in ml_sets_dir.glob("ml_set_*"):
-                if not folder.is_dir():
-                    continue
-                payload = _read_json(folder / "ml_set.json")
-                if payload:
-                    memberships = self.list_ml_set_memberships(dataset_id=did, ml_set_id=str(payload.get("id") or "")) if str(payload.get("id") or "") else []
-                    items.append({
-                        **payload,
-                        **self.summarize_ml_set_memberships(payload, memberships),
-                    })
+            for payload in self.docs.list_ml_sets(did):
+                ml_set_id = str(payload.get("id") or "")
+                memberships = self.list_ml_set_memberships(dataset_id=did, ml_set_id=ml_set_id) if ml_set_id else []
+                items.append({
+                    **payload,
+                    **self.summarize_ml_set_memberships(payload, memberships),
+                })
         return sorted(items, key=lambda item: str(item.get("created_at") or ""), reverse=True)
 
     @staticmethod
@@ -276,7 +264,7 @@ class DatasetService:
     def list_ml_set_memberships(self, *, dataset_id: str, ml_set_id: str) -> list[dict[str, Any]]:
         if self.get_ml_set(dataset_id, ml_set_id) is None:
             raise ValueError(f"unknown ml set: {dataset_id}/{ml_set_id}")
-        payload = _read_json(self._ml_set_dir(dataset_id, ml_set_id) / "memberships.json") or {}
+        payload = {"memberships": self.docs.read_memberships(dataset_id, ml_set_id)}
         rows = payload.get("memberships")
         if not isinstance(rows, list):
             return []
@@ -384,9 +372,8 @@ class DatasetService:
             }
             next_rows.append(result_row)
 
-        _write_json(
-            self._ml_set_dir(dataset_id, ml_set_id) / "memberships.json",
-            {"memberships": sorted(next_rows, key=lambda item: str(item.get("take_id") or ""))},
+        self.docs.write_memberships(
+            dataset_id, ml_set_id, sorted(next_rows, key=lambda item: str(item.get("take_id") or ""))
         )
         return {"status": "updated" if updated else "added", "membership": result_row}
 
@@ -539,7 +526,7 @@ class DatasetService:
         next_rows = [item for item in memberships if str(item.get("take_id") or "") != take_id]
         if len(next_rows) == len(memberships):
             return False
-        _write_json(self._ml_set_dir(dataset_id, ml_set_id) / "memberships.json", {"memberships": next_rows})
+        self.docs.write_memberships(dataset_id, ml_set_id, next_rows)
         return True
 
     def assign_ml_set_splits(
@@ -662,9 +649,10 @@ class DatasetService:
                     copied["split"] = split_by_take[take_id]
                     copied["updated_at"] = now
                 next_rows.append(copied)
-            _write_json(
-                self._ml_set_dir(resolved_dataset_id, ml_set_id) / "memberships.json",
-                {"memberships": sorted(next_rows, key=lambda item: str(item.get("take_id") or ""))},
+            self.docs.write_memberships(
+                resolved_dataset_id,
+                ml_set_id,
+                sorted(next_rows, key=lambda item: str(item.get("take_id") or "")),
             )
 
         return {
@@ -904,7 +892,7 @@ class DatasetService:
         if "session_type" in updates and updates["session_type"] not in SESSION_TYPES:
             updates["session_type"] = current.get("session_type") or "engineering"
         merged = {**current, **{k: v for k, v in updates.items() if v is not None or k == "notes"}}
-        _write_json(self._session_dir(dataset_id, session_id) / "session.json", merged)
+        self.docs.write_session(dataset_id, session_id, merged)
         return merged
 
     def resolve_take_membership(self, take_id: str) -> tuple[str | None, str | None]:
@@ -915,20 +903,14 @@ class DatasetService:
         return None, None
 
     def resolve_all_take_memberships(self, take_id: str) -> list[tuple[str, str]]:
-        rows: list[tuple[str, str]] = []
-        for dataset in self.list_datasets():
-            did = str(dataset.get("id") or "")
-            if not did:
-                continue
-            sessions_dir = self._dataset_dir(did) / "sessions"
-            if not sessions_dir.is_dir():
-                continue
-            for session_folder in sessions_dir.glob("session_*"):
-                sid = session_folder.name.replace("session_", "", 1)
-                take_folder = session_folder / "takes" / take_id
-                if take_folder.is_dir():
-                    rows.append((did, sid))
-        return rows
+        """Every dataset/session the take is filed under.
+
+        On the catalog this is a primary key lookup returning at most one row.
+        On the filesystem it walks datasets x sessions and can return several,
+        which is the shape that let 421 takes carry two sidecars with different
+        labels and show whichever one glob happened to yield first.
+        """
+        return self.docs.take_memberships(take_id)
 
     def update_take_session_id(
         self,
@@ -959,7 +941,7 @@ class DatasetService:
         # upsert_take_metadata already pruned the stale sidecars; this keeps the
         # guarantee explicit at the point a caller asks for a move.
         self.prune_stale_take_sidecars(
-            take_id, keep=self._session_dir(dataset_id, new_session_id) / "takes" / take_id
+            take_id, keep=(dataset_id, new_session_id)
         )
 
         return updated
@@ -1081,8 +1063,7 @@ class DatasetService:
         updates: dict[str, Any],
         source_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        take_path = self._session_dir(dataset_id, session_id) / "takes" / take_id / "metadata.json"
-        existing = _read_json(take_path)
+        existing = self.docs.read_take(dataset_id, session_id, take_id)
         if existing is None:
             # Filing the take under a session it has not been filed under before.
             # Carry over whatever it already had rather than starting from the
@@ -1092,30 +1073,33 @@ class DatasetService:
         resolved_dataset = updates["dataset_id"] if "dataset_id" in updates else dataset_id
         resolved_session = updates["session_id"] if "session_id" in updates else session_id
         merged = {**existing, **updates, "take_id": take_id, "dataset_id": resolved_dataset, "session_id": resolved_session}
-        _write_json(take_path, merged)
-        self.prune_stale_take_sidecars(take_id, keep=take_path.parent)
+        self.docs.write_take(resolved_dataset, resolved_session, take_id, merged)
+        self.prune_stale_take_sidecars(take_id, keep=(resolved_dataset, resolved_session))
+
+        from vision_3d_acquisition.storage import catalog_sync  # noqa: WPS433 - avoids an import cycle
+
+        catalog_sync.refresh_take(self.data_dir, take_id)
         return merged
 
-    def prune_stale_take_sidecars(self, take_id: str, *, keep: Path) -> list[str]:
-        """Enforce one sidecar per take: remove every copy other than ``keep``.
+    def prune_stale_take_sidecars(self, take_id: str, *, keep: tuple[str, str]) -> list[str]:
+        """Enforce one record per take: remove every copy other than ``keep``.
 
-        Membership resolves by taking the first hit while iterating datasets and
-        sessions, so a second sidecar does not merely waste space, it makes the
-        take's labels depend on directory iteration order.
+        Redundant against the catalog, where take_id is a primary key. It still
+        runs because the filesystem backend can represent the state, and that is
+        exactly where a take's labels came to depend on iteration order.
         """
         removed: list[str] = []
         for did, sid in self.resolve_all_take_memberships(take_id):
-            stale = self._session_dir(did, sid) / "takes" / take_id
-            if stale == keep or not stale.exists():
+            if (did, sid) == tuple(keep):
                 continue
-            shutil.rmtree(stale, ignore_errors=True)
-            removed.append(str(stale))
+            if self.docs.delete_take(did, sid, take_id):
+                removed.append(f"{did}/{sid}/{take_id}")
         return removed
 
     def load_take_metadata(self, *, take_id: str, source_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         did, sid = self.resolve_take_membership(take_id)
         if did and sid:
-            payload = _read_json(self._session_dir(did, sid) / "takes" / take_id / "metadata.json")
+            payload = self.docs.read_take(did, sid, take_id)
             if payload:
                 payload.setdefault("dataset_id", did)
                 payload.setdefault("session_id", sid)
@@ -1161,39 +1145,20 @@ class DatasetService:
         }
 
     def iter_dataset_takes(self, dataset_id: str, *, session_id: str | None = None) -> list[tuple[str, str, dict[str, Any]]]:
-        sessions = [session_id] if session_id else [str(item.get("id") or "") for item in self.list_sessions(dataset_id=dataset_id)]
-        rows: list[tuple[str, str, dict[str, Any]]] = []
-        for sid in sessions:
-            if not sid:
-                continue
-            takes_dir = self._session_dir(dataset_id, sid) / "takes"
-            if not takes_dir.is_dir():
-                continue
-            for child in sorted(takes_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                take_id = child.name
-                payload = _read_json(child / "metadata.json") or self.default_take_metadata(take_id, source_metadata={"session_id": sid})
-                rows.append((sid, take_id, payload))
-        return rows
+        return self.docs.iter_dataset_takes(dataset_id, session_id)
 
     def visible_take_counts_by_session(self, dataset_id: str, *, include_archived: bool = False) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for session in self.list_sessions(dataset_id=dataset_id):
-            sid = str(session.get("id") or "")
-            if not sid:
+        counts: dict[str, int] = {
+            str(session.get("id") or ""): 0
+            for session in self.list_sessions(dataset_id=dataset_id)
+            if str(session.get("id") or "")
+        }
+        for sid, _take_id, payload in self.docs.iter_dataset_takes(dataset_id):
+            if sid not in counts:
                 continue
-            counts[sid] = 0
-            takes_dir = self._session_dir(dataset_id, sid) / "takes"
-            if not takes_dir.is_dir():
+            if not include_archived and bool(payload.get("archived")):
                 continue
-            for child in takes_dir.iterdir():
-                if not child.is_dir():
-                    continue
-                payload = _read_json(child / "metadata.json") or {}
-                if not include_archived and bool(payload.get("archived")):
-                    continue
-                counts[sid] += 1
+            counts[sid] += 1
         return counts
 
     def label_summary(self, dataset_id: str) -> dict[str, Any]:
@@ -1282,8 +1247,7 @@ class DatasetService:
         if not updated:
             next_annotations.append(incoming)
         payload["object_annotations"] = next_annotations
-        take_path = self._session_dir(dataset_id, session_id) / "takes" / take_id / "metadata.json"
-        _write_json(take_path, payload)
+        self.docs.write_take(dataset_id, session_id, take_id, payload)
         return incoming
 
     def match_object_annotations(
