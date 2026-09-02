@@ -1113,7 +1113,10 @@ class ValidationService:
         for case in suite["cases"]:
             if not case.get("enabled", True):
                 continue
-            for baseline_id in case.get("baseline_ids") or []:
+            # Coverage reflects what the case is actually configured to resolve to
+            # (active/pinned/allowed_versions), not every baseline it has ever been
+            # attached to. A case pinned to v1 must not also count v2 and v3.
+            for baseline_id in self._case_baselines(case):
                 baseline = self.get_baseline(str(baseline_id))
                 area = str((baseline or {}).get("stage_id") or "unknown")
                 row = areas.setdefault(
@@ -1409,22 +1412,29 @@ class ValidationService:
             }
             for index, stage in enumerate(stage_order)
         ]
+        # get_baseline() reads baseline.json from disk. The naive version of this
+        # loop called it once per (case, column, comparison) -- for a suite with
+        # even a modest number of cases that is hundreds of redundant reads of
+        # the same handful of baselines. A comparison's baseline is fixed, so
+        # fetch each one exactly once and group by stage_id instead.
+        baseline_cache: dict[str, dict[str, Any]] = {}
+
+        def _cached_baseline(baseline_id: str) -> dict[str, Any]:
+            if baseline_id not in baseline_cache:
+                baseline_cache[baseline_id] = self.get_baseline(baseline_id) or {}
+            return baseline_cache[baseline_id]
+
         rows = []
         for case in execution.get("cases") or []:
             comparisons = [x for x in case.get("comparisons") or [] if isinstance(x, dict)]
+            by_stage: dict[str, list[dict[str, Any]]] = {}
+            for comparison in comparisons:
+                baseline_id = str((comparison.get("baseline_ref") or {}).get("baseline_id") or "")
+                stage_id = _cached_baseline(baseline_id).get("stage_id")
+                by_stage.setdefault(str(stage_id), []).append(comparison)
             cells = []
             for column in columns:
-                matches = [
-                    x
-                    for x in comparisons
-                    if (
-                        self.get_baseline(
-                            str((x.get("baseline_ref") or {}).get("baseline_id")) or ""
-                        )
-                        or {}
-                    ).get("stage_id")
-                    == column["stage_id"]
-                ]
+                matches = by_stage.get(column["stage_id"], [])
                 statuses = [str(x.get("status")) for x in matches]
                 status = next(
                     (
@@ -1670,11 +1680,23 @@ class ValidationService:
             return [str(x) for x in resolution.get("allowed_baseline_ids") or []]
         # Legacy cases are active mode. Preserve each artifact identity while
         # resolving the latest explicitly active version.
+        #
+        # baseline_ids is set once at add_case time and never pruned when the
+        # resolution mode later changes, so it can legitimately hold several
+        # versions of the same family (e.g. a case first configured with
+        # allowed_versions=[v1, v2], later switched to active). Two configured
+        # ids from the same family resolve to the same active sibling, so the
+        # raw per-id loop below can yield the same baseline twice; that
+        # duplicate would double-count in coverage() and re-run the same
+        # comparison in execute_suite(). Dedupe by resolved id, keeping order.
         resolved = []
+        seen: set[str] = set()
         for baseline_id in configured:
             baseline = self.get_baseline(baseline_id)
             if not baseline:
-                resolved.append(baseline_id)
+                if baseline_id not in seen:
+                    resolved.append(baseline_id)
+                    seen.add(baseline_id)
                 continue
             siblings = [
                 b
@@ -1685,15 +1707,14 @@ class ValidationService:
                 and b.get("artifact_id") == baseline.get("artifact_id")
                 and b.get("stage_id") == baseline.get("stage_id")
             ]
-            resolved.append(
-                str(
-                    (
-                        max(siblings, key=lambda x: int(x.get("version", 0)))
-                        if siblings
-                        else baseline
-                    ).get("id")
+            resolved_id = str(
+                (max(siblings, key=lambda x: int(x.get("version", 0))) if siblings else baseline).get(
+                    "id"
                 )
             )
+            if resolved_id not in seen:
+                resolved.append(resolved_id)
+                seen.add(resolved_id)
         return resolved
 
     def execute_suite(self, suite_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
