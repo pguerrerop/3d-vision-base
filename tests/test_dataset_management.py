@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 
 from vision_3d_acquisition.api.filesystem import get_take_detail, list_takes, list_takes_paged
-from vision_3d_acquisition.api.main import dataset_sessions, update_take_metadata
+from vision_3d_acquisition.api.main import (
+    DatasetSessionRequest,
+    dataset_sessions,
+    update_dataset_session,
+    update_take_metadata,
+)
 from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.datasets import DatasetService
 
@@ -437,3 +442,64 @@ def test_the_sessions_endpoint_reports_both_counts(tmp_path: Path) -> None:
     sessions = dataset_sessions("d", settings=settings)
 
     assert [(s.id, s.take_count, s.validated_take_count) for s in sessions] == [("s1", 1, 1)]
+
+
+def test_updating_a_session_returns_its_take_counts(tmp_path: Path) -> None:
+    """update_dataset_session called an undefined _dataset_session_take_count
+
+    on every request — the function never existed in this module — so this
+    endpoint raised NameError unconditionally. No test exercised it.
+    """
+    settings = make_settings(tmp_path / "data")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="d", name="D")
+    service.create_session(dataset_id="d", session_id="s1", name="S1")
+    write_take(settings.data_dir, "take_a")
+    service.upsert_take_metadata(
+        take_id="take_a", dataset_id="d", session_id="s1", updates={"validation_status": "valid"}
+    )
+
+    result = update_dataset_session(
+        "d", "s1", DatasetSessionRequest(name="S1 renamed"), settings
+    )
+
+    assert result.name == "S1 renamed"
+    assert result.take_count == 1
+    assert result.validated_take_count == 1
+
+
+def test_label_summary_covers_the_whole_dataset_including_class_distribution(tmp_path: Path) -> None:
+    """Class Distribution and the tag cloud on the Datasets page used to be
+
+    computed client-side over the loaded page of takes, so a dataset larger
+    than one page reported the classes/tags of whichever takes happened to be
+    loaded. label_summary is the dataset-wide aggregate the page now reads
+    from, via /api/datasets/{id}/label-summary.
+    """
+    settings = make_settings(tmp_path / "data")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="d", name="D")
+    service.create_session(dataset_id="d", session_id="s1", name="S1")
+    for take_id, expected_class, tags in (
+        ("take_a", "BALL_GOOD", ["wet"]),
+        ("take_b", "BALL_GOOD", ["wet", "shiny"]),
+        ("take_c", "SCRAP_METAL", []),
+    ):
+        write_take(settings.data_dir, take_id)
+        service.upsert_take_metadata(
+            take_id=take_id,
+            dataset_id="d",
+            session_id="s1",
+            updates={"expected_class": expected_class, "tags": tags},
+        )
+    # No expected_class and no normalized_class: falls into "unassigned",
+    # matching the precedence the frontend used to apply client-side.
+    write_take(settings.data_dir, "take_d")
+    service.upsert_take_metadata(take_id="take_d", dataset_id="d", session_id="s1", updates={})
+
+    summary = service.label_summary("d")
+
+    assert summary["take_count"] == 4
+    assert summary["class_counts"] == {"BALL_GOOD": 2, "SCRAP_METAL": 1, "unassigned": 1}
+    assert summary["raw_tag_counts"] == {"wet": 2, "shiny": 1}
+

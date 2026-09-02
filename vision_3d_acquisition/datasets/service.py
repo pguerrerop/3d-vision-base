@@ -1186,6 +1186,7 @@ class DatasetService:
         superclass_counts: dict[str, int] = {}
         unmapped_counts: dict[str, int] = {}
         normalization_versions: dict[str, int] = {}
+        class_counts: dict[str, int] = {}
         take_count = 0
         for _sid, _take_id, payload in self.iter_dataset_takes(dataset_id):
             take_count += 1
@@ -1202,6 +1203,15 @@ class DatasetService:
             version = str(payload.get("normalization_version") or "").strip()
             if version:
                 normalization_versions[version] = normalization_versions.get(version, 0) + 1
+            # Same precedence the Datasets page used client-side over one loaded
+            # page: expected_class first, normalized_class as a fallback, else
+            # unassigned. Computed here so the chart covers the whole dataset.
+            class_label = (
+                str(payload.get("expected_class") or "").strip()
+                or str(payload.get("normalized_class") or "").strip()
+                or "unassigned"
+            )
+            class_counts[class_label] = class_counts.get(class_label, 0) + 1
         dominant_version = None
         if normalization_versions:
             dominant_version = sorted(normalization_versions.items(), key=lambda item: (-item[1], item[0]))[0][0]
@@ -1212,6 +1222,7 @@ class DatasetService:
             "semantic_label_counts": dict(sorted(semantic_counts.items(), key=lambda item: (-item[1], item[0]))),
             "superclass_counts": dict(sorted(superclass_counts.items(), key=lambda item: (-item[1], item[0]))),
             "unmapped_tags": dict(sorted(unmapped_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "class_counts": dict(sorted(class_counts.items(), key=lambda item: (-item[1], item[0]))),
             "normalization_version": dominant_version,
             "normalization_versions_seen": normalization_versions,
         }

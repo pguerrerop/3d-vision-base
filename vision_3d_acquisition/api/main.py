@@ -2789,8 +2789,15 @@ def update_dataset_session(dataset_id: str, session_id: str, payload: DatasetSes
     updated = service.update_session(dataset_id, session_id, payload.model_dump(exclude_unset=True))
     if updated is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    take_count = _dataset_session_take_count(settings, dataset_id=dataset_id, session_id=session_id)
-    return DatasetSessionSummary(**updated, take_count=take_count)
+    # _dataset_session_take_count never existed in this module; every call to
+    # this endpoint raised NameError. take_counts_by_session is the same helper
+    # /api/datasets/{id}/sessions uses.
+    counts = service.take_counts_by_session(dataset_id).get(session_id) or {}
+    return DatasetSessionSummary(
+        **updated,
+        take_count=int(counts.get("take_count") or 0),
+        validated_take_count=int(counts.get("validated_take_count") or 0),
+    )
 
 
 @app.get("/api/feature-analytics/features")

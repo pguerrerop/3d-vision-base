@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { api, fileUrl, type DatasetMlSet, type DatasetSessionDetailSummary, type DatasetSessionSummary, type DatasetSummary, type MLSetMemberRow, type MLSetReviewFacetsResponse, type MLSetSummaryResponse, type MaterializeMlIngestionResponse, type PhysicalObjectSummary, type TakeDetail, type TakeSummary } from "../api/client";
+import { api, fileUrl, type DatasetLabelSummary, type DatasetMlSet, type DatasetSessionDetailSummary, type DatasetSessionSummary, type DatasetSummary, type MLSetMemberRow, type MLSetReviewFacetsResponse, type MLSetSummaryResponse, type MaterializeMlIngestionResponse, type PhysicalObjectSummary, type TakeDetail, type TakeSummary } from "../api/client";
 import DatasetSessionDrawer from "../components/datasets/DatasetSessionDrawer";
 import MLSetDetailDrawer from "../components/datasets/MLSetDetailDrawer";
 import PhysicalObjectDetailDrawer from "../components/datasets/PhysicalObjectDetailDrawer";
@@ -131,6 +131,7 @@ function formatObjectFacetLabel(option: NonNullable<MLSetReviewFacetsResponse["o
 export default function DatasetsPage() {
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [sessions, setSessions] = useState<DatasetSessionSummary[]>([]);
+  const [datasetLabelSummary, setDatasetLabelSummary] = useState<DatasetLabelSummary | null>(null);
   const [mlSets, setMlSets] = useState<DatasetMlSet[]>([]);
   const [physicalObjects, setPhysicalObjects] = useState<PhysicalObjectSummary[]>([]);
   const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
@@ -254,6 +255,21 @@ export default function DatasetsPage() {
       }
     }).catch((err: unknown) => setError(err instanceof Error ? err.message : "Failed to load sessions"));
   }, [selectedDataset, selectedSession]);
+
+  useEffect(() => {
+    if (!selectedDataset) {
+      setDatasetLabelSummary(null);
+      return;
+    }
+    // Class Distribution and the tag cloud used to be computed client-side
+    // over `takes`, which only ever holds one page: a 729-take dataset showed
+    // the tags of whichever 50 takes happened to be loaded. This is the same
+    // dataset-wide aggregate /api/datasets/{id}/label-summary already
+    // computed for other consumers.
+    void api.datasetLabelSummary(selectedDataset)
+      .then((summary) => setDatasetLabelSummary(summary))
+      .catch(() => setDatasetLabelSummary(null));
+  }, [selectedDataset]);
 
   useEffect(() => {
     if (!selectedSession) {
@@ -647,8 +663,6 @@ export default function DatasetsPage() {
       splitCoverage: 0,
       splits: Object.fromEntries(splitBuckets.map((bucket) => [bucket, 0])) as Record<SplitBucket, number>,
       sessionCounts: new Map<string, number>(),
-      classes: new Map<string, number>(),
-      tags: new Map<string, number>(),
       recent: [] as TakeSummary[],
     };
     takes.forEach((take) => {
@@ -663,17 +677,19 @@ export default function DatasetsPage() {
         next.splits[split] += 1;
         next.splitCoverage += 1;
       }
-      const classLabel = take.expected_class || take.normalized_class || "unassigned";
-      next.classes.set(classLabel, (next.classes.get(classLabel) ?? 0) + 1);
       const sessionKey = take.experiment_session_name || take.experiment_session_id || "unassigned";
       next.sessionCounts.set(sessionKey, (next.sessionCounts.get(sessionKey) ?? 0) + 1);
-      (take.tags ?? []).forEach((tag) => next.tags.set(tag, (next.tags.get(tag) ?? 0) + 1));
     });
     next.recent = [...takes].sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? ""))).slice(0, 6);
     return next;
   }, [takes]);
 
-  const sortedClassCounts = useMemo(() => [...stats.classes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8), [stats.classes]);
+  // From /api/datasets/{id}/label-summary, over the whole dataset — not from
+  // `stats`, which only ever saw the loaded page.
+  const sortedClassCounts = useMemo(
+    () => Object.entries(datasetLabelSummary?.class_counts ?? {}).slice(0, 8),
+    [datasetLabelSummary],
+  );
   // From the sessions endpoint rather than from `stats`, which only sees the
   // loaded page: the distribution reported the page size for whichever session
   // the page happened to belong to, and nothing for the others.
@@ -686,7 +702,10 @@ export default function DatasetsPage() {
         .slice(0, 8),
     [sessions],
   );
-  const sortedTags = useMemo(() => [...stats.tags.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12), [stats.tags]);
+  const sortedTags = useMemo(
+    () => Object.entries(datasetLabelSummary?.raw_tag_counts ?? {}).slice(0, 12),
+    [datasetLabelSummary],
+  );
   const validatedCount = Number(pagedSummaryCounts?.validation?.validated ?? stats.validated);
   const unreviewedCount = Number(pagedSummaryCounts?.validation?.unreviewed ?? stats.unreviewed);
   const rejectedCount = Number(pagedSummaryCounts?.validation?.rejected ?? stats.rejected);

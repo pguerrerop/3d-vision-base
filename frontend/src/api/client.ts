@@ -1629,6 +1629,18 @@ export interface DatasetSummary {
   take_count?: number;
 }
 
+export interface DatasetLabelSummary {
+  dataset_id: string;
+  take_count: number;
+  raw_tag_counts: Record<string, number>;
+  semantic_label_counts: Record<string, number>;
+  superclass_counts: Record<string, number>;
+  unmapped_tags: Record<string, number>;
+  class_counts: Record<string, number>;
+  normalization_version: string | null;
+  normalization_versions_seen: Record<string, number>;
+}
+
 export interface DatasetSessionSummary {
   id: string;
   dataset_id: string;
@@ -2597,6 +2609,7 @@ export const api = {
   createDataset: (payload: { name: string; notes?: string | null }) =>
     post<DatasetSummary>("/api/datasets", payload),
   datasetSessions: (datasetId: string) => request<DatasetSessionSummary[]>(`/api/datasets/${encodeURIComponent(datasetId)}/sessions`),
+  datasetLabelSummary: (datasetId: string) => request<DatasetLabelSummary>(`/api/datasets/${encodeURIComponent(datasetId)}/label-summary`),
   physicalObjects: (params: { dataset_id: string; normalized_class?: string; superclass?: string; session_id?: string; needs_review?: boolean }) => {
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([key, value]) => {
