@@ -44,11 +44,9 @@ class PhysicalObjectRegistry:
         needs_review: bool | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        objects_dir = self._objects_dir(dataset_id)
-        if not objects_dir.is_dir():
-            return []
-        for folder in sorted(objects_dir.glob("physical_object_*")):
-            payload = _read_json(folder / "physical_object.json")
+        # Through the document backend: physical objects are rows, and globbing
+        # data/datasets/ returned nothing once the documents moved.
+        for payload in self.dataset_service.docs.list_physical_objects(dataset_id):
             if not payload:
                 continue
             if normalized_class and str(payload.get("normalized_class") or "") != normalized_class:
@@ -63,7 +61,7 @@ class PhysicalObjectRegistry:
         return rows
 
     def get_object(self, dataset_id: str, physical_object_id: str) -> dict[str, Any] | None:
-        return _read_json(self._object_dir(dataset_id, physical_object_id) / "physical_object.json")
+        return self.dataset_service.docs.read_physical_object(dataset_id, physical_object_id)
 
     def upsert_object(self, dataset_id: str, physical_object_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         current = self.get_object(dataset_id, physical_object_id) or {
@@ -77,7 +75,7 @@ class PhysicalObjectRegistry:
         merged = {**current, **updates, "physical_object_id": physical_object_id, "dataset_id": dataset_id, "updated_at": _now_iso()}
         source_session_ids = sorted({str(item) for item in (merged.get("source_session_ids") or []) if str(item)})
         merged["source_session_ids"] = source_session_ids
-        _write_json(self._object_dir(dataset_id, physical_object_id) / "physical_object.json", merged)
+        self.dataset_service.docs.write_physical_object(dataset_id, physical_object_id, merged)
         return merged
 
     def sync_from_manifest_rows(self, dataset_id: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

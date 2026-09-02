@@ -1148,8 +1148,25 @@ class DatasetService:
         return self.docs.iter_dataset_takes(dataset_id, session_id)
 
     def visible_take_counts_by_session(self, dataset_id: str, *, include_archived: bool = False) -> dict[str, int]:
-        counts: dict[str, int] = {
-            str(session.get("id") or ""): 0
+        return {
+            sid: counts["take_count"]
+            for sid, counts in self.take_counts_by_session(
+                dataset_id, include_archived=include_archived
+            ).items()
+        }
+
+    def take_counts_by_session(
+        self, dataset_id: str, *, include_archived: bool = False
+    ) -> dict[str, dict[str, int]]:
+        """Takes and validated takes per session, over the whole dataset.
+
+        The session tree used to derive both from whatever page the client had
+        loaded, so a dataset of 729 takes reported 50 in one session and 0 in the
+        rest. Counting server-side is the only way the numbers can be right: the
+        client never holds more than one page.
+        """
+        counts: dict[str, dict[str, int]] = {
+            str(session.get("id") or ""): {"take_count": 0, "validated_take_count": 0}
             for session in self.list_sessions(dataset_id=dataset_id)
             if str(session.get("id") or "")
         }
@@ -1158,7 +1175,9 @@ class DatasetService:
                 continue
             if not include_archived and bool(payload.get("archived")):
                 continue
-            counts[sid] += 1
+            counts[sid]["take_count"] += 1
+            if str(payload.get("validation_status") or "").strip().lower() == "valid":
+                counts[sid]["validated_take_count"] += 1
         return counts
 
     def label_summary(self, dataset_id: str) -> dict[str, Any]:

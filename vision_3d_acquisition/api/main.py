@@ -2270,17 +2270,20 @@ def sessions(settings: ApiSettings = Depends(get_settings)) -> list[dict[str, An
 @app.get("/api/datasets", response_model=list[DatasetSummary])
 def datasets(settings: ApiSettings = Depends(get_settings)) -> list[DatasetSummary]:
     service = DatasetService(settings.data_dir)
-    sessions = service.list_sessions()
     counts: dict[str, dict[str, int]] = {}
-    for session in sessions:
+    for session in service.list_sessions():
         did = str(session.get("dataset_id") or "")
         if not did:
             continue
         counts.setdefault(did, {"session_count": 0, "take_count": 0})
         counts[did]["session_count"] += 1
-        folder = settings.data_dir / "datasets" / f"dataset_{did}" / "sessions" / f"session_{session.get('id')}" / "takes"
-        take_count = len([child for child in folder.iterdir() if child.is_dir()]) if folder.is_dir() else 0
-        counts[did]["take_count"] += take_count
+    for did in list(counts):
+        # Through the service, not by listing directories: takes are rows now,
+        # and counting folders under data/datasets/ reported zero once the
+        # documents moved into the catalog.
+        counts[did]["take_count"] = sum(
+            service.visible_take_counts_by_session(did, include_archived=True).values()
+        )
     payload: list[DatasetSummary] = []
     for dataset in service.list_datasets():
         did = str(dataset.get("id") or "")
@@ -2317,12 +2320,18 @@ def update_dataset(dataset_id: str, payload: DatasetRequest, settings: ApiSettin
 def dataset_sessions(dataset_id: str, settings: ApiSettings = Depends(get_settings)) -> list[DatasetSessionSummary]:
     service = DatasetService(settings.data_dir)
     sessions = service.list_sessions(dataset_id=dataset_id)
-    take_counts = service.visible_take_counts_by_session(dataset_id, include_archived=False)
+    counts = service.take_counts_by_session(dataset_id, include_archived=False)
     payload: list[DatasetSessionSummary] = []
     for item in sessions:
         sid = str(item.get("id") or "")
-        take_count = int(take_counts.get(sid) or 0)
-        payload.append(DatasetSessionSummary(**item, take_count=take_count))
+        session_counts = counts.get(sid) or {}
+        payload.append(
+            DatasetSessionSummary(
+                **item,
+                take_count=int(session_counts.get("take_count") or 0),
+                validated_take_count=int(session_counts.get("validated_take_count") or 0),
+            )
+        )
     return payload
 
 
@@ -2421,9 +2430,9 @@ def create_dataset_ml_set(dataset_id: str, payload: DatasetMlSetRequest, setting
         notes=payload.notes,
         overwrite=False,
     )
-    ml_set_path = settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "ml_sets" / f"ml_set_{did}" / "ml_set.json"
-    existing = read_operations_json(ml_set_path) or {}
-    existing = existing if isinstance(existing, dict) else {}
+    # The ML set is a row; reading and writing the file would drop the semantics
+    # and membership snapshot merged in below.
+    existing = service.get_ml_set(dataset_id, did) or {}
     existing["membership"] = existing.get("membership") or {"mode": "ids", "take_ids": [], "filter_snapshot": {}, "exclude_take_ids": []}
     existing["semantics"] = {
         "source": "manual_bulk_selection",
@@ -2432,7 +2441,7 @@ def create_dataset_ml_set(dataset_id: str, payload: DatasetMlSetRequest, setting
         "notes": payload.notes or "",
     }
     existing["updated_at"] = datetime.now(UTC).isoformat()
-    ml_set_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    service.docs.write_ml_set(dataset_id, did, existing)
     memberships = service.list_ml_set_memberships(dataset_id=dataset_id, ml_set_id=did)
     return {**created, **existing, **service.summarize_ml_set_memberships(existing, memberships)}
 
@@ -2470,9 +2479,7 @@ def add_dataset_ml_set_members(dataset_id: str, ml_set_id: str, payload: Dataset
                 affected_count += 1
         except Exception:
             failed_ids.append(take_id)
-    ml_set_path = settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "ml_sets" / f"ml_set_{ml_set_id}" / "ml_set.json"
-    existing = read_operations_json(ml_set_path) or {}
-    existing = existing if isinstance(existing, dict) else {}
+    existing = service.get_ml_set(dataset_id, ml_set_id) or {}
     existing["membership"] = {
         "mode": "ids" if payload.mode == "ids" else "filter_snapshot",
         "take_ids": target_ids if payload.mode == "ids" else [],
@@ -2480,7 +2487,7 @@ def add_dataset_ml_set_members(dataset_id: str, ml_set_id: str, payload: Dataset
         "exclude_take_ids": list(excluded),
     }
     existing["updated_at"] = datetime.now(UTC).isoformat()
-    ml_set_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    service.docs.write_ml_set(dataset_id, ml_set_id, existing)
     return {
         "ok": True,
         "matched_count": len(candidate_ids),
@@ -3268,10 +3275,10 @@ def permanent_delete_take(take_id: str, payload: PermanentDeleteTakeRequest, set
     service = DatasetService(settings.data_dir)
     dataset_id, session_id = service.resolve_take_membership(take_id)
     if dataset_id and session_id:
-        take_meta_dir = settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "sessions" / f"session_{session_id}" / "takes" / take_id
-        if take_meta_dir.exists():
-            shutil.rmtree(take_meta_dir)
-            deleted.append(str(take_meta_dir))
+        # Through the service: the sidecar is a row, and removing a directory
+        # that no longer exists left the take's metadata behind in the catalog.
+        if service.docs.delete_take(dataset_id, session_id, take_id):
+            deleted.append(f"take_metadata:{dataset_id}/{session_id}/{take_id}")
     if payload.delete_runs:
         index_path = settings.data_dir / "processes" / "index" / "runs.json"
         if index_path.is_file():

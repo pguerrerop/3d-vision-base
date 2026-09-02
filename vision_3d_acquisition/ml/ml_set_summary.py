@@ -583,12 +583,28 @@ class MLSetSummaryService:
         ]
 
     def _export_manifest(self, dataset_id: str, ml_set_id: str) -> dict[str, str]:
-        base = self.settings.data_dir / "datasets" / f"dataset_{dataset_id}" / "ml_sets" / f"ml_set_{ml_set_id}"
         materialized = self.settings.data_dir / "ml_sets" / ml_set_id
+        manifest = materialized / "label_manifest.csv"
+        schema = materialized / "label_schema.json"
         return {
-            "manifest_csv": str((materialized / "label_manifest.csv") if (materialized / "label_manifest.csv").is_file() else (base / "memberships.json")),
-            "label_schema": str((materialized / "label_schema.json") if (materialized / "label_schema.json").is_file() else (base / "ml_set.json")),
+            "manifest_csv": str(manifest) if manifest.is_file() else f"sqlite:ml_set_membership/{dataset_id}/{ml_set_id}",
+            "label_schema": str(schema) if schema.is_file() else f"sqlite:ml_set/{dataset_id}/{ml_set_id}",
         }
+
+    def _memberships_fallback(self, dataset_id: str, ml_set_id: str) -> Path:
+        """Write the stored memberships out so a download has a file to serve.
+
+        The fallback used to point at data/datasets/.../memberships.json. That
+        document is a table now, so the path would dangle; this regenerates it
+        from the catalog next to the materialized artifacts instead.
+        """
+        from vision_3d_acquisition.datasets import DatasetService
+
+        target = self.settings.data_dir / "ml_sets" / ml_set_id / "memberships.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rows = DatasetService(self.settings.data_dir).docs.read_memberships(dataset_id, ml_set_id)
+        target.write_text(json.dumps({"memberships": rows}, indent=2), encoding="utf-8")
+        return target
 
     def _build_split_integrity(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         splits = defaultdict(int)
@@ -684,14 +700,13 @@ class MLSetSummaryService:
 
     def export_file(self, ml_set_id: str, kind: str, dataset_id: str | None = None) -> Path:
         ml_set, resolved_dataset_id = self._resolve_ml_set(ml_set_id, dataset_id)
-        base = self.settings.data_dir / "datasets" / f"dataset_{resolved_dataset_id}" / "ml_sets" / f"ml_set_{ml_set_id}"
         materialized = self.settings.data_dir / "ml_sets" / ml_set_id
         if kind == "manifest":
             candidate = materialized / "label_manifest.csv"
-            return candidate if candidate.is_file() else base / "memberships.json"
+            return candidate if candidate.is_file() else self._memberships_fallback(resolved_dataset_id, ml_set_id)
         if kind == "splits":
             candidate = materialized / "split_manifest.csv"
-            return candidate if candidate.is_file() else base / "memberships.json"
+            return candidate if candidate.is_file() else self._memberships_fallback(resolved_dataset_id, ml_set_id)
         if kind == "label_schema":
             candidate = materialized / "label_schema.json"
             return candidate if candidate.is_file() else base / "ml_set.json"

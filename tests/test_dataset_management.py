@@ -379,3 +379,61 @@ def test_batch_update_take_session_apply_updates_membership(tmp_path: Path) -> N
     assert service.get_session("d1", "s_new") is not None
     assert service.resolve_all_take_memberships("t1") == [("d1", "s_new")]
     assert service.resolve_all_take_memberships("t2") == [("d1", "s_new")]
+
+
+def test_session_counts_cover_the_dataset_not_one_page(tmp_path: Path) -> None:
+    """The session tree used to count whatever page the client had loaded.
+
+    A dataset with more takes than fit on a page reported the page size for the
+    session the page belonged to and zero for every other one. The counts have to
+    come from the server, over the whole dataset.
+    """
+    settings = make_settings(tmp_path / "data")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="d", name="D")
+    service.create_session(dataset_id="d", session_id="s1", name="S1")
+    service.create_session(dataset_id="d", session_id="s2", name="S2")
+    service.create_session(dataset_id="d", session_id="empty", name="Empty")
+
+    for index in range(7):
+        take_id = f"take_s1_{index}"
+        write_take(settings.data_dir, take_id)
+        service.upsert_take_metadata(
+            take_id=take_id,
+            dataset_id="d",
+            session_id="s1",
+            updates={"validation_status": "valid" if index < 3 else "unreviewed"},
+        )
+    for index in range(2):
+        take_id = f"take_s2_{index}"
+        write_take(settings.data_dir, take_id)
+        service.upsert_take_metadata(take_id=take_id, dataset_id="d", session_id="s2", updates={})
+
+    write_take(settings.data_dir, "take_archived")
+    service.upsert_take_metadata(
+        take_id="take_archived", dataset_id="d", session_id="s1", updates={"archived": True}
+    )
+
+    counts = service.take_counts_by_session("d")
+
+    assert counts["s1"] == {"take_count": 7, "validated_take_count": 3}
+    assert counts["s2"] == {"take_count": 2, "validated_take_count": 0}
+    # A session with no takes still has to appear, or the tree drops it.
+    assert counts["empty"] == {"take_count": 0, "validated_take_count": 0}
+    # Archived takes stay out unless asked for, matching the take listing.
+    assert service.take_counts_by_session("d", include_archived=True)["s1"]["take_count"] == 8
+
+
+def test_the_sessions_endpoint_reports_both_counts(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path / "data")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="d", name="D")
+    service.create_session(dataset_id="d", session_id="s1", name="S1")
+    write_take(settings.data_dir, "take_a")
+    service.upsert_take_metadata(
+        take_id="take_a", dataset_id="d", session_id="s1", updates={"validation_status": "valid"}
+    )
+
+    sessions = dataset_sessions("d", settings=settings)
+
+    assert [(s.id, s.take_count, s.validated_take_count) for s in sessions] == [("s1", 1, 1)]

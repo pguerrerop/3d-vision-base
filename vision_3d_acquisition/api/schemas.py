@@ -159,3 +159,4 @@ class DatasetSessionSummary(BaseModel):
     tags: list[str] = Field(default_factory=list)
     notes: str | None = None
     take_count: int = 0
+    validated_take_count: int = 0

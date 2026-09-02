@@ -674,7 +674,18 @@ export default function DatasetsPage() {
   }, [takes]);
 
   const sortedClassCounts = useMemo(() => [...stats.classes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8), [stats.classes]);
-  const sortedSessionCounts = useMemo(() => [...stats.sessionCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8), [stats.sessionCounts]);
+  // From the sessions endpoint rather than from `stats`, which only sees the
+  // loaded page: the distribution reported the page size for whichever session
+  // the page happened to belong to, and nothing for the others.
+  const sortedSessionCounts = useMemo(
+    () =>
+      sessions
+        .map((session) => [session.name || session.id, session.take_count ?? 0] as [string, number])
+        .filter(([, count]) => count > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8),
+    [sessions],
+  );
   const sortedTags = useMemo(() => [...stats.tags.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12), [stats.tags]);
   const validatedCount = Number(pagedSummaryCounts?.validation?.validated ?? stats.validated);
   const unreviewedCount = Number(pagedSummaryCounts?.validation?.unreviewed ?? stats.unreviewed);
@@ -1593,8 +1604,11 @@ export default function DatasetsPage() {
             {showSessionTree && (
               <div className="datasets-session-tree">
                 {sessions.map((session) => {
-                  const sessionTakes = takes.filter((take) => (take.experiment_session_id ?? "") === session.id);
-                  const sessionValid = sessionTakes.filter((take) => take.validation_status === "valid").length;
+                  // Server-side counts, not a filter over `takes`: that array holds
+                  // one page, so a session outside it reported 0 takes and the one
+                  // inside it reported the page size.
+                  const sessionTakeCount = session.take_count ?? 0;
+                  const sessionValid = session.validated_take_count ?? 0;
                   return (
                     <div
                       key={session.id}
@@ -1611,7 +1625,7 @@ export default function DatasetsPage() {
                     >
                       <div className="datasets-session-node-main">
                         <span>{session.name}</span>
-                        <small>{sessionTakes.length} takes · {sessionTakes.length ? Math.round((sessionValid / sessionTakes.length) * 100) : 0}% valid</small>
+                        <small>{sessionTakeCount} takes · {sessionTakeCount ? Math.round((sessionValid / sessionTakeCount) * 100) : 0}% valid</small>
                       </div>
                       <button
                         type="button"

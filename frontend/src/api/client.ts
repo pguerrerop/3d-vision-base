@@ -1645,6 +1645,7 @@ export interface DatasetSessionSummary {
   tags?: string[];
   notes?: string | null;
   take_count?: number;
+  validated_take_count?: number;
 }
 
 export interface FeatureDefinition {
