@@ -659,3 +659,46 @@ def test_impact_route_reports_which_cases_would_follow_an_activation(tmp_path: P
     with pytest.raises(HTTPException) as raised:
         routes.resolution_impact("baseline_does_not_exist", store=store)
     assert raised.value.status_code == 404
+
+
+def test_unmatched_objects_carry_their_identity_not_just_a_position(tmp_path: Path) -> None:
+    """A detail view has to name a missing or added object, not just count it."""
+    store = ValidationService(_settings(tmp_path))
+    left, right = tmp_path / "left.json", tmp_path / "right.json"
+    left.write_text(json.dumps({"objects": [
+        {"object_id": "one", "diameter_mm": 10.0},
+        {"object_id": "gone_missing", "diameter_mm": 12.0},
+    ]}))
+    right.write_text(json.dumps({"objects": [
+        {"object_id": "one", "diameter_mm": 10.1},
+        {"object_id": "newly_added", "diameter_mm": 8.0},
+    ]}))
+    base = {"id": "m", "version": 1, "comparison_policy": {"metrics": {"diameter_mm": {"absolute_tolerance": 5}}}}
+    result = store._measurement_compare(left, right, base, {"artifact_id": "measure"})
+
+    assert result["matching"]["baseline_only"] == [{"index": 1, "object_id": "gone_missing"}]
+    assert result["matching"]["candidate_only"] == [{"index": 1, "object_id": "newly_added"}]
+    assert result["metrics"]["missing_object_count"] == 1
+    assert result["metrics"]["added_object_count"] == 1
+
+
+def test_file_route_serves_diff_artifacts_and_rejects_traversal(tmp_path: Path) -> None:
+    from fastapi import HTTPException
+    from vision_3d_acquisition.api import validation as routes
+
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    case = store.add_case(suite["id"], {"baseline_ids": [v1["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    diff_path = execution["cases"][0]["comparisons"][0]["diff_artifacts"][0]
+
+    served = routes.get_file(diff_path, store=store)
+    assert Path(served.path) == (store.root / diff_path).resolve()
+
+    for attempt in ("../../../etc/passwd", "..%2f..%2fetc/passwd", "", ".", "baselines/../../../../etc/passwd"):
+        with pytest.raises(HTTPException) as raised:
+            routes.get_file(attempt, store=store)
+        assert raised.value.status_code == 404
+
+    with pytest.raises(HTTPException):
+        routes.get_file("baselines/does_not_exist.png", store=store)

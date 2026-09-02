@@ -809,11 +809,16 @@ class ValidationService:
                         }
                     )
                     continue
-            baseline_only.append(li)
+            baseline_only.append({"index": li, "object_id": self._id(row)})
         return {
             "matches": matches,
+            # Carrying the object id, not just the array index, is what lets a
+            # detail view name which object was missing or added rather than
+            # only report a count.
             "baseline_only": baseline_only,
-            "candidate_only": sorted(unmatched_right),
+            "candidate_only": [
+                {"index": ri, "object_id": self._id(right[ri])} for ri in sorted(unmatched_right)
+            ],
             "ambiguous": ambiguous,
             "split_candidates": [],
             "merge_candidates": [],

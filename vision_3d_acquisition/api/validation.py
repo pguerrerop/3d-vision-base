@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from vision_3d_acquisition.api.settings import ApiSettings, get_settings
@@ -45,6 +46,28 @@ def resolution_impact(baseline_id: str, store: ValidationService = Depends(servi
     return _error(lambda: store.resolution_impact(store.get_baseline(baseline_id) or (_ for _ in ()).throw(KeyError(baseline_id))))
 @router.post("/baselines/{baseline_id}/compare")
 def compare(baseline_id: str, candidate_run_id: str, store: ValidationService = Depends(service)): return _error(lambda: store.compare(baseline_id, candidate_run_id=candidate_run_id))
+@router.get("/files/{path:path}")
+def get_file(path: str, store: ValidationService = Depends(service)):
+    """Serve a file stored under the validation root: baseline snapshots and diff artifacts.
+
+    Every path the service hands out (``baseline.snapshot_artifact_path``,
+    entries in ``diff_artifacts``) is already relative to this root, so this is
+    the one place that turns those references into bytes. The traversal guard
+    mirrors ``safe_take_file``: reject any segment that could escape the root,
+    then require the resolved path to still be inside it.
+    """
+    normalized = path.replace("\\", "/").strip("/")
+    if not normalized or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise HTTPException(404, "Unknown validation file")
+    root = (store.root).resolve()
+    candidate = (store.root / normalized).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise HTTPException(404, "Unknown validation file")
+    if not candidate.is_file():
+        raise HTTPException(404, "Unknown validation file")
+    return FileResponse(candidate)
 @router.post("/indexes/rebuild")
 def rebuild_indexes(store: ValidationService = Depends(service)): return store.rebuild_indexes()
 @router.get("/integrity")
