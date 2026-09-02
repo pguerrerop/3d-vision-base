@@ -3329,28 +3329,17 @@ def permanent_delete_take(take_id: str, payload: PermanentDeleteTakeRequest, set
         if service.docs.delete_take(dataset_id, session_id, take_id):
             deleted.append(f"take_metadata:{dataset_id}/{session_id}/{take_id}")
     if payload.delete_runs:
-        index_path = settings.data_dir / "processes" / "index" / "runs.json"
-        if index_path.is_file():
-            try:
-                payload_json = json.loads(index_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload_json = {"entries": []}
-            entries = payload_json.get("entries") if isinstance(payload_json.get("entries"), list) else []
-            next_entries: list[dict[str, Any]] = []
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                if str(entry.get("take_id") or "") == take_id:
-                    path = entry.get("path")
-                    if path:
-                        run_dir = Path(str(path))
-                        if run_dir.exists():
-                            shutil.rmtree(run_dir, ignore_errors=True)
-                            deleted.append(str(run_dir))
-                    continue
-                next_entries.append(entry)
-            payload_json["entries"] = next_entries
-            index_path.write_text(json.dumps(payload_json, indent=2), encoding="utf-8")
+        # Through run_store, not the runs.json mirror: that file is regenerated
+        # from process_run on every full reindex, so editing it directly was
+        # silently undone by the next `index rebuild` and the rows for this
+        # take never left the database.
+        from vision_3d_acquisition.storage.run_store import delete_runs_for_take
+
+        for run_path in delete_runs_for_take(settings.data_dir, take_id):
+            run_dir = Path(run_path)
+            if run_dir.exists():
+                shutil.rmtree(run_dir, ignore_errors=True)
+                deleted.append(str(run_dir))
     return {
         "ok": True,
         "take_id": take_id,

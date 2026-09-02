@@ -143,6 +143,28 @@ def update_run(data_dir: Path, run_id: str, patch: dict[str, Any]) -> list[str]:
     return take_ids
 
 
+def delete_runs_for_take(data_dir: Path, take_id: str) -> list[str]:
+    """Remove every run row for a take. Returns each row's ``path``, if set.
+
+    process_run is authoritative as of stage 2 — permanent_delete_take used to
+    edit the runs.json mirror instead, which is regenerated from this table on
+    every full rebuild, so the edit was undone the next time anyone reindexed
+    and the rows for a "permanently deleted" take stayed in the database
+    forever. The caller still owns removing the run directories on disk; this
+    only removes the rows and hands back what to remove.
+    """
+    conn = _connect(data_dir)
+    with db.transaction(conn):
+        paths = [
+            str(row["path"])
+            for row in conn.execute(
+                "SELECT path FROM process_run WHERE take_id = ? AND path IS NOT NULL", (take_id,)
+            )
+        ]
+        conn.execute("DELETE FROM process_run WHERE take_id = ?", (take_id,))
+    return paths
+
+
 def load_runs(data_dir: Path) -> list[dict[str, Any]]:
     conn = _connect(data_dir)
     return [row_to_entry(row) for row in conn.execute("SELECT * FROM process_run ORDER BY created_at, run_id")]

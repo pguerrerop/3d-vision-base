@@ -17,6 +17,8 @@ from vision_3d_acquisition.api.main import (
 )
 from vision_3d_acquisition.api.settings import ApiSettings
 from vision_3d_acquisition.datasets import DatasetService
+from vision_3d_acquisition.processing.status_index import append_process_run_index
+from vision_3d_acquisition.storage.run_store import runs_for_take
 
 
 def make_settings(data_dir: Path) -> ApiSettings:
@@ -75,6 +77,40 @@ def test_archive_hidden_by_default_and_restore(tmp_path: Path) -> None:
     restore_take("take_archive", settings)
     restored = list_takes(settings)
     assert any(item.take_id == "take_archive" for item in restored)
+
+
+def test_permanent_delete_removes_process_run_rows(tmp_path: Path) -> None:
+    """delete_runs used to edit the runs.json mirror, which a full reindex
+
+    regenerates from process_run — so a "permanently deleted" take's runs
+    silently came back, or rather never actually left the database. This
+    exercises the real path: a run recorded through append_process_run_index,
+    which is how every worker actually writes one.
+    """
+    settings = make_settings(tmp_path / "data")
+    write_take(settings, "take_with_runs")
+    attach_to_dataset(settings, "take_with_runs")
+    run_dir = settings.data_dir / "processes" / "runs" / "pipeline_1" / "run_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "result.json").write_text("{}", encoding="utf-8")
+    append_process_run_index(
+        settings.data_dir,
+        take_id="take_with_runs",
+        pipeline_instance_id="pipeline_1",
+        run_id="run_1",
+        pipeline_family="25d",
+        status="success",
+        run_dir=run_dir,
+        created_at="2026-05-20T12:05:00Z",
+    )
+    assert runs_for_take(settings.data_dir, "take_with_runs")
+
+    permanent_delete_take(
+        "take_with_runs", PermanentDeleteTakeRequest(confirmation="take_with_runs"), settings
+    )
+
+    assert runs_for_take(settings.data_dir, "take_with_runs") == []
+    assert not run_dir.exists()
 
 
 def test_permanent_delete_requires_confirmation(tmp_path: Path) -> None:
