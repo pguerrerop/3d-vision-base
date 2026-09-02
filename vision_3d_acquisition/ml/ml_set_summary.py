@@ -606,6 +606,23 @@ class MLSetSummaryService:
         target.write_text(json.dumps({"memberships": rows}, indent=2), encoding="utf-8")
         return target
 
+    def _ml_set_fallback(self, dataset_id: str, ml_set_id: str) -> Path:
+        """Write the stored ml_set document out so a download has a file to serve.
+
+        label_schema/tasks/snapshot used to fall back to a `base` variable that
+        pointed at data/datasets/.../ml_set.json — a leftover from before that
+        document became a row, and no longer assigned anywhere in this method,
+        so hitting this fallback raised NameError instead of a stale 404. This
+        regenerates the file from the catalog instead.
+        """
+        from vision_3d_acquisition.datasets import DatasetService
+
+        target = self.settings.data_dir / "ml_sets" / ml_set_id / "ml_set.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = DatasetService(self.settings.data_dir).get_ml_set(dataset_id, ml_set_id) or {}
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return target
+
     def _build_split_integrity(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         splits = defaultdict(int)
         group_splits: dict[str, set[str]] = defaultdict(set)
@@ -709,13 +726,13 @@ class MLSetSummaryService:
             return candidate if candidate.is_file() else self._memberships_fallback(resolved_dataset_id, ml_set_id)
         if kind == "label_schema":
             candidate = materialized / "label_schema.json"
-            return candidate if candidate.is_file() else base / "ml_set.json"
+            return candidate if candidate.is_file() else self._ml_set_fallback(resolved_dataset_id, ml_set_id)
         if kind == "tasks":
             candidate = materialized / "tasks.json"
-            return candidate if candidate.is_file() else base / "ml_set.json"
+            return candidate if candidate.is_file() else self._ml_set_fallback(resolved_dataset_id, ml_set_id)
         if kind == "snapshot":
             candidate = materialized / "ml_set.json"
-            return candidate if candidate.is_file() else base / "ml_set.json"
+            return candidate if candidate.is_file() else self._ml_set_fallback(resolved_dataset_id, ml_set_id)
         raise ValueError(f"Unknown export kind: {kind}")
 
 

@@ -224,3 +224,26 @@ def test_ml_set_member_facets_cover_full_scope_counts(tmp_path: Path) -> None:
     membership_counts = {item["value"]: item["count"] for item in facets["membership_statuses"]}
     assert membership_counts["all"] == 3
     assert membership_counts["uncertain"] == 1
+
+
+def test_export_file_falls_back_to_the_catalog_without_materialized_artifacts(tmp_path: Path) -> None:
+    """label_schema/tasks/snapshot used to reference an unassigned `base`
+
+    variable when the materialized file was missing on disk — a leftover from
+    before ml_set.json became a row in the catalog. Every call with nothing
+    materialized yet raised NameError instead of serving anything.
+    """
+    settings = _settings(tmp_path / "data")
+    service = DatasetService(settings.data_dir)
+    service.create_dataset(dataset_id="ds1", name="Dataset 1")
+    service.create_session(dataset_id="ds1", session_id="s1", name="Session 1")
+    service.create_ml_set(dataset_id="ds1", ml_set_id="mls1", name="MLS 1", task_type="classification")
+    _write_take(settings, "t1")
+    service.upsert_take_metadata(take_id="t1", dataset_id="ds1", session_id="s1", updates={}, source_metadata={})
+    service.add_take_to_ml_set(dataset_id="ds1", ml_set_id="mls1", take_id="t1", split="train")
+
+    summary = MLSetSummaryService(settings)
+
+    for kind in ("manifest", "splits", "label_schema", "tasks", "snapshot"):
+        path = summary.export_file("mls1", kind, dataset_id="ds1")
+        assert path.is_file(), f"{kind} did not produce a readable file"
