@@ -101,6 +101,7 @@ tests/
 | `poc` | POC readiness summaries, calibration health, labels, exports | `contracts`, stdlib |
 | `acquisition` | Sources and modes: offline PLY, Harvesters, FTP | `contracts`, `storage`, `utils` |
 | `storage` | Filesystem queue: stage, atomic publish, `READY` | `contracts`, `utils` |
+| `validation` | Approved baselines, regression suites, comparators, promotion | `contracts`, `pipelines`, stdlib |
 | `processing` | Algorithms on takes (future) | `contracts`, `storage` |
 | `state` | Acquisition/processing status files (future) | `contracts`, `utils` |
 | `utils` | IDs, paths, timestamps | stdlib |
@@ -113,6 +114,7 @@ Rules:
 - **poc** — owns operator-facing readiness summaries, dataset labels, validation helpers, and CSV/JSON exports; reads through `datasets`, never opens the catalog itself.
 - **acquisition** — produces takes; calls `storage.AcquisitionPublisher`, never writes `incoming/<id>/` without staging.
 - **storage** — owns queue semantics and the catalog; the only place that creates `.tmp`, renames, and touches `READY` for publishes, and the only place that opens `data/index.db`.
+- **validation** — reads runs through `pipelines.comparison`; writes only under `data/validation/`, never into a take or a run. Baselines are snapshots copied out of the run, so run cleanup cannot invalidate them.
 - **processing** — consumes `incoming/` with `READY`, writes `processed/` (future).
 - **state** — centralizes readers/writers for `data/state/*.json` beyond the minimal publish snapshot (future).
 

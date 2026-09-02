@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -464,7 +465,19 @@ class FeatureJobService:
             self._write_job(updated)
 
     def _write_job(self, record: FeatureJobRecord) -> None:
-        self.paths.job_path(record.id).write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        """Replace the record atomically.
+
+        The worker thread rewrites the job while callers poll its status. A plain
+        write truncates first, so a poll landing in that window read an empty file,
+        failed to parse, and was reported as an unknown job rather than a running
+        one. os.replace swaps the file in one step, so a reader sees either the
+        previous record or the new one.
+        """
+        path = self.paths.job_path(record.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def _read_job(self, path: Path) -> FeatureJobRecord | None:
         if not path.is_file():

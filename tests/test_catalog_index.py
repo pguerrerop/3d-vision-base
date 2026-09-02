@@ -390,3 +390,49 @@ def test_a_new_run_reaches_the_index_immediately(
 
     # And the pushed row is not left looking stale to the next rebuild.
     assert indexer.rebuild().takes_projected == 0
+
+
+def test_opening_many_connections_at_once_never_reports_a_locked_database(tmp_path: Path) -> None:
+    """Concurrent opens must not fail on the journal-mode pragma.
+
+    ``PRAGMA journal_mode=WAL`` needs a brief exclusive lock, and SQLite does not
+    run the busy handler for it: a connection that opens while another holds the
+    file gets SQLITE_BUSY at once. The mode is a property of the file, so losing
+    that race is not a real conflict — the winner sets the mode the loser wanted.
+    Before this was handled, roughly one run in seven of the concurrent append
+    test died here rather than in anything it was written to check.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vision_3d_acquisition.storage import db
+
+    db.close_process_connections()
+
+    def open_and_read(data_dir: Path) -> str:
+        conn = db.connect(data_dir)
+        try:
+            return str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        finally:
+            conn.close()
+
+    # Only the very first opener of a file performs the transition, so the race
+    # exists once per database. Repeat over fresh ones: a single storm caught the
+    # old behaviour about one time in five, which is too weak to guard anything.
+    for attempt in range(16):
+        data_dir = tmp_path / f"data_{attempt}"
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            modes = list(pool.map(lambda _: open_and_read(data_dir), range(12)))
+        assert modes == ["wal"] * 12, f"storm {attempt}: every connection ends up in WAL, none raises"
+
+
+def test_a_connection_can_wait_for_a_write_lock_instead_of_failing(tmp_path: Path) -> None:
+    """busy_timeout has to be in place before any pragma that can block."""
+    from vision_3d_acquisition.storage import db
+
+    data_dir = tmp_path / "data"
+    conn = db.connect(data_dir)
+    try:
+        timeout_ms = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        assert timeout_ms > 0, "a zero busy timeout turns every contended write into an error"
+    finally:
+        conn.close()

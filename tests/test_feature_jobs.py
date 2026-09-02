@@ -286,3 +286,55 @@ def test_feature_job_status_endpoint_shape(monkeypatch, tmp_path: Path) -> None:
     payload = get_feature_job(job_id, settings=settings)
     assert payload["job_id"] == job_id
     assert payload["job"]["feature_key"] == "surface_sphere_fit_rmse_mm"
+
+
+def test_a_job_stays_readable_while_its_worker_rewrites_it(tmp_path: Path) -> None:
+    """Polling a running job must never report it as unknown.
+
+    The worker rewrites the record as it progresses while callers poll status.
+    A plain write truncates the file first, so a poll landing inside that window
+    read nothing, failed to parse, and surfaced as 404 "Unknown feature job" for
+    a job that was running perfectly well.
+    """
+    import threading
+
+    from vision_3d_acquisition.api.feature_jobs import FeatureJobRecord
+
+    settings = _settings(tmp_path / "data")
+    service = FeatureJobService(settings)
+
+    job = FeatureJobRecord(
+        id="fj_concurrent",
+        created_at="2026-05-28T12:00:00Z",
+        status="running",
+        scope="ml_set",
+        dataset_id="d1",
+        ml_set_id="ml_set_1",
+        feature_key="surface_sphere_fit_rmse_mm",
+        feature_display_name="Surface sphere fit RMSE",
+        mode="reprocess",
+        total_takes=1,
+    )
+    service._write_job(job)
+
+    stop = threading.Event()
+    missed: list[str] = []
+
+    def rewrite() -> None:
+        counter = 0
+        while not stop.is_set():
+            counter += 1
+            service._write_job(job.model_copy(update={"completed_takes": counter}))
+
+    writer = threading.Thread(target=rewrite, daemon=True)
+    writer.start()
+    try:
+        for _ in range(400):
+            if service.load_job("fj_concurrent") is None:
+                missed.append("read returned no record while the job existed")
+                break
+    finally:
+        stop.set()
+        writer.join(timeout=5)
+
+    assert missed == [], missed[0] if missed else ""

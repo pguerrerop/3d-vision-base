@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -51,11 +52,34 @@ def connect(data_dir: Path, *, timeout: float = 10.0) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=timeout, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout first: the pragmas below must be able to wait for a lock.
+    conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    _ensure_wal(conn, timeout=timeout)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def _ensure_wal(conn: sqlite3.Connection, *, timeout: float) -> None:
+    """Put the database in WAL, waiting out any connection doing the same.
+
+    The journal mode belongs to the file, not to the connection, so only the
+    first opener performs the transition. SQLite runs no busy handler for a
+    journal_mode change, and while the winner holds the lock even *reading*
+    the mode fails, so a single retry is not enough: wait and look again until
+    the winner is done or the caller's timeout is spent.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                return
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005)
 
 
 @contextmanager

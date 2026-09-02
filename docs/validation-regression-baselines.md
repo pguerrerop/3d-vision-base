@@ -6,43 +6,97 @@ Approving again creates a new version and leaves prior versions immutable. Activ
 
 Suites live in `data/validation/suites`; executions in `data/validation/executions`, with incremental progress. A case connects one take to one or more baseline expectations. The current initial runner evaluates existing candidate runs (`latest` or an explicit run id), preserving all run semantics. Pipeline dispatch/rerun remains owned by the existing processing workflow, which keeps validation free from implicit recipe or run mutation.
 
-Comparators are selected from artifact contracts where supplied, with conservative fallbacks: masks use IoU/Dice/add/remove fractions; numeric rasters use error statistics; JSON-backed plane, measurement, and classification artifacts are initially structural comparisons after unstable run fields are excluded. PNG overlays are `visual_only` and therefore `needs_review`, not failures. Unknown artifacts are `not_comparable`, never pass.
+Statuses have distinct meanings: `pass` is within tolerance; `changed` differs without a failure policy; `regression` violates an expectation; `not_comparable` lacks a compatible semantic contract; `blocked` is invalidated by upstream failure; and `needs_review` is evidence requiring an engineer. Studio owns baseline controls next to artifact review; suite governance and execution belong in the Validation workspace.
 
-Statuses have distinct meanings: `pass` is within tolerance; `changed` differs without a failure policy; `regression` violates an expectation; `not_comparable` lacks a compatible semantic contract; `blocked` is invalidated by upstream failure; and `needs_review` is evidence requiring an engineer. Studio should use baseline controls next to artifact review; suite governance and execution belong in the Validation workspace.
+Initial 2.5D focus is reference support masks, belt plane/residual summaries, authoritative normalized height rasters, final object masks, measurements, classification fields, and quality flags. Overlay rendering is retained as review evidence.
 
-Initial 2.5D focus is reference support masks, belt plane/residual summaries, authoritative normalized height rasters, final object masks, measurements, classification fields, and quality flags. Overlay rendering is retained as review evidence. Future extensions should add per-artifact `validationSpec` metadata (eligibility, comparator, tolerances, unstable/required fields, and downstream blocking) rather than filename-specific batch-runner logic.
+## Choosing a comparator
+
+An artifact resolves to a comparator through progressively weaker evidence, and the decision is recorded on the baseline as `comparator_source` so a reviewer can tell a declared decision from a guessed one:
+
+1. `metadata.comparator` — a stage stating the comparator outright. Nothing overrides it.
+2. `metadata.semantic_type`, mapped through the reviewed `COMPARATOR_BY_SEMANTIC_TYPE` table.
+3. `metadata.role`, where it settles comparability alone (`difference_overlay`, `added_pixels`, `removed_pixels` are `visual_only`).
+4. The artifact `kind` and the on-disk representation: `overlay` is `visual_only`, a `.npy` path is a `numeric_raster`.
+5. Identifier heuristics, kept so nothing approvable stops being approvable, but reported as `heuristic`.
+
+Anything unresolved is `not_comparable` and is skipped at approval time with that source recorded; it never passes. Extend the table rather than the heuristics — an entry there is a reviewed decision. Some declared types are deliberately absent: component id maps are label rasters, and comparing them as binary masks would silently under-report.
+
+Note that `kind` is a closed literal (`image`, `point_cloud`, `table`, `json`, `metric`, `overlay`, `video`, `text`, `file`). It has no `mask`, `raster` or `npy` member, so rules written against those values can never fire.
+
+Masks use IoU/Dice/add/remove fractions and connected-component counts; numeric rasters use error statistics over the mutually finite pixels; JSON-backed plane artifacts are structural comparisons after unstable run fields are excluded.
+
+## Case governance
+
+Cases are managed in `/validation`. The table shows take, enabled state, resolution, tags and notes, with add, edit, enable, disable, remove and history actions per row. Archived suites keep every case visible and disable every action; the service rejects `add_case`, `update_case` and `delete_case` on them.
+
+Removing a case removes suite membership only. Its baselines, source runs and historical executions are all preserved, and the confirmation says so rather than implying deletion.
+
+An edit sends only the fields the user changed. The server preserves omitted fields, so sending a whole record would overwrite anything another session edited meanwhile.
+
+## Baseline resolution
+
+A case resolves its expectations in one of three modes. Legacy cases carry no `baseline_resolution` and behave as `active`.
+
+- **`active`** follows whichever version is currently active, not the version the case was configured against. When no active baseline covers the case the workspace says so explicitly and offers baseline history; it never silently uses a historical version.
+- **`pinned`** always compares against one chosen version. A pinned baseline that is later deactivated stays pinned — the case never falls back to the active version — and the workspace labels it `Pinned · inactive vN`. A pin whose record is missing or fails integrity keeps the configured id and reports the specific problem.
+- **`allowed_versions`** passes when the candidate matches any one of the versions in `allowed_baseline_ids`. The version that matched is persisted on the execution as `matched_baseline_id` and is read from there, never recomputed against today's history. Newly promoted versions are not added automatically.
+
+Versions are chosen from approved history in every mode; no baseline id is ever typed. A selection that is present but empty is rejected rather than substituted — an absent key still defaults to the case's configured baselines. Duplicates are rejected, and a baseline from another take, pipeline or artifact family is rejected on creation and on edit alike.
+
+## Activation is not exclusive
+
+`set_active` flips one record. It does not deactivate anything else, and a family may hold several active versions at once — this is deliberate, and supports legitimate multi-outcome cases. An `active`-mode case resolves to the **highest-numbered** active version.
+
+The consequence is worth stating plainly: activating an older version while a newer one is still active changes nothing about what cases compare against. The history drawer says which versions are active, which one cases will resolve to afterwards, and names the version to deactivate when the activation would otherwise have no effect.
+
+Activation and deactivation refresh case resolution and coverage. Neither rewrites a stored execution: past executions keep the versions they used.
+
+Before either action, `GET /api/validation/baselines/{id}/impact` reports which cases follow the change and which are deliberately unaffected — pinned, allowed-version, disabled, and archived-suite cases are bucketed separately. Deactivating never mutates a case configuration, but it can leave `active`-mode cases with no version to resolve to; the drawer warns when that is what would happen.
+
+## Baseline history
+
+The history drawer lists every approved version of an artifact newest first, with state, source run, reviewer, date, integrity and notes, plus the version that superseded each one. Expanding a row shows the baseline id, checksum, source artifact, stage and processing unit, comparator and its source, recipe and contract fingerprints, comparison policy, and promotion provenance where the version came from a promotion.
+
+Integrity is recomputed on every read of the history endpoint, so an absent value means "not reported", which is not the same as verified. A version whose snapshot fails verification cannot be activated.
+
+Deletion is never offered. Versions are activated or deactivated.
+
+## Promotion
+
+A candidate is promoted from an exact execution, case and comparison. The candidate artifact is re-resolved and re-checksummed, and the recorded provenance checksum must match the stored snapshot — a candidate rewritten during promotion fails rather than producing a baseline whose provenance disagrees with its own bytes.
+
+Promotion is inactive by default: the new version is created but the previously active one keeps resolving until someone activates the new one explicitly. `carry_forward_policy` controls whether the source comparison policy is copied forward.
+
+Retrying the same promotion reuses the existing baseline and reports `already_promoted` rather than creating a version. Idempotency is keyed on execution, case, comparison and candidate checksum, so a changed candidate is correctly treated as a new promotion.
+
+The response describes state *after* the promotion: `previous_active_baseline` is re-read rather than reported as it was before, and `resulting_active_baseline` is the family's real active version, or null when none is active.
+
+## Current versus historical state
+
+The case table describes present governance. A selected historical execution reports the versions it actually used, the version it matched, its original statuses and its original first divergence. Editing a case or activating a baseline afterwards does not alter any of it — executions are written once and never revisited.
 
 ## Operations
 
-The CLI is intentionally usable in CI: `validation list-suites`, `run-suite`,
-`compare`, `inspect-execution`, `rebuild-indexes`, and `verify-integrity` all
-emit JSON. `run-suite` and `compare` return `1` for regressions/execution
-failures, `0` otherwise; their JSON retains `not_comparable` and
-`needs_review` rather than treating either as a silent pass. Integrity returns
-`2` for missing snapshots, checksum corruption, unsafe snapshot paths, or
-broken suite references.
+The CLI is intentionally usable in CI. Twenty-one commands cover the governance family: suite lifecycle (`list-suites`, `inspect-suite`, `update-suite`, `duplicate-suite`, `archive-suite`, `restore-suite`, `coverage`), cases (`add-case`, `update-case`, `remove-case`), baselines (`baseline-history`, `activate-baseline`, `deactivate-baseline`, `compare`, `promote-comparison`), and execution (`run-suite`, `list-executions`, `inspect-execution`, `rebuild-indexes`, `verify-integrity`, `smoke`). All emit JSON.
 
-## Semantic comparators and governance
+`run-suite` and `compare` return `1` for regressions and execution failures, `0` otherwise; their JSON retains `not_comparable` and `needs_review` rather than treating either as a silent pass. Integrity returns `2` for missing snapshots, checksum corruption, unsafe snapshot paths, or broken suite references.
 
-Measurement tables use stable object IDs before conservative centroid matching.
-Configured metrics pass when `abs(delta) <= max(absolute_tolerance,
-relative_tolerance * abs(baseline))`; missing required metrics and unmatched
-objects regress, while ambiguous geometric matches require review. Classification
-uses the same matcher and treats superclass or detailed-label changes as
-regressions unless an explicit allowed-label policy permits them. New configured
-critical warnings also regress.
+The CLI is currently the most complete surface: it is the only one exposing `verify-integrity` and `rebuild-indexes`.
 
-The Validation workspace (`/validation`) is the suite execution surface. Its
-matrix keeps status cells separate from coverage: `pass`, `changed`,
-`regression`, `not_comparable`, `blocked`, `needs_review`, and skipped states
-are never collapsed. Matrix detail opens the persisted comparison context;
-binary-mask and numeric-raster diff assets are retained below the execution
-directory. The changed-run smoke proves the lifecycle: baseline v1 pass,
-deterministic segmentation regression, then explicit promotion to v2 and pass.
+Indexes are caches and can be regenerated from `baseline.json`, `suite.json`, and `execution.json`. Snapshot paths are restricted to the validation baseline root and checksums are verified before an integrity report passes.
 
-Indexes are caches and can be regenerated from `baseline.json`, `suite.json`,
-and `execution.json`. Snapshot paths are restricted to the validation baseline
-root and checksums are verified before an integrity report passes. Deactivating
-or superseding a baseline leaves its snapshot and historical execution reports
-intact. Suite deletion must similarly only remove suite records, never a
-baseline.
+## Errors
+
+The API answers refusals with a status code and a plain message, not typed error codes. The workspace matches on those messages to produce actionable sentences — an archived suite, an incompatible family, an empty allowed selection — and falls back to showing what the server said, minus the status prefix. Adding `VALIDATION_*` codes would require a backend change; nothing emits them today.
+
+## Current limitations
+
+- Comparison results are computed and persisted but not yet displayed semantically. Mask, raster, measurement and classification detail views do not exist; the workspace shows the matrix and first divergence only.
+- Promotion has no UI. The backend, the client binding and the impact summary are all in place.
+- Studio has mark-as-reference and compare-with-reference. Add-to-suite and deep links into `/validation` are not built.
+- Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so a `&comparison=` deep link would carry a baseline id.
+- `coverage()` iterates a case's raw `baseline_ids` rather than its resolved ones, so a case pinned to v1 is counted across every configured version at once.
+- `execute_suite` accepts archived suites. Case mutation is blocked on them; running is not, on the grounds that an execution does not mutate the suite.
+- Four routes have no client binding: single-baseline read, execution progress polling, integrity and index rebuild. The last two are exposed by the CLI.
+- Frontend coverage is model-level. `validationCaseModel` and `validationHistoryModel` are tested; the panel and drawer components are not.
