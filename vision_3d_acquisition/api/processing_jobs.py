@@ -283,10 +283,14 @@ class ProcessingJobService:
         ):
             self._append_progress(job.id, {"event": "skipped", "take_id": take_id, "reason": "filtered_by_job_mode", "timestamp": _now()})
             return {"ok": True, "take_id": take_id, "skipped": True, "skipped_reason": "filtered_by_job_mode", "status": "skipped"}
-        stage_params = None
+        options_stage_params = job.options.get("stage_params")
+        stage_params = dict(options_stage_params) if isinstance(options_stage_params, dict) else None
         classifier_rules_path = str(job.options.get("classifier_rules_path") or "") or None
         if classifier_rules_path:
-            stage_params = {"classify_25d": {"classifier_rules_path": classifier_rules_path}}
+            stage_params = dict(stage_params or {})
+            classify_overrides = dict(stage_params.get("classify_25d") or {})
+            classify_overrides["classifier_rules_path"] = classifier_rules_path
+            stage_params["classify_25d"] = classify_overrides
         return dispatch_take_processing(
             settings=self.settings,
             take_id=take_id,

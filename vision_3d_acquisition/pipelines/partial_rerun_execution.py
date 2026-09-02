@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -902,6 +903,10 @@ def _stage_kwargs(stage_cls: type[Any], params: dict[str, Any]) -> dict[str, Any
 
 
 def _new_child_run_id(boundary_stage_id: str) -> str:
+    # The timestamp keeps ids human-sortable/readable; the uuid4 suffix is what
+    # actually guarantees uniqueness under concurrent partial reruns -- see
+    # storage/run_store.py, run_id is a global primary key that would
+    # otherwise silently overwrite on a timestamp collision.
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
     suffix = boundary_stage_id.replace(".", "_")
-    return f"partial_{suffix}_{stamp}"
+    return f"partial_{suffix}_{stamp}_{uuid.uuid4().hex[:8]}"

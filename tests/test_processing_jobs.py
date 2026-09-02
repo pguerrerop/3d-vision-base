@@ -105,3 +105,44 @@ def test_processing_job_service_executes_and_persists_progress(monkeypatch, tmp_
     assert finished.summary.get("scope_label") == "Selected takes"
     assert (settings.data_dir / "runtime" / "processing_jobs" / f"{job.id}.json").is_file()
     assert (settings.data_dir / "runtime" / "processing_jobs" / f"{job.id}.jsonl").is_file()
+
+
+def test_processing_job_dispatch_forwards_tuned_stage_params(monkeypatch, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path / "data")
+    create_take(settings, dataset_id="d1", session_id="s1", take_id="take_a")
+
+    captured: dict = {}
+
+    def _fake_dispatch(**kwargs):
+        captured["stage_params"] = kwargs.get("stage_params")
+        return {
+            "ok": True,
+            "take_id": kwargs["take_id"],
+            "pipeline_id": kwargs["pipeline_id"],
+            "status": "completed",
+            "run_id": f"run_{kwargs['take_id']}",
+        }
+
+    monkeypatch.setattr("vision_3d_acquisition.api.processing_jobs.dispatch_take_processing", _fake_dispatch)
+
+    service = ProcessingJobService(settings)
+    job = service.create_job(
+        ProcessingJobCreateRequest(
+            take_ids=["take_a"],
+            pipeline_id="mining_steel_ball_classification_25d",
+            created_by="tests",
+            options={
+                "stage_params": {
+                    "detect_belt_plane": {"gradient_threshold_value": 4.5},
+                },
+                "classifier_rules_path": "config/classifiers/example.json",
+            },
+        )
+    )
+    finished = wait_for_job(service, job.id)
+
+    assert finished.status == "completed"
+    assert captured["stage_params"] == {
+        "detect_belt_plane": {"gradient_threshold_value": 4.5},
+        "classify_25d": {"classifier_rules_path": "config/classifiers/example.json"},
+    }

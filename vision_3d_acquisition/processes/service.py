@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -909,7 +910,12 @@ class ProcessService:
 
 
 def _new_id() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+    # A wall-clock timestamp is not unique under concurrent dispatch (two
+    # threads can read the same microsecond), and process_run.run_id is a
+    # global primary key that silently overwrites on collision -- see
+    # storage/run_store.py. uuid4 has no realistic collision risk at any
+    # scale this system reaches.
+    return uuid.uuid4().hex
 
 
 def _take_id_from_image_path(data_dir: Path, image_path: Path) -> str | None:

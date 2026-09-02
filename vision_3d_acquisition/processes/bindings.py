@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -169,4 +170,6 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _new_id() -> str:
-    return datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
+    # See processes/service.py:_new_id -- a timestamp string is not unique
+    # under concurrent dispatch; uuid4 is.
+    return uuid.uuid4().hex

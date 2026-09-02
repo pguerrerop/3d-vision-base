@@ -71,6 +71,24 @@ def test_a_run_is_readable_right_after_it_is_written(
     assert entries[0]["take_id"] == "take_a"
 
 
+def test_appending_a_duplicate_run_id_raises_instead_of_overwriting(
+    catalog_settings: ApiSettings, write_take
+) -> None:
+    """run_id is a global primary key; the live append path must fail loudly on
+    a collision instead of silently replacing the earlier run's row (which is
+    what INSERT OR REPLACE used to do)."""
+    write_take("take_a")
+    write_take("take_b")
+    _append(catalog_settings.data_dir, "run_01", take_id="take_a")
+
+    with pytest.raises(run_store.DuplicateRunIdError):
+        _append(catalog_settings.data_dir, "run_01", take_id="take_b")
+
+    entries = load_process_entries(catalog_settings.data_dir)
+    assert len(entries) == 1
+    assert entries[0]["take_id"] == "take_a"
+
+
 def test_updating_a_run_patches_it_in_place(catalog_settings: ApiSettings, write_take) -> None:
     write_take("take_a")
     _append(catalog_settings.data_dir, "run_01")

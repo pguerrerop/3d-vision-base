@@ -91,6 +91,11 @@ from vision_3d_acquisition.pipelines.processing_units import (
     processing_unit_contract_fingerprint,
     validate_processing_unit_contracts,
 )
+from vision_3d_acquisition.pipelines.batch_comparison import (
+    compare_pipeline_sources_batch,
+    get_pipeline_batch_comparison,
+    list_pipeline_batch_comparisons,
+)
 from vision_3d_acquisition.pipelines.comparison import (
     compare_pipeline_sources,
     get_pipeline_comparison,
@@ -319,6 +324,12 @@ class ComparisonSourceRequest(BaseModel):
 
 
 class ComparePipelineRequest(BaseModel):
+    left: ComparisonSourceRequest
+    right: ComparisonSourceRequest
+
+
+class CompareBatchPipelineRequest(BaseModel):
+    take_ids: list[str]
     left: ComparisonSourceRequest
     right: ComparisonSourceRequest
 
@@ -1015,6 +1026,44 @@ def compare_pipeline_contracts(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/pipelines/{pipeline_id}/compare-batch")
+def compare_pipeline_contracts_batch(
+    pipeline_id: str,
+    payload: CompareBatchPipelineRequest,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    if not payload.take_ids:
+        raise HTTPException(status_code=400, detail="take_ids must not be empty")
+    return compare_pipeline_sources_batch(
+        settings,
+        pipeline_id=pipeline_id,
+        take_ids=payload.take_ids,
+        left=payload.left.model_dump(exclude_none=True),
+        right=payload.right.model_dump(exclude_none=True),
+    )
+
+
+@app.get("/api/pipelines/{pipeline_id}/compare-batch")
+def pipeline_batch_comparisons(
+    pipeline_id: str,
+    limit: int = 20,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    return {"batch_comparisons": list_pipeline_batch_comparisons(settings, pipeline_id, limit=limit)}
+
+
+@app.get("/api/pipelines/{pipeline_id}/compare-batch/{batch_comparison_id}")
+def pipeline_batch_comparison(
+    pipeline_id: str,
+    batch_comparison_id: str,
+    settings: ApiSettings = Depends(get_settings),
+) -> dict[str, Any]:
+    try:
+        return get_pipeline_batch_comparison(settings, pipeline_id, batch_comparison_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/pipelines/{pipeline_id}/comparisons")
