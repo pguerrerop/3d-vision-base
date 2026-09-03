@@ -659,3 +659,326 @@ def test_impact_route_reports_which_cases_would_follow_an_activation(tmp_path: P
     with pytest.raises(HTTPException) as raised:
         routes.resolution_impact("baseline_does_not_exist", store=store)
     assert raised.value.status_code == 404
+
+
+def test_coverage_reflects_the_resolved_baseline_not_every_configured_one(tmp_path: Path) -> None:
+    """A case pinned to v1 must not also be counted against v2 and v3."""
+    store, _, v1, v2 = _resolution_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+
+    pinned = store.add_case(
+        suite["id"],
+        {"baseline_ids": [v1["id"], v2["id"]], "baseline_resolution": {"mode": "pinned", "baseline_id": v1["id"]}},
+    )
+    report = store.coverage(suite["id"])
+    area = next(row for row in report["areas"] if row["area"] == v1["stage_id"])
+    # v1 is inactive (v2 is active): a pin to it counts once, as stale — not twice.
+    assert area["stale"] == 1
+    assert area["approved"] == 0
+
+    store.update_case(suite["id"], pinned["id"], {"baseline_resolution": {"mode": "allowed_versions", "allowed_baseline_ids": [v1["id"], v2["id"]]}})
+    report = store.coverage(suite["id"])
+    area = next(row for row in report["areas"] if row["area"] == v1["stage_id"])
+    # Allowed versions legitimately covers both configured versions.
+    assert area["stale"] == 1 and area["approved"] == 1
+
+    store.update_case(suite["id"], pinned["id"], {"baseline_resolution": {"mode": "active"}})
+    report = store.coverage(suite["id"])
+    area = next(row for row in report["areas"] if row["area"] == v1["stage_id"])
+    # Active mode resolves to the one active version, not the configured (possibly stale) id.
+    assert area["approved"] == 1 and area["stale"] == 0
+
+
+def test_active_resolution_deduplicates_same_family_configured_twice(tmp_path: Path) -> None:
+    """baseline_ids is frozen at add_case time and outlives mode switches, so it can
+    legitimately hold two versions of one family. Both must resolve to one entry,
+    not two — a duplicate would double-run the comparison in execute_suite()."""
+    store, _, v1, v2 = _resolution_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    case = store.add_case(
+        suite["id"],
+        {"baseline_ids": [v1["id"], v2["id"]], "baseline_resolution": {"mode": "allowed_versions", "allowed_baseline_ids": [v1["id"], v2["id"]]}},
+    )
+    store.update_case(suite["id"], case["id"], {"baseline_resolution": {"mode": "active"}})
+
+    resolved = store._case_baselines(_case_of(store, suite["id"], case["id"]))
+    assert resolved == [v2["id"]], "both configured ids resolve to the same active sibling"
+
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    assert len(execution["cases"][0]["comparisons"]) == 1, "the comparison must not run twice"
+
+
+# --------------------------------------------------------------------------
+# Matrix
+# --------------------------------------------------------------------------
+
+def _real_stage_fixture(tmp_path: Path) -> tuple[ValidationService, Path, dict]:
+    """A baseline whose stage_id is one PIPELINE's real processing-unit registry
+    actually reports, so it lands in a matrix column instead of vanishing --
+    "segment" (the shared _resolved() fixture's stage) is not a registered
+    stage for PIPELINE and so is invisible to matrix(), same as any other
+    unrecognized stage id would be."""
+    source = tmp_path / "candidate.png"
+    Image.fromarray(_V1).save(source)
+    store = ValidationService(_settings(tmp_path))
+    resolved = {
+        "artifact_root": tmp_path,
+        "artifacts": [{"artifact_id": "final_object_mask", "stage_id": "detect_belt_plane", "processing_unit_id": "detect_belt_plane", "kind": "image", "path": source.name}],
+        "result_payload": {"processing_pipeline": {"processing_units": []}, "recipe_snapshot": {}},
+        "stage_params": {}, "recipe_id": None,
+    }
+    store._resolve = lambda **_: resolved  # type: ignore[method-assign]
+    baseline = store.create_baselines({"take_id": "take_1", "pipeline_id": PIPELINE, "run_id": "run_1", "approval_scope": "artifact", "stage_id": "detect_belt_plane", "artifact_id": "final_object_mask"})["baselines"][0]
+    Image.fromarray(_V2).save(source)
+    return store, source, baseline
+
+
+
+def test_matrix_groups_by_stage_and_reports_missing_baseline_elsewhere(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    case = store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    grid = store.matrix(execution["id"])
+    assert grid["execution_id"] == execution["id"]
+    row = grid["rows"][0]
+    assert row["case_id"] == case["id"] and row["take_id"] == "take_1"
+
+    by_stage = {column["stage_id"]: cell for column, cell in zip(grid["columns"], row["cells"])}
+    covered = by_stage[baseline["stage_id"]]
+    assert covered["status"] == "regression"
+    assert covered["comparison_ids"] == [baseline["id"]]
+
+    uncovered = [cell for stage, cell in by_stage.items() if stage != baseline["stage_id"]]
+    assert uncovered and all(cell["status"] == "missing_baseline" for cell in uncovered)
+    assert all(cell["comparison_ids"] == [] for cell in uncovered)
+
+
+def test_matrix_marks_first_divergence_on_its_own_column_only(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    grid = store.matrix(execution["id"])
+    row = grid["rows"][0]
+    flagged = [cell for cell in row["cells"] if cell["first_divergence"]]
+    assert len(flagged) == 1
+    assert flagged[0]["artifact_id"] == baseline["artifact_id"]
+    others = [cell for cell in row["cells"] if not cell["first_divergence"]]
+    assert all(cell["artifact_id"] is None for cell in others)
+
+
+def test_matrix_falls_back_to_a_fixed_stage_list_for_an_unregistered_pipeline(tmp_path: Path) -> None:
+    """No processing-unit definitions exist for this pipeline id, so the column
+    set must still be usable rather than empty."""
+    store = ValidationService(_settings(tmp_path))
+    suite = store.create_suite({"name": "s", "pipeline_id": "no_such_pipeline"})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    grid = store.matrix(execution["id"])
+    assert grid["rows"] == []
+    assert [c["stage_id"] for c in grid["columns"]] == [
+        "detect_belt_plane", "normalize_heights_to_plane", "remove_belt_segment_objects",
+        "extract_connected_components", "fit_object_geometry", "compute_height_metrics",
+        "classification", "overlay",
+    ]
+
+
+def test_matrix_reads_each_baseline_at_most_once(tmp_path: Path) -> None:
+    """Regression guard for the N+1 fix: matrix() used to call get_baseline()
+    once per (case, column, comparison), reading the same handful of baseline
+    records off disk hundreds of times over for a suite with several cases."""
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    for _ in range(5):
+        store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    calls = {"n": 0}
+    real_get_baseline = store.get_baseline
+
+    def _counting_get_baseline(baseline_id):
+        calls["n"] += 1
+        return real_get_baseline(baseline_id)
+
+    store.get_baseline = _counting_get_baseline  # type: ignore[method-assign]
+    grid = store.matrix(execution["id"])
+    store.get_baseline = real_get_baseline  # type: ignore[method-assign]
+
+    # One comparison per case, all against the same baseline (v2): five cases,
+    # nine columns each in the fallback list -- the naive loop would have
+    # called get_baseline() up to 45 times for a single baseline record.
+    assert calls["n"] <= 5, f"expected at most one read per case, got {calls['n']}"
+    assert len(grid["rows"]) == 5
+
+
+# --------------------------------------------------------------------------
+# Integrity verification: every unhealthy branch, not just the clean path
+# --------------------------------------------------------------------------
+
+def test_verify_integrity_detects_a_missing_snapshot(tmp_path: Path) -> None:
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    snapshot = store.root / "baselines" / v1["id"] / v1["snapshot_artifact_path"]
+    snapshot.unlink()
+
+    report = store.verify_integrity()
+    assert report["ok"] is False
+    assert {"kind": "missing_snapshot", "baseline_id": v1["id"]} in report["problems"]
+
+
+def test_verify_integrity_detects_a_checksum_mismatch(tmp_path: Path) -> None:
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    snapshot = store.root / "baselines" / v1["id"] / v1["snapshot_artifact_path"]
+    snapshot.write_bytes(b"corrupted, does not match the recorded checksum")
+
+    report = store.verify_integrity()
+    assert report["ok"] is False
+    assert {"kind": "checksum_mismatch", "baseline_id": v1["id"]} in report["problems"]
+
+
+def test_verify_integrity_detects_a_snapshot_path_that_escapes_the_baselines_root(tmp_path: Path) -> None:
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    record_path = store.root / "baselines" / v1["id"] / "baseline.json"
+    record = json.loads(record_path.read_text())
+    record["snapshot_artifact_path"] = "../../../../../../etc/passwd"
+    record_path.write_text(json.dumps(record))
+
+    report = store.verify_integrity()
+    assert report["ok"] is False
+    assert {"kind": "snapshot_path_escape", "baseline_id": v1["id"]} in report["problems"]
+
+
+def test_verify_integrity_detects_an_unparseable_baseline_record(tmp_path: Path) -> None:
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    stray = store.root / "baselines" / "baseline_not_a_dict"
+    stray.mkdir()
+    (stray / "baseline.json").write_text(json.dumps(["not", "a", "dict"]))
+
+    report = store.verify_integrity()
+    assert report["ok"] is False
+    assert any(p["kind"] == "invalid_baseline_record" for p in report["problems"])
+    # Two genuine baselines exist; the one unparseable record is not counted as a third.
+    assert report["baseline_count"] == 2
+
+
+def test_verify_integrity_detects_a_suite_case_referencing_a_baseline_that_no_longer_exists(tmp_path: Path) -> None:
+    store, source, v1, v2 = _resolution_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    case = store.add_case(suite["id"], {"baseline_ids": [v1["id"]]})
+
+    # Simulate the baseline vanishing without going through delete_case: hand
+    # corruption, not a reachable API path, which is exactly what this check guards.
+    import shutil
+    shutil.rmtree(store.root / "baselines" / v1["id"])
+
+    report = store.verify_integrity()
+    assert report["ok"] is False
+    assert {"kind": "broken_suite_baseline", "case_id": case["id"], "baseline_id": v1["id"]} in report["problems"]
+
+
+# --------------------------------------------------------------------------
+# Conservative object matching: the centroid fallback and the ambiguity guard
+# --------------------------------------------------------------------------
+
+def test_centroid_matching_requires_a_clear_winner_within_5mm(tmp_path: Path) -> None:
+    store = ValidationService(_settings(tmp_path))
+    left = [{"id": "a", "centroid": [0.0, 0.0, 0.0]}]
+
+    # Well within 5mm and unambiguous: matches.
+    close = store._match_objects(left, [{"id": "b", "centroid": [3.0, 0.0, 0.0]}])
+    assert len(close["matches"]) == 1
+    assert close["matches"][0]["match_method"] == "centroid"
+    assert close["matches"][0]["candidate_object_id"] == "b"
+
+    # Outside 5mm: no match at all, not a forced best-effort pairing.
+    far = store._match_objects(left, [{"id": "b", "centroid": [8.0, 0.0, 0.0]}])
+    assert far["matches"] == []
+    assert far["baseline_only"] == [0]
+
+
+def test_centroid_matching_refuses_to_guess_between_two_close_candidates(tmp_path: Path) -> None:
+    """Two candidates within 1mm of each other near the baseline object: too close
+    to call, so it is reported as ambiguous rather than picking the nearer one."""
+    store = ValidationService(_settings(tmp_path))
+    left = [{"id": "a", "centroid": [0.0, 0.0, 0.0]}]
+    right = [
+        {"id": "b", "centroid": [3.0, 0.0, 0.0]},
+        {"id": "c", "centroid": [3.5, 0.0, 0.0]},
+    ]
+
+    result = store._match_objects(left, right)
+    assert result["matches"] == []
+    assert len(result["ambiguous"]) == 1
+    assert result["ambiguous"][0]["baseline_object_id"] == "a"
+    assert set(result["ambiguous"][0]["candidate_indices"]) == {0, 1}
+
+
+def test_stable_id_match_outranks_centroid_even_when_geometry_disagrees(tmp_path: Path) -> None:
+    store = ValidationService(_settings(tmp_path))
+    left = [{"id": "a", "centroid": [0.0, 0.0, 0.0]}]
+    right = [{"id": "a", "centroid": [50.0, 50.0, 50.0]}]
+
+    result = store._match_objects(left, right)
+    assert len(result["matches"]) == 1
+    assert result["matches"][0]["match_method"] == "stable_id"
+    assert result["matches"][0]["match_score"] == 1.0
+
+
+# --------------------------------------------------------------------------
+# Route-layer logic beyond a 1:1 passthrough to the service
+# --------------------------------------------------------------------------
+
+def test_get_baseline_route_404s_on_a_missing_id_without_raising_something_else(tmp_path: Path) -> None:
+    from fastapi import HTTPException
+    from vision_3d_acquisition.api import validation as routes
+
+    store, _, v1, v2 = _resolution_fixture(tmp_path)
+    assert routes.get_baseline(v1["id"], store=store)["id"] == v1["id"]
+
+    with pytest.raises(HTTPException) as raised:
+        routes.get_baseline("baseline_does_not_exist", store=store)
+    assert raised.value.status_code == 404
+
+
+def test_suite_executions_route_filters_to_the_requested_suite_only(tmp_path: Path) -> None:
+    from vision_3d_acquisition.api import validation as routes
+
+    store, _, v1, v2 = _resolution_fixture(tmp_path)
+    suite_a = store.create_suite({"name": "a", "pipeline_id": PIPELINE})
+    suite_b = store.create_suite({"name": "b", "pipeline_id": PIPELINE})
+    store.add_case(suite_a["id"], {"baseline_ids": [v1["id"]]})
+    store.add_case(suite_b["id"], {"baseline_ids": [v1["id"]]})
+    store.execute_suite(suite_a["id"], {"candidate_run_id": "run_1"})
+    store.execute_suite(suite_b["id"], {"candidate_run_id": "run_1"})
+
+    executions = routes.suite_executions(suite_a["id"], store=store)
+    assert len(executions) == 1
+    assert all(e["suite_id"] == suite_a["id"] for e in executions)
+
+
+def test_progress_route_returns_the_progress_of_a_completed_execution(tmp_path: Path) -> None:
+    from vision_3d_acquisition.api import validation as routes
+
+    store, _, v1, v2 = _resolution_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [v1["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    progress = routes.progress(execution["id"], store=store)
+    assert progress["completed"] == progress["total"] == 1
+    assert progress["status"] in {"completed", "completed_with_regressions"}
+
+
+def test_promote_route_extracts_case_id_from_the_payload(tmp_path: Path) -> None:
+    from fastapi import HTTPException
+    from vision_3d_acquisition.api import validation as routes
+
+    store, _, v1, case, execution = _promotion_fixture(tmp_path)
+    outcome = routes.promote(execution["id"], v1["id"], {"case_id": case["id"], "activate": True}, store=store)
+    assert outcome["baseline"]["version"] == 2
+
+    with pytest.raises(HTTPException) as raised:
+        routes.promote(execution["id"], v1["id"], {"activate": True}, store=store)
+    assert raised.value.status_code == 404, "an absent case_id must not silently match some other case"

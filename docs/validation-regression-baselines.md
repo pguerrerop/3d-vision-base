@@ -92,11 +92,12 @@ The API answers refusals with a status code and a plain message, not typed error
 
 ## Current limitations
 
+`coverage()` and `_case_baselines()` were fixed to resolve each case's active mode/pinned/allowed_versions setting rather than iterating raw `baseline_ids`. Two related things were true before this: coverage double-counted a case pinned to an inactive version, and active mode could return the same resolved baseline twice when `baseline_ids` held more than one version of the same family — which `execute_suite()` would then compare against redundantly. Both are covered by tests now.
+
 - Comparison results are computed and persisted but not yet displayed semantically. Mask, raster, measurement and classification detail views do not exist; the workspace shows the matrix and first divergence only.
 - Promotion has no UI. The backend, the client binding and the impact summary are all in place.
 - Studio has mark-as-reference and compare-with-reference. Add-to-suite and deep links into `/validation` are not built.
 - Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so a `&comparison=` deep link would carry a baseline id.
-- `coverage()` iterates a case's raw `baseline_ids` rather than its resolved ones, so a case pinned to v1 is counted across every configured version at once.
 - `execute_suite` accepts archived suites. Case mutation is blocked on them; running is not, on the grounds that an execution does not mutate the suite.
 - Four routes have no client binding: single-baseline read, execution progress polling, integrity and index rebuild. The last two are exposed by the CLI.
 - Frontend coverage is model-level. `validationCaseModel` and `validationHistoryModel` are tested; the panel and drawer components are not.
