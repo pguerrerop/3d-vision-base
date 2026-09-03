@@ -10,17 +10,50 @@ type Props = {
   dataset: DatasetSummary | null;
   onClose: () => void;
   onSelectSession?: (sessionId: string) => void;
+  onLabelCorrected?: () => void;
 };
 
-export default function PhysicalObjectDetailDrawer({ open, physicalObject, dataset, onClose, onSelectSession }: Props) {
+export default function PhysicalObjectDetailDrawer({ open, physicalObject, dataset, onClose, onSelectSession, onLabelCorrected }: Props) {
   const [takes, setTakes] = useState<Array<{ session_id: string; take_id: string; metadata: Record<string, unknown> }>>([]);
   const [repeatability, setRepeatability] = useState<Record<string, unknown> | null>(null);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [superclassDraft, setSuperclassDraft] = useState("");
+  const [reason, setReason] = useState("");
+  const [savingCorrection, setSavingCorrection] = useState(false);
+  const [correctionMessage, setCorrectionMessage] = useState("");
 
   useEffect(() => {
     if (!open || !physicalObject) return;
     void api.physicalObjectTakes(physicalObject.physical_object_id, physicalObject.dataset_id).then((payload) => setTakes(payload.takes || [])).catch(() => setTakes([]));
     void api.physicalObjectRepeatability(physicalObject.physical_object_id, physicalObject.dataset_id).then((payload) => setRepeatability(payload)).catch(() => setRepeatability(null));
   }, [open, physicalObject]);
+
+  useEffect(() => {
+    setLabelDraft(physicalObject?.normalized_class || "");
+    setSuperclassDraft(physicalObject?.superclass || "");
+    setReason("");
+    setCorrectionMessage("");
+  }, [physicalObject?.physical_object_id]);
+
+  async function saveCorrection() {
+    if (!physicalObject || !labelDraft.trim()) return;
+    setSavingCorrection(true);
+    setCorrectionMessage("");
+    try {
+      const result = await api.correctPhysicalObjectLabel(physicalObject.physical_object_id, {
+        dataset_id: physicalObject.dataset_id,
+        normalized_class: labelDraft.trim(),
+        superclass: superclassDraft.trim() || null,
+        reason: reason.trim() || null,
+      });
+      setCorrectionMessage(`Correction ${result.id} applied to ${result.affected_take_ids.length} takes and ${result.affected_ml_set_ids.length} ML sets.`);
+      onLabelCorrected?.();
+    } catch (error) {
+      setCorrectionMessage(error instanceof Error ? error.message : "Label correction failed.");
+    } finally {
+      setSavingCorrection(false);
+    }
+  }
 
   return (
     <EntityDetailDrawer
@@ -44,6 +77,15 @@ export default function PhysicalObjectDetailDrawer({ open, physicalObject, datas
         </>
       )}
     >
+      <section className="entity-section">
+        <h4>Correct canonical label</h4>
+        <small>This updates the physical object, every linked take and its ML-set memberships in one audited database transaction.</small>
+        <label className="field-label">Normalized class<input value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} /></label>
+        <label className="field-label">Superclass<input value={superclassDraft} onChange={(event) => setSuperclassDraft(event.target.value)} /></label>
+        <label className="field-label">Reason<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="e.g. cadena → SCRAP_METAL" /></label>
+        <button type="button" disabled={savingCorrection || !labelDraft.trim()} onClick={() => void saveCorrection()}>{savingCorrection ? "Saving…" : "Apply audited correction"}</button>
+        {correctionMessage ? <small>{correctionMessage}</small> : null}
+      </section>
       <section className="entity-section">
         <h4>Identity</h4>
         <EntityStatisticsGrid rows={[

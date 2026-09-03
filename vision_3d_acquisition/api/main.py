@@ -55,6 +55,8 @@ from vision_3d_acquisition.api.filesystem import (
 from vision_3d_acquisition.api.dataset_session_exports import DatasetSessionExportService
 from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.datasets.physical_objects import PhysicalObjectRegistry
+from vision_3d_acquisition.datasets.label_corrections import correct_physical_object_label
+from vision_3d_acquisition.storage import db
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
 from vision_3d_acquisition.api.feature_analytics import (
     build_filter_options,
@@ -629,6 +631,15 @@ class MLExperimentRequest(BaseModel):
     training_config: dict[str, Any] = {}
 
 
+class PhysicalObjectLabelCorrectionRequest(BaseModel):
+    dataset_id: str
+    normalized_class: str
+    superclass: str | None = None
+    raw_label: str | None = None
+    actor: str = "studio"
+    reason: str | None = None
+
+
 class MLEvaluateRequest(BaseModel):
     id: str
     name: str
@@ -652,6 +663,12 @@ class MLDeploymentRequest(BaseModel):
     target_stage_id: str
     pipeline_family: str = "25d"
     deployed_by: str = "system"
+    notes: str | None = None
+
+
+class LiveTrialRequest(BaseModel):
+    deployment_id: str
+    recipe_snapshot: dict[str, Any] = {}
     notes: str | None = None
 
 
@@ -2455,6 +2472,14 @@ def get_physical_object_repeatability(physical_object_id: str, dataset_id: str, 
     return PhysicalObjectRegistry(settings).object_repeatability(dataset_id, physical_object_id)
 
 
+@app.post("/api/physical-objects/{physical_object_id}/label-corrections")
+def correct_physical_object_label_endpoint(physical_object_id: str, payload: PhysicalObjectLabelCorrectionRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    try:
+        return correct_physical_object_label(data_dir=settings.data_dir, physical_object_id=physical_object_id, **payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc) else 422, detail=str(exc)) from exc
+
+
 @app.post("/api/physical-objects/reconcile")
 def reconcile_physical_objects(payload: PhysicalObjectReconcileRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
     registry = PhysicalObjectRegistry(settings)
@@ -3768,6 +3793,8 @@ def ml_runtime_health(settings: ApiSettings = Depends(get_settings)) -> dict[str
     incompatible = int((stats or {}).get("incompatible_deployment_count", 0))
     latest_path = settings.data_dir / "ml" / "smoke_test_results" / "latest.json"
     latest = _read_json(latest_path) if latest_path.is_file() else None
+    latency_samples = [float(v) for v in ((stats or {}).get("inference_latency_samples_ms") or []) if isinstance(v, (int, float))]
+    latency_p95 = sorted(latency_samples)[min(len(latency_samples) - 1, max(0, int((len(latency_samples) - 1) * 0.95)))] if latency_samples else None
     return {
         "runtime_stats": stats or {},
         "totals": {
@@ -3776,6 +3803,7 @@ def ml_runtime_health(settings: ApiSettings = Depends(get_settings)) -> dict[str
             "heuristic_usage_rate": (float(heuristic) / float(inf)) if inf else 0.0,
             "incompatible_deployment_count": incompatible,
             "average_inference_time_ms": float((stats or {}).get("average_inference_time_ms", 0.0)),
+            "p95_inference_time_ms": latency_p95,
         },
         "backend_breakdown": {
             "inference_by_backend": (stats or {}).get("inference_by_backend", {}),
@@ -3784,6 +3812,18 @@ def ml_runtime_health(settings: ApiSettings = Depends(get_settings)) -> dict[str
         },
         "latest_smoke_test": latest,
     }
+
+
+@app.post("/api/ml/live-trials")
+def start_ml_live_trial(payload: LiveTrialRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    deployment = next((item for item in MLService(settings.data_dir).list_active_deployments() if item.get("id") == payload.deployment_id), None)
+    if deployment is None:
+        raise HTTPException(status_code=422, detail="Deployment must be active before starting a live trial")
+    health = ml_runtime_health(settings)
+    trial_id = f"live_trial_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}"
+    conn = db.catalog_for_process(settings.data_dir)
+    conn.execute("INSERT INTO live_trial(id,deployment_id,recipe_snapshot_json,runtime_health_json,notes,status,started_at) VALUES (?,?,?,?,?,?,?)", (trial_id, payload.deployment_id, json.dumps(payload.recipe_snapshot), json.dumps(health), payload.notes, "active", datetime.now(UTC).isoformat()))
+    return {"id": trial_id, "deployment_id": payload.deployment_id, "runtime_health": health}
 
 
 @app.get("/api/ml/runtime-health/history")
@@ -3831,6 +3871,18 @@ def ml_experiment_logs(experiment_id: str, settings: ApiSettings = Depends(get_s
 @app.get("/api/ml/experiments/{experiment_id}/evaluation-preview")
 def ml_experiment_evaluation_preview(experiment_id: str, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
     return MLService(settings.data_dir).evaluation_preview(experiment_id)
+
+
+@app.get("/api/ml/evaluations")
+def ml_evaluations(dataset_id: str | None = None, settings: ApiSettings = Depends(get_settings)) -> list[dict[str, Any]]:
+    conn = db.catalog_for_process(settings.data_dir)
+    query = "SELECT id,experiment_id,dataset_id,classifier_id,split_strategy,recipe_snapshot_json,metrics_json,artifacts_json,created_at FROM evaluation_run"
+    params: tuple[Any, ...] = ()
+    if dataset_id:
+        query += " WHERE dataset_id = ?"
+        params = (dataset_id,)
+    query += " ORDER BY created_at DESC"
+    return [{**dict(row), "recipe_snapshot": json.loads(row["recipe_snapshot_json"]), "metrics": json.loads(row["metrics_json"]), "artifacts": json.loads(row["artifacts_json"])} for row in conn.execute(query, params)]
 
 
 @app.get("/api/exports/object-metrics", response_model=None)

@@ -18,6 +18,7 @@ from vision_3d_acquisition.ml.splits import build_split
 from vision_3d_acquisition.ml.runtime import MLRuntimeResolver
 from vision_3d_acquisition.ml.deployments import DeploymentService
 from vision_3d_acquisition.ml.storage import MLStorage
+from vision_3d_acquisition.storage import db
 
 
 @dataclass
@@ -262,6 +263,19 @@ class MLService:
                 },
             }
         )
+        # The files are useful artifacts, but this immutable DB row is the
+        # decision record used to compare iterations and report n/recall later.
+        conn = db.catalog_for_process(self.data_dir)
+        now = datetime.now(UTC).isoformat()
+        for backend_id, backend_result in by_backend.items():
+            evaluation_id = f"evaluation_{exp.id}_{backend_id}"
+            conn.execute(
+                "INSERT OR REPLACE INTO evaluation_run(id,experiment_id,dataset_id,classifier_id,split_strategy,recipe_snapshot_json,metrics_json,artifacts_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (evaluation_id, exp.id, exp.dataset_id, backend_id, exp.split_strategy,
+                 json.dumps(payload.get("recipe_snapshot") or {}, ensure_ascii=False),
+                 json.dumps(backend_result.get("metrics_summary") or {}, ensure_ascii=False),
+                 json.dumps(backend_result.get("evaluation_artifacts") or {}, ensure_ascii=False), now),
+            )
         self._append_log(log_dir / "train.log", "[done] status=completed")
         return self.storage.save("experiments", completed.id, completed.model_dump(mode="json"))
 

@@ -6507,6 +6507,10 @@ class ComputeHeightMetricsStage:
     produced_modalities: tuple[CaptureModality, ...] = ()
     produced_artifacts: tuple[str, ...] = ("objects",)
     stage_category: str | None = "measurement"
+    height_percentile: float = 99.0
+    inner_kernel_size: int = 5
+    smoothing_kernel_size: int = 7
+    flat_gradient_threshold: float = 0.08
 
     def run(self, context: PipelineContext) -> None:
         _assert_not_preview_semantic(context, stage_name=self.name)
@@ -6530,10 +6534,12 @@ class ComputeHeightMetricsStage:
                 continue
             pos_values = np.maximum(values, 0.0)
             gy, gx = np.gradient(np.where(mask, normalized, 0.0))
-            inner_mask = cv2.erode(mask.astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1).astype(bool)
+            inner_k = max(1, int(self.inner_kernel_size) | 1)
+            smooth_k = max(1, int(self.smoothing_kernel_size) | 1)
+            inner_mask = cv2.erode(mask.astype(np.uint8), np.ones((inner_k, inner_k), dtype=np.uint8), iterations=1).astype(bool)
             if int(np.count_nonzero(inner_mask)) < max(25, int(0.15 * np.count_nonzero(mask))):
                 inner_mask = mask
-            smoothed_surface = cv2.GaussianBlur(np.where(mask, normalized, 0.0).astype(np.float32), (7, 7), 0)
+            smoothed_surface = cv2.GaussianBlur(np.where(mask, normalized, 0.0).astype(np.float32), (smooth_k, smooth_k), 0)
             surface_residuals = normalized[inner_mask] - smoothed_surface[inner_mask]
             asym = float(abs(np.mean(pos_values[::2]) - np.mean(pos_values[1::2]))) if pos_values.size > 4 else 0.0
             flatness = float(1.0 - np.std(pos_values) / max(np.mean(pos_values), 1e-6))
@@ -6551,7 +6557,7 @@ class ComputeHeightMetricsStage:
             # on the known calibration cube or on regular objects) do not inflate the
             # canonical Z extent. The true maximum is preserved separately under
             # `height_above_belt_mm.max_height_mm` for diagnostics.
-            p99_height = float(np.percentile(values, 99)) if values.size else max_height
+            p99_height = float(np.percentile(values, min(100.0, max(50.0, float(self.height_percentile))))) if values.size else max_height
             dim_z_height = p99_height
             footprint_x = float(comp.get("major_axis_mm") or comp["bbox"][2] * frame.x_resolution_mm)
             footprint_y = float(comp.get("minor_axis_mm") or comp["bbox"][3] * frame.y_resolution_mm)
@@ -6616,7 +6622,7 @@ class ComputeHeightMetricsStage:
             surface_roughness_score = float(max(0.0, min(1.0, surface_roughness_mean / 8.0)))
             # Flat region proxy: low local gradient zones inside the object mask.
             grad_mag = np.sqrt(gx * gx + gy * gy)
-            flat_mask = inner_mask & (grad_mag < 0.08)
+            flat_mask = inner_mask & (grad_mag < float(self.flat_gradient_threshold))
             flat_region_ratio = float(np.count_nonzero(flat_mask) / max(1, np.count_nonzero(inner_mask)))
             largest_flat_region_mm2 = 0.0
             if np.count_nonzero(flat_mask):
@@ -7476,6 +7482,10 @@ class ComputeMeasurementDiagnosticsStage:
     produced_modalities: tuple[CaptureModality, ...] = ()
     produced_artifacts: tuple[str, ...] = ("measurement_diagnostics", "feature_vector", "feature_provenance", "quality_flags")
     stage_category: str | None = "measurement"
+    min_valid_pixel_ratio: float = 0.85
+    max_invalid_pixel_ratio: float = 0.2
+    max_border_touch_ratio: float = 0.02
+    max_plane_residual_std_mm: float = 2.0
 
     def run(self, context: PipelineContext) -> None:
         frame: HeightmapFrame = context.require_artifact("heightmap_frame")
@@ -7812,13 +7822,13 @@ class ComputeMeasurementDiagnosticsStage:
 
     def _build_quality_flags(self, features: dict[str, Any]) -> list[dict[str, Any]]:
         flags: list[dict[str, Any]] = []
-        if float(features.get("valid_pixel_ratio", 0.0)) < 0.85:
+        if float(features.get("valid_pixel_ratio", 0.0)) < self.min_valid_pixel_ratio:
             flags.append({"code": "LOW_VALID_PIXEL_RATIO", "severity": "warning", "trigger": {"valid_pixel_ratio": features["valid_pixel_ratio"]}, "related_features": ["valid_pixel_ratio"]})
-        if float(features.get("invalid_pixel_ratio", 0.0)) > 0.2:
+        if float(features.get("invalid_pixel_ratio", 0.0)) > self.max_invalid_pixel_ratio:
             flags.append({"code": "HIGH_INVALID_REGION_RATIO", "severity": "warning", "trigger": {"invalid_pixel_ratio": features["invalid_pixel_ratio"]}, "related_features": ["invalid_pixel_ratio"]})
-        if float(features.get("border_touch_ratio", 0.0)) > 0.02:
+        if float(features.get("border_touch_ratio", 0.0)) > self.max_border_touch_ratio:
             flags.append({"code": "BORDER_TOUCH", "severity": "warning", "trigger": {"border_touch_ratio": features["border_touch_ratio"]}, "related_features": ["border_touch_ratio"]})
-        if float(features.get("plane_residual_std", 0.0)) > 2.0:
+        if float(features.get("plane_residual_std", 0.0)) > self.max_plane_residual_std_mm:
             flags.append({"code": "HIGH_PLANE_RESIDUAL", "severity": "warning", "trigger": {"plane_residual_std": features["plane_residual_std"]}, "related_features": ["plane_residual_std"]})
         if float(features.get("footprint_area_mm2", 0.0)) < 50.0:
             flags.append({"code": "SMALL_OBJECT", "severity": "warning", "trigger": {"footprint_area_mm2": features["footprint_area_mm2"]}, "related_features": ["footprint_area_mm2"]})
@@ -8586,6 +8596,9 @@ class ClassifyMiningBall25DStage:
             stats["calibration_compatibility_failures"] = int(stats.get("calibration_compatibility_failures", 0)) + int(calibration_compatibility_failures)
             stats["schema_mismatch_failures"] = int(stats.get("schema_mismatch_failures", 0)) + int(schema_mismatch_failures)
             stats["inference_time_total_ms"] = float(stats.get("inference_time_total_ms", 0.0)) + float(inference_duration_ms)
+            samples = list(stats.get("inference_latency_samples_ms") or [])
+            samples.append(float(inference_duration_ms))
+            stats["inference_latency_samples_ms"] = samples[-512:]
             total_inf = max(1, int(stats.get("inference_count", 0)))
             stats["average_inference_time_ms"] = float(stats["inference_time_total_ms"]) / float(total_inf)
             stats_storage.write_artifact(stats_rel, stats)

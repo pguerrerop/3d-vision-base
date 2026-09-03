@@ -307,6 +307,7 @@ export default function ClassifiersPage() {
             <div className="ml-kpi-grid ml-kpi-strip">
               <article className="ml-kpi-card"><small>Inference Count</small><strong>{compactNumber(runtimeHealth?.totals?.inference_count ?? 0)}</strong></article>
               <article className="ml-kpi-card"><small>Fallback Rate</small><strong>{compactNumber(((runtimeHealth?.totals?.fallback_rate ?? 0) * 100).toFixed(2))}%</strong></article>
+              <article className="ml-kpi-card"><small>Inference p95</small><strong>{runtimeHealth?.totals?.p95_inference_time_ms == null ? "-" : `${compactNumber(Number(runtimeHealth.totals.p95_inference_time_ms).toFixed(1))} ms`}</strong></article>
               <article className="ml-kpi-card"><small>Heuristic Usage</small><strong>{compactNumber(((runtimeHealth?.totals?.heuristic_usage_rate ?? 0) * 100).toFixed(2))}%</strong></article>
               <article className="ml-kpi-card"><small>Avg Inference Time</small><strong>{compactNumber(runtimeHealth?.totals?.average_inference_time_ms ?? 0)} ms</strong></article>
               <article className="ml-kpi-card"><small>Incompatible Deployments</small><strong>{compactNumber(runtimeHealth?.totals?.incompatible_deployment_count ?? 0)}</strong></article>
@@ -824,6 +825,7 @@ export default function ClassifiersPage() {
                           <td><code>rollback_from={String(dep.rollback_from ?? "-")}</code></td>
                           <td>
                             <div className="ml-actions-row">
+                              {dep.status === "active" && <button type="button" className="ml-btn" onClick={async () => { const result = await api.startMlLiveTrial({ deployment_id: dep.id, notes: "Started from deployment workspace" }); window.alert(`Live trial frozen: ${result.id}`); }}>Start live trial</button>}
                               <button
                                 type="button"
                                 className="ml-btn"

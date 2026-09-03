@@ -1844,6 +1844,19 @@ REMOVE_BELT_SEGMENT_OBJECTS_PARAMETER_SCHEMA: dict[str, Any] = {
     },
 }
 
+MEASUREMENT_25D_PARAMETER_SCHEMA: dict[str, Any] = {"title": "Measurement parameters", "fields": {
+    "height_percentile": {"type": "number", "label": "Height percentile", "default": 99, "minimum": 50, "maximum": 100, "group": "Height metric"},
+    "inner_kernel_size": {"type": "integer", "label": "Inner-mask kernel", "default": 5, "minimum": 1, "maximum": 31, "group": "Surface sampling"},
+    "smoothing_kernel_size": {"type": "integer", "label": "Surface smoothing kernel", "default": 7, "minimum": 1, "maximum": 31, "group": "Surface sampling"},
+    "flat_gradient_threshold": {"type": "number", "label": "Flat-gradient threshold", "default": 0.08, "minimum": 0, "maximum": 10, "group": "Deformation"},
+}}
+MEASUREMENT_DIAGNOSTICS_PARAMETER_SCHEMA: dict[str, Any] = {"title": "Measurement quality thresholds", "fields": {
+    "min_valid_pixel_ratio": {"type": "number", "label": "Min valid-pixel ratio", "default": 0.85, "minimum": 0, "maximum": 1, "group": "Quality flags"},
+    "max_invalid_pixel_ratio": {"type": "number", "label": "Max invalid-pixel ratio", "default": 0.2, "minimum": 0, "maximum": 1, "group": "Quality flags"},
+    "max_border_touch_ratio": {"type": "number", "label": "Max border-touch ratio", "default": 0.02, "minimum": 0, "maximum": 1, "group": "Quality flags"},
+    "max_plane_residual_std_mm": {"type": "number", "label": "Max plane residual std", "default": 2, "minimum": 0, "maximum": 100, "unit": "mm", "group": "Quality flags"},
+}}
+
 KNOWN_OBJECT_25D_PARAMETER_SCHEMA: dict[str, Any] = {
     "title": "Known-Object Calibration",
     "runtime_stage_params_key": "known_object_25d",
@@ -2141,8 +2154,8 @@ PIPELINES: list[dict[str, Any]] = [
             _stage(stage_id="normalize_heights_to_plane", display_name="Normalize heights to reference", description="Recomputes height_above_reference_mm from the selected reference model and emits near-zero background QA metrics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["image", "json"], object_outputs=False, supports_real_time=True, dependencies=["detect_belt_plane"]),
             _stage(stage_id="remove_belt_segment_objects", display_name="Remove reference + segment objects", description="Suppresses reference-surface pixels and isolates object components above object_min_height_mm.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["image", "overlay", "json"], object_outputs=True, supports_real_time=True, dependencies=["normalize_heights_to_plane"], parameter_schema=REMOVE_BELT_SEGMENT_OBJECTS_PARAMETER_SCHEMA),
             _stage(stage_id="geometry", display_name="Footprint geometry", description="Connected components, contour/hull/ellipse and footprint metrics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "json", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["remove_belt_segment_objects"]),
-            _stage(stage_id="measurement", display_name="Height + volume metrics", description="Height statistics, volume proxy, and deformation feature extraction.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "metric", "json"], object_outputs=True, supports_real_time=True, dependencies=["geometry"]),
-            _stage(stage_id="measurement_diagnostics", display_name="Measurement diagnostics", description="Quality metrics, feature vector, provenance, and quality flags.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["json", "table", "metric"], object_outputs=True, supports_real_time=True, dependencies=["measurement"], parameter_schema=KNOWN_OBJECT_25D_PARAMETER_SCHEMA),
+            _stage(stage_id="measurement", display_name="Height + volume metrics", description="Height statistics, volume proxy, and deformation feature extraction.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "metric", "json"], object_outputs=True, supports_real_time=True, dependencies=["geometry"], parameter_schema=MEASUREMENT_25D_PARAMETER_SCHEMA),
+            _stage(stage_id="measurement_diagnostics", display_name="Measurement diagnostics", description="Quality metrics, feature vector, provenance, and quality flags.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["json", "table", "metric"], object_outputs=True, supports_real_time=True, dependencies=["measurement"], parameter_schema={"title": "Measurement diagnostics", "runtime_stage_params_key": "known_object_25d", "payload_path": "stage_params.known_object_25d", "fields": {**KNOWN_OBJECT_25D_PARAMETER_SCHEMA["fields"], **MEASUREMENT_DIAGNOSTICS_PARAMETER_SCHEMA["fields"]}}),
             _stage(stage_id="classification", display_name="Mining-ball classification", description="Initial 2.5D heuristic classifier with class-group semantics.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["table", "json", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["measurement_diagnostics"]),
             _stage(stage_id="overlay", display_name="Overlay rendering", description="Height colormap, segmentation, measurement and plane-debug overlays.", required_modalities=["heightmap"], optional_modalities=["reflectance", "rgb"], produced_artifact_kinds=["image", "overlay"], object_outputs=True, supports_real_time=True, dependencies=["classification"]),
         ],

@@ -475,13 +475,19 @@ function allStageParams(detail: TakeDetail | null): Record<string, unknown> {
 
 // stage_params is namespaced per stage (e.g. {"detect_belt_plane": {...}, "known_object_25d": {...}}),
 // keyed by each stage's own parameter_schema.runtime_stage_params_key -- which does not always match
-// the stage's own id (measurement_diagnostics's schema is keyed "known_object_25d"). Falls back to the
-// stage id itself for stages with no parameter_schema (nothing gated there anyway).
+// the stage's own id (measurement_diagnostics's schema is keyed "known_object_25d", though its fields
+// also draw from the stage's own "measurement_diagnostics" bucket for the quality-threshold params
+// added alongside it). Falls back to the stage id itself for stages with no parameter_schema (nothing
+// gated there anyway). Merges both buckets so both field groups resolve to their real current values.
 function valuesForStage(stage: PipelineStageInfo, stageParams: Record<string, unknown>): Record<string, unknown> {
   const schema = stage.parameter_schema as Record<string, unknown> | undefined;
   const key = (schema?.["runtime_stage_params_key"] as string | undefined) ?? stage.id;
+  const own = stageParams[stage.id];
   const scoped = stageParams[key];
-  return scoped && typeof scoped === "object" ? (scoped as Record<string, unknown>) : {};
+  return {
+    ...(own && typeof own === "object" ? (own as Record<string, unknown>) : {}),
+    ...(scoped && typeof scoped === "object" ? (scoped as Record<string, unknown>) : {}),
+  };
 }
 
 function strategySummaryForStage(

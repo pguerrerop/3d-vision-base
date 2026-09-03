@@ -57,6 +57,8 @@ def evaluate_predictions(*, y_true: list[str], y_pred: list[str], failed_example
         "micro_recall": micro_r,
         "micro_f1": micro_f1,
         "macro_f1": (sum(float(item["f1"]) for item in per_class) / len(per_class)) if per_class else 0.0,
+        "balanced_accuracy": (sum(float(item["recall"]) for item in per_class) / len(per_class)) if per_class else 0.0,
+        "per_class": per_class,
         "roc_auc": None,
         "calibration": {"status": "not_available"},
     }

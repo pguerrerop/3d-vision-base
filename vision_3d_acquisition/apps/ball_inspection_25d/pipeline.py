@@ -154,6 +154,8 @@ def run_ball_inspection_25d_flow(
     segment_params = dict(stage_params.get("remove_belt_segment_objects") or {})
     normalize_params = dict(stage_params.get("normalize_heights_to_plane") or {})
     known_object_params = dict(stage_params.get("known_object_25d") or {})
+    measurement_params = dict(stage_params.get("measurement") or {})
+    diagnostics_params = dict(stage_params.get("measurement_diagnostics") or {})
     classify_params = dict(stage_params.get("classify_25d") or {})
     pipeline_cfg = get_pipeline("mining_steel_ball_classification_25d") or {}
     classifier_cfg = pipeline_cfg.get("classifier") if isinstance(pipeline_cfg.get("classifier"), dict) else {}
@@ -165,6 +167,8 @@ def run_ball_inspection_25d_flow(
     context.set_artifact("stage_params.remove_belt_segment_objects", segment_params)
     context.set_artifact("stage_params.normalize_heights_to_plane", normalize_params)
     context.set_artifact("stage_params.known_object_25d", known_object_params)
+    context.set_artifact("stage_params.measurement", measurement_params)
+    context.set_artifact("stage_params.measurement_diagnostics", diagnostics_params)
     context.set_artifact("stage_params.classify_25d", classify_params)
     runner = PipelineRunner(
         stages=[
@@ -176,9 +180,9 @@ def run_ball_inspection_25d_flow(
             RemoveBeltAndSegmentObjectsStage(**_stage_kwargs(RemoveBeltAndSegmentObjectsStage, segment_params)),
             ExtractConnectedComponentsStage(),
             FitObjectGeometryStage(),
-            ComputeHeightMetricsStage(),
+            ComputeHeightMetricsStage(**_stage_kwargs(ComputeHeightMetricsStage, measurement_params)),
             ValidateKnownObjectScale25DStage(),
-            ComputeMeasurementDiagnosticsStage(),
+            ComputeMeasurementDiagnosticsStage(**_stage_kwargs(ComputeMeasurementDiagnosticsStage, diagnostics_params)),
             ClassifyMiningBall25DStage(**_stage_kwargs(ClassifyMiningBall25DStage, classify_params)),
             Generate25DOverlaysStage(),
             SerializeProcessingResultStage(),

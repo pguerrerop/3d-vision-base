@@ -2750,6 +2750,10 @@ export default function DatasetsPage() {
         onSelectSession={(sessionId) => {
           openSessionDrawer(sessionId);
         }}
+        onLabelCorrected={() => {
+          if (selectedDataset) void refreshTakes();
+          if (selectedDataset) void api.physicalObjects({ dataset_id: selectedDataset }).then(setPhysicalObjects);
+        }}
       />
 
       {successMessage && <div className="warning-line">{successMessage}</div>}

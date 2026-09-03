@@ -2701,6 +2701,8 @@ export const api = {
     request<{ takes: Array<{ session_id: string; take_id: string; metadata: Record<string, unknown> }> }>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/takes?dataset_id=${encodeURIComponent(datasetId)}`),
   physicalObjectRepeatability: (physicalObjectId: string, datasetId: string) =>
     request<Record<string, unknown>>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/repeatability?dataset_id=${encodeURIComponent(datasetId)}`),
+  correctPhysicalObjectLabel: (physicalObjectId: string, payload: { dataset_id: string; normalized_class: string; superclass?: string | null; raw_label?: string | null; actor?: string; reason?: string | null }) =>
+    post<{ id: string; affected_take_ids: string[]; affected_ml_set_ids: string[] }>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/label-corrections`, payload),
   featureAnalyticsFeatures: (params: FeatureAnalyticsQuery & { feature_selection?: string[] }) => {
     const qs = featureAnalyticsQueryToSearchParams(params);
     return request<FeatureAnalyticsFeaturesResponse>(`/api/feature-analytics/features${qs.toString() ? `?${qs.toString()}` : ""}`);
@@ -2804,6 +2806,7 @@ export const api = {
     latest_smoke_test: MLSmokeSummary | null;
   }>("/api/ml/runtime-health"),
   mlRuntimeHealthHistory: (days = 14) => request<{ items: Array<{ day: string; stats: Record<string, unknown> }> }>(`/api/ml/runtime-health/history?days=${encodeURIComponent(String(days))}`),
+  startMlLiveTrial: (payload: { deployment_id: string; recipe_snapshot?: Record<string, unknown>; notes?: string }) => post<{ id: string }>("/api/ml/live-trials", payload),
   mlDatasetInsights: (datasetId: string) => request<MLDatasetInsights>(`/api/ml/datasets/${encodeURIComponent(datasetId)}/insights`),
   mlLabelsPreview: (datasetId: string, limit = 200) => request<{ dataset_id: string; count: number; items: Array<Record<string, unknown>> }>(`/api/ml/datasets/${encodeURIComponent(datasetId)}/labels-preview?limit=${encodeURIComponent(String(limit))}`),
   mlFeaturesPreview: (datasetId: string, limit = 200) => request<{
