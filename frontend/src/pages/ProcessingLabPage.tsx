@@ -8,6 +8,7 @@ import {
   type PipelineInfo,
   type PipelineComparisonResponse,
   type PipelineComparisonIndexEntry,
+  type PipelineBatchComparisonResponse,
   type PartialRerunExecuteResponse,
   type PartialRerunPlanResponse,
   type PipelineRecipe,
@@ -1085,6 +1086,9 @@ export default function ProcessingLabPage() {
   const [comparisonBusy, setComparisonBusy] = useState(false);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [comparisonResult, setComparisonResult] = useState<PipelineComparisonResponse | null>(null);
+  const [batchComparisonBusy, setBatchComparisonBusy] = useState(false);
+  const [batchComparisonError, setBatchComparisonError] = useState<string | null>(null);
+  const [batchComparisonResult, setBatchComparisonResult] = useState<PipelineBatchComparisonResponse | null>(null);
   const [comparisonLeftType, setComparisonLeftType] = useState<CompareSourceType>("current");
   const [comparisonRightType, setComparisonRightType] = useState<CompareSourceType>("recipe");
   const [comparisonLeftRunId, setComparisonLeftRunId] = useState<string>("");
@@ -3357,15 +3361,17 @@ export default function ProcessingLabPage() {
     };
   }
 
-  function buildComparisonSource(sourceType: CompareSourceType, side: "left" | "right") {
+  function buildComparisonSource(sourceType: CompareSourceType, side: "left" | "right", options?: { requireTakeId?: boolean }) {
+    const requireTakeId = options?.requireTakeId ?? true;
     const recipeId = side === "left" ? comparisonLeftRecipeId : comparisonRightRecipeId;
     const runId = side === "left" ? comparisonLeftRunId : comparisonRightRunId;
     if (sourceType === "run") {
-      if (!detail?.take_id || !runId) return null;
+      if (!runId) return null;
+      if (requireTakeId && !detail?.take_id) return null;
       return {
         type: "run" as const,
         label: `Run ${runId}`,
-        take_id: detail.take_id,
+        ...(requireTakeId ? { take_id: detail!.take_id } : {}),
         run_id: runId,
       };
     }
@@ -3408,6 +3414,37 @@ export default function ProcessingLabPage() {
       setComparisonError(error instanceof Error ? error.message : "Comparison failed.");
     } finally {
       setComparisonBusy(false);
+    }
+  }
+
+  async function runBatchComparison() {
+    if (!selectedPipeline || selectedPipeline.id !== "mining_steel_ball_classification_25d") return;
+    const takeIds = Array.from(selectedTakeIds);
+    if (!takeIds.length) {
+      setBatchComparisonError("Select at least one take first.");
+      return;
+    }
+    // Left stays whatever the Compare tab has configured (a fixed reference:
+    // a recipe, current edits, or one pinned run). Right resolves per take
+    // when it's a "run" source, so the same right-side run label is looked up
+    // independently in each selected take instead of being pinned to the
+    // currently open one.
+    const left = buildComparisonSource(comparisonLeftType, "left");
+    const right = buildComparisonSource(comparisonRightType, "right", { requireTakeId: false });
+    if (!left || !right) {
+      setBatchComparisonError("Select valid comparison sources first in the Compare tab.");
+      return;
+    }
+    setBatchComparisonBusy(true);
+    setBatchComparisonError(null);
+    try {
+      const response = await api.compareBatchPipeline(selectedPipeline.id, { take_ids: takeIds, left, right });
+      setBatchComparisonResult(response);
+    } catch (error) {
+      setBatchComparisonResult(null);
+      setBatchComparisonError(error instanceof Error ? error.message : "Batch comparison failed.");
+    } finally {
+      setBatchComparisonBusy(false);
     }
   }
 
@@ -4767,6 +4804,19 @@ export default function ProcessingLabPage() {
             </button>
             <button
               type="button"
+              disabled={
+                batchComparisonBusy ||
+                !selectedPipeline ||
+                selectedPipeline.id !== "mining_steel_ball_classification_25d" ||
+                bulkSelectionCount === 0
+              }
+              title="Compares the Compare tab's left source (fixed) against each selected take's right source. Configure sources in the Compare tab first."
+              onClick={() => void runBatchComparison()}
+            >
+              {batchComparisonBusy ? "Comparing…" : `Compare selected (${bulkSelectionCount})`}
+            </button>
+            <button
+              type="button"
               disabled={pipelineActionBusy || !selectedPipeline || takesLoading}
               onClick={() => void reprocessFilteredTakes("failed_only")}
             >
@@ -5937,6 +5987,78 @@ export default function ProcessingLabPage() {
                 </button>
               </div>
               {comparisonError ? <small>{comparisonError}</small> : null}
+            </section>
+            <section className="control-panel-section">
+              <span>Batch comparison</span>
+              <small>
+                Select takes in the left rail's Batch panel, then use "Compare selected" there — it reuses the left/right
+                sources configured above, but resolves the right side's run independently for each selected take.
+              </small>
+              {batchComparisonBusy ? <small>Comparing selected takes…</small> : null}
+              {batchComparisonError ? <small>{batchComparisonError}</small> : null}
+              {batchComparisonResult && !batchComparisonBusy && (
+                <>
+                  <div className="studio-inspector-summary">
+                    <div className="studio-inspector-summary-card">
+                      <span>Takes compared</span>
+                      <strong>
+                        {batchComparisonResult.compared_take_count} / {batchComparisonResult.requested_take_count}
+                      </strong>
+                    </div>
+                    <div className="studio-inspector-summary-card">
+                      <span>Classification changed</span>
+                      <strong>
+                        {batchComparisonResult.aggregate.classification_changed_count} ({formatRatio(batchComparisonResult.aggregate.classification_changed_fraction ?? null, 2)})
+                      </strong>
+                    </div>
+                    <div className="studio-inspector-summary-card">
+                      <span>Takes with mask changes</span>
+                      <strong>
+                        {batchComparisonResult.aggregate.takes_with_mask_changes_count} ({formatRatio(batchComparisonResult.aggregate.takes_with_mask_changes_fraction ?? null, 2)})
+                      </strong>
+                    </div>
+                    <div className="studio-inspector-summary-card">
+                      <span>Mask IoU (min / avg / max)</span>
+                      <strong>
+                        {formatRatio(batchComparisonResult.aggregate.min_iou ?? null)} / {formatRatio(batchComparisonResult.aggregate.average_iou ?? null)} / {formatRatio(batchComparisonResult.aggregate.max_iou ?? null)}
+                      </strong>
+                    </div>
+                  </div>
+                  {batchComparisonResult.aggregate.most_changed_units.length > 0 ? (
+                    <div className="artifact-reference">
+                      <span>Most-changed units across selected takes</span>
+                      {batchComparisonResult.aggregate.most_changed_units.slice(0, 5).map((row) => (
+                        <small key={`batch-unit:${row.unit_id}`}>
+                          {row.unit_id}: {row.changed_take_count} take(s) ({formatRatio(row.changed_take_fraction, 2)})
+                        </small>
+                      ))}
+                    </div>
+                  ) : null}
+                  {batchComparisonResult.errors.length > 0 ? (
+                    <div className="artifact-reference">
+                      <span>Could not compare ({batchComparisonResult.errors.length})</span>
+                      {batchComparisonResult.errors.map((row) => (
+                        <small key={`batch-error:${row.take_id}`}>
+                          {row.take_id}: {row.error}
+                        </small>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div className="comparison-history-list">
+                    {batchComparisonResult.per_take.map((row) => (
+                      <div key={`batch-take:${row.take_id}`} className="comparison-history-item">
+                        <button type="button" className="link-button" onClick={() => setSelectedTakeId(row.take_id)}>
+                          {row.take_id}
+                        </button>
+                        <small>
+                          {row.summary.classification_changed ? "classification changed" : "classification unchanged"}
+                          {row.summary.average_iou != null ? ` · IoU ${formatRatio(row.summary.average_iou)}` : ""}
+                        </small>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </section>
             <section className="control-panel-section">
               <span>Saved comparisons</span>

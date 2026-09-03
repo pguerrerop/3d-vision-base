@@ -640,6 +640,47 @@ export interface PipelineComparisonResponse {
   warnings?: string[];
 }
 
+export interface PipelineBatchComparisonEntry {
+  take_id: string;
+  comparison_id?: string | null;
+  summary: PipelineComparisonResponse["summary"];
+}
+
+export interface PipelineBatchComparisonError {
+  take_id: string;
+  error: string;
+}
+
+export interface PipelineBatchComparisonAggregate {
+  compared_take_count: number;
+  classification_changed_count: number;
+  classification_changed_fraction?: number | null;
+  object_count_changed_count: number;
+  object_count_changed_fraction?: number | null;
+  warnings_changed_count: number;
+  warnings_changed_fraction?: number | null;
+  takes_with_mask_changes_count: number;
+  takes_with_mask_changes_fraction?: number | null;
+  average_iou?: number | null;
+  min_iou?: number | null;
+  max_iou?: number | null;
+  most_changed_units: Array<{ unit_id: string; changed_take_count: number; changed_take_fraction: number }>;
+}
+
+export interface PipelineBatchComparisonResponse {
+  batch_comparison_id: string;
+  pipeline_id: string;
+  created_at: string;
+  left: PipelineComparisonSource;
+  right: PipelineComparisonSource;
+  requested_take_count: number;
+  compared_take_count: number;
+  error_take_count: number;
+  errors: PipelineBatchComparisonError[];
+  aggregate: PipelineBatchComparisonAggregate;
+  per_take: PipelineBatchComparisonEntry[];
+}
+
 export interface PartialRerunPlanResponse {
   pipeline_id: string;
   safe: boolean;
@@ -2990,6 +3031,32 @@ export const api = {
       };
     },
   ) => post<PipelineComparisonResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/compare`, payload),
+  compareBatchPipeline: (
+    pipelineId: string,
+    payload: {
+      take_ids: string[];
+      left: {
+        type: "run" | "recipe" | "current" | string;
+        label?: string | null;
+        take_id?: string | null;
+        run_id?: string | null;
+        recipe_id?: string | null;
+        version?: number | null;
+        stage_params?: Record<string, unknown> | null;
+        parameters_by_unit?: Record<string, unknown> | null;
+      };
+      right: {
+        type: "run" | "recipe" | "current" | string;
+        label?: string | null;
+        take_id?: string | null;
+        run_id?: string | null;
+        recipe_id?: string | null;
+        version?: number | null;
+        stage_params?: Record<string, unknown> | null;
+        parameters_by_unit?: Record<string, unknown> | null;
+      };
+    },
+  ) => post<PipelineBatchComparisonResponse>(`/api/pipelines/${encodeURIComponent(pipelineId)}/compare-batch`, payload),
   pipelineComparisons: (pipelineId: string, params?: { take_id?: string | null; limit?: number }) => {
     const query = new URLSearchParams();
     if (params?.take_id) query.set("take_id", params.take_id);
