@@ -3,25 +3,20 @@ import {
   api,
   type ValidationBaseline,
   type ValidationCoverageArea,
+  type ValidationExecution,
   type ValidationSuiteDetail,
 } from "../api/client";
 import { validationStatus, type ValidationStatus } from "../components/validation/validationStatus";
 import ValidationCasePanel from "../components/validation/ValidationCasePanel";
+import ValidationComparisonDrawer from "../components/validation/ValidationComparisonDrawer";
 
 type Matrix = Awaited<ReturnType<typeof api.validationMatrix>>;
 
 /** Read the versions an execution actually matched, as recorded at the time. */
-function matchedFromExecution(execution: Record<string, unknown>): Record<string, string | null> {
-  const cases = Array.isArray(execution.cases) ? execution.cases : [];
+function matchedFromExecution(execution: ValidationExecution): Record<string, string | null> {
   const matched: Record<string, string | null> = {};
-  for (const entry of cases) {
-    if (entry && typeof entry === "object") {
-      const row = entry as Record<string, unknown>;
-      if (typeof row.case_id === "string") {
-        matched[row.case_id] =
-          typeof row.matched_baseline_id === "string" ? row.matched_baseline_id : null;
-      }
-    }
+  for (const entry of execution.cases) {
+    matched[entry.case_id] = entry.matched_baseline_id ?? null;
   }
   return matched;
 }
@@ -40,6 +35,11 @@ export default function ValidationPage() {
   const [newName, setNewName] = useState("");
   const [baselines, setBaselines] = useState<ValidationBaseline[]>([]);
   const [matchedByCase, setMatchedByCase] = useState<Record<string, string | null>>({});
+  const [executionDetail, setExecutionDetail] = useState<ValidationExecution | null>(null);
+  const [selectedCell, setSelectedCell] = useState<{
+    caseId: string;
+    comparisonIds: Array<string | null>;
+  } | null>(null);
 
   // Workspace state is parent-owned so every panel reads one consistent snapshot.
   const reloadSuite = async (id: string) => {
@@ -69,8 +69,15 @@ export default function ValidationPage() {
       setBaselines(await api.validationBaselines(undefined, detail.pipeline_id));
       const latest = history.filter((x) => x.suite_id === id).at(-1);
       if (latest?.id) {
-        setExecutionId(String(latest.id));
-        setMatrix(await api.validationMatrix(String(latest.id)));
+        const executionId = String(latest.id);
+        setExecutionId(executionId);
+        const [grid, execution] = await Promise.all([
+          api.validationMatrix(executionId),
+          api.validationExecution(executionId),
+        ]);
+        setMatrix(grid);
+        setExecutionDetail(execution);
+        setMatchedByCase(matchedFromExecution(execution));
       }
     }
   };
@@ -101,9 +108,12 @@ export default function ValidationPage() {
     if (!suiteId) return;
     setMessage("Running suite…");
     const execution = await api.runValidationSuite(suiteId);
-    setExecutionId(String(execution.id));
-    setMatrix(await api.validationMatrix(String(execution.id)));
-    setMessage(String(execution.status));
+    setExecutionId(execution.id);
+    setExecutionDetail(execution);
+    setMatchedByCase(matchedFromExecution(execution));
+    setSelectedCell(null);
+    setMatrix(await api.validationMatrix(execution.id));
+    setMessage(execution.status);
   };
 
   const create = async () => {
@@ -142,12 +152,19 @@ export default function ValidationPage() {
 
   const loadExecution = async (id: string) => {
     setExecutionId(id);
+    setSelectedCell(null);
     const [grid, execution] = await Promise.all([
       api.validationMatrix(id),
       api.validationExecution(id),
     ]);
     setMatrix(grid);
+    setExecutionDetail(execution);
     setMatchedByCase(matchedFromExecution(execution));
+  };
+
+  const openComparison = (caseId: string, comparisonIds: Array<string | null>) => {
+    if (!comparisonIds.length) return;
+    setSelectedCell({ caseId, comparisonIds });
   };
 
   const badge = (status: string) =>
@@ -295,15 +312,28 @@ export default function ValidationPage() {
                     <td>{row.take_id}</td>
                     {row.cells.map((cell) => {
                       const presentation = badge(cell.status);
+                      const openable = cell.comparison_ids.some(Boolean);
+                      const content = (
+                        <span
+                          title={presentation.tooltip}
+                          className={`status-badge ${cell.status}`}
+                        >
+                          {cell.first_divergence ? "◆ " : presentation.icon + " "}
+                          {presentation.label}
+                        </span>
+                      );
                       return (
                         <td key={cell.column_id}>
-                          <span
-                            title={presentation.tooltip}
-                            className={`status-badge ${cell.status}`}
-                          >
-                            {cell.first_divergence ? "◆ " : presentation.icon + " "}
-                            {presentation.label}
-                          </span>
+                          {openable ? (
+                            <button
+                              type="button"
+                              onClick={() => openComparison(row.case_id, cell.comparison_ids)}
+                            >
+                              {content}
+                            </button>
+                          ) : (
+                            content
+                          )}
                         </td>
                       );
                     })}
@@ -317,6 +347,27 @@ export default function ValidationPage() {
           </div>
         )}
       </section>
+      {selectedCell && executionDetail && suite
+        ? (() => {
+            const executionCase = executionDetail.cases.find(
+              (item) => item.case_id === selectedCell.caseId,
+            );
+            const comparisons = (executionCase?.comparisons ?? []).filter((comparison) =>
+              selectedCell.comparisonIds.includes(comparison.baseline_ref.baseline_id),
+            );
+            if (!executionCase || !comparisons.length) return null;
+            return (
+              <ValidationComparisonDrawer
+                suite={suite}
+                execution={executionDetail}
+                executionCase={executionCase}
+                comparisons={comparisons}
+                onClose={() => setSelectedCell(null)}
+                onChanged={() => reloadSuite(suiteId)}
+              />
+            );
+          })()
+        : null}
     </main>
   );
 }

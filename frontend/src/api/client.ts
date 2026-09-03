@@ -2312,6 +2312,12 @@ export interface SegmentationPreviewResponse {
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
+/** A path from diff_artifacts or a baseline's snapshot_artifact_path, servable directly. */
+export function validationFileUrl(path: string): string {
+  const encoded = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  return `${API_BASE_URL}/api/validation/files/${encoded}`;
+}
+
 export type ValidationComparator =
   | "binary_mask" | "numeric_raster" | "measurement_table" | "classification"
   | "json_fields" | "plane_model" | "visual_only" | "not_comparable";
@@ -2325,11 +2331,12 @@ export interface ValidationBaselinePromotion {
 export interface ValidationBaseline {
   id: string; version: number; status: "active" | "inactive" | string;
   take_id: string; pipeline_id: string; source_run_id: string; stage_id?: string | null;
-  processing_unit_id?: string | null; view_id?: string | null; artifact_id?: string | null;
+  processing_unit_id?: string | null; substage_id?: string | null; view_id?: string | null; artifact_id?: string | null;
   artifact_kind?: string | null; artifact_semantic_type?: string | null; artifact_role?: string | null;
   comparator?: ValidationComparator | string; comparator_source?: ValidationComparatorSource | string;
-  artifact_checksum?: string; recipe_fingerprint?: string | null;
+  artifact_checksum?: string; recipe_fingerprint?: string | null; recipe_id?: string | null;
   pipeline_contract_fingerprint?: string | null; comparison_policy?: Record<string, unknown>;
+  calibration_context?: Record<string, unknown>;
   created_at?: string; supersedes_baseline_id?: string | null;
   promotion?: ValidationBaselinePromotion | null;
   /** Recomputed on read by the history endpoint, not stored on the record. */
@@ -2360,6 +2367,35 @@ export interface ValidationResolutionImpact {
   allowed_version_cases_unchanged: ValidationCaseRef[];
   disabled_cases: ValidationCaseRef[];
   archived_suites: ValidationCaseRef[];
+}
+export type ValidationComparisonStatus = "pass" | "changed" | "regression" | "not_comparable" | "blocked" | "needs_review";
+export interface ValidationMatch { baseline_index: number; candidate_index: number; baseline_object_id: string | null; candidate_object_id: string | null; match_method: "stable_id" | "centroid" | string; match_score: number; ambiguous: boolean; }
+export interface ValidationUnmatchedObject { index: number; object_id: string | null; }
+export interface ValidationAmbiguousMatch { baseline_object_id: string | null; candidate_indices: number[]; }
+export interface ValidationMatching { matches: ValidationMatch[]; baseline_only: ValidationUnmatchedObject[]; candidate_only: ValidationUnmatchedObject[]; ambiguous: ValidationAmbiguousMatch[]; }
+export interface ValidationMetricResult { metric: string; units?: string | null; baseline: unknown; candidate: unknown; delta?: number; relative_delta?: number; absolute_tolerance?: number; relative_tolerance?: number; effective_tolerance?: number; status: "pass" | "regression" | "changed" | "not_comparable"; reason: string | null; }
+export interface ValidationMeasurementObjectResult extends ValidationMatch { status: "pass" | "regression"; metric_results: ValidationMetricResult[]; }
+export interface ValidationClassificationSide { superclass: string | null; label: string | null; confidence: number | null; }
+export interface ValidationClassificationObjectResult extends ValidationMatch { baseline: ValidationClassificationSide; candidate: ValidationClassificationSide; confidence_delta: number; status: "pass" | "regression"; reasons: string[]; }
+export interface ValidationComparisonResult {
+  status: ValidationComparisonStatus; comparator: string; summary: string;
+  /** Field set depends on the comparator; look up the ones that comparator defines. */
+  metrics: Record<string, number>; thresholds: Record<string, unknown>; reasons: string[];
+  /** Paths under the validation root, servable via validationFileUrl(). */
+  diff_artifacts: string[];
+  baseline_ref: { baseline_id: string | null; version: number | null }; candidate_ref: { artifact_id: string | null };
+  /** Measurement and classification comparators only. */
+  object_results?: Array<ValidationMeasurementObjectResult | ValidationClassificationObjectResult>;
+  matching?: ValidationMatching;
+}
+export interface ValidationExecutionCase {
+  case_id: string; take_id: string; status: string; skipped?: boolean; summary?: string;
+  comparisons?: ValidationComparisonResult[]; matched_baseline_id?: string | null; first_failing_stage?: string | null;
+  first_divergence?: { take_id: string; stage_id?: string | null; processing_unit_id?: string | null; substage_id?: string | null; view_id?: string | null; artifact_id?: string | null; status: string; summary: string } | null;
+}
+export interface ValidationExecution {
+  id: string; suite_id: string; pipeline_id: string; status: string; candidate_run_id: string;
+  created_at?: string; started_at?: string; completed_at?: string; cases: ValidationExecutionCase[];
 }
 export interface ValidationPromotionResponse { baseline: ValidationBaseline; already_promoted: boolean; previous_active_baseline: ValidationBaseline | null; resulting_active_baseline: ValidationBaseline | null; affected_case_resolution: ValidationResolutionImpact; }
 
@@ -2465,7 +2501,7 @@ export const api = {
     return request<ValidationBaseline[]>(`/api/validation/baselines${query.size ? `?${query}` : ""}`);
   },
   approveValidationBaseline: (payload: Record<string, unknown>) => post<{ baselines: ValidationBaseline[]; included: string[]; skipped: Array<Record<string, unknown>> }>("/api/validation/baselines", payload),
-  compareValidationBaseline: (baselineId: string, candidateRunId: string) => post<Record<string, unknown>>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/compare?candidate_run_id=${encodeURIComponent(candidateRunId)}`, {}),
+  compareValidationBaseline: (baselineId: string, candidateRunId: string) => post<ValidationComparisonResult>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/compare?candidate_run_id=${encodeURIComponent(candidateRunId)}`, {}),
   validationBaselineImpact: (baselineId: string) => request<ValidationResolutionImpact>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/impact`),
   activateValidationBaseline: (baselineId: string) => post<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/activate`, {}),
   deactivateValidationBaseline: (baselineId: string) => post<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}/deactivate`, {}),
@@ -2487,9 +2523,10 @@ export const api = {
   },
   promoteValidationComparison: (executionId: string, comparisonId: string, payload: { case_id: string; activate?: boolean; notes?: string; carry_forward_policy?: boolean; reviewed_by?: string }) => post<ValidationPromotionResponse>(`/api/validation/executions/${encodeURIComponent(executionId)}/comparisons/${encodeURIComponent(comparisonId)}/promote`, payload),
   validationExecutions: () => request<Array<Record<string, unknown>>>("/api/validation/executions"),
-  validationExecution: (executionId: string) => request<Record<string, unknown>>(`/api/validation/executions/${encodeURIComponent(executionId)}`),
+  validationExecution: (executionId: string) => request<ValidationExecution>(`/api/validation/executions/${encodeURIComponent(executionId)}`),
+  validationBaseline: (baselineId: string) => request<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}`),
   validationMatrix: (executionId: string) => request<{ execution_id: string; columns: Array<{ id:string; label:string; stage_id:string; order:number }>; rows: Array<{ case_id:string; take_id:string; overall_status:string; cells:Array<{ column_id:string; status:string; comparison_ids:Array<string | null>; first_divergence:boolean; artifact_id?:string | null }> }> }>(`/api/validation/executions/${encodeURIComponent(executionId)}/matrix`),
-  runValidationSuite: (suiteId: string, candidateRunId = "latest") => post<Record<string, unknown>>(`/api/validation/suites/${encodeURIComponent(suiteId)}/execute`, { candidate_run_id: candidateRunId }),
+  runValidationSuite: (suiteId: string, candidateRunId = "latest") => post<ValidationExecution>(`/api/validation/suites/${encodeURIComponent(suiteId)}/execute`, { candidate_run_id: candidateRunId }),
   health: () => request<HealthResponse>("/api/health"),
   state: () => request<RuntimeState>("/api/state"),
   runtimePreviewMetadata: () => request<RuntimePreviewMetadata>("/api/runtime/preview/metadata"),
