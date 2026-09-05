@@ -102,6 +102,7 @@ import {
   resolveProcessingUnitArtifactRefs,
   resolveProcessingUnitView,
   rootProcessingUnit,
+  type ResolvedProcessingUnitArtifactRef,
 } from "../components/processingUnitModel";
 import { buildProcessingUnitGraph, formatTraceCoverageLine, graphSelectionForUnit, persistedTraceFromDetail, traceSummaryFromDetail } from "../components/processingUnitGraphModel";
 import RunHistoryPanel from "../components/RunHistoryPanel";
@@ -1012,6 +1013,16 @@ function prettyStageLabel(stageId: string, fallback: string): string {
   if (canonical === "normalize_heights_to_plane") return "Normalize heights to reference";
   if (canonical === "remove_belt_segment_objects") return "Remove reference + segment objects";
   return fallback;
+}
+
+const MAX_STAGE_OUTPUT_LABELS_SHOWN = 2;
+
+function summarizeStageOutputs(outputs: ResolvedProcessingUnitArtifactRef[]): { shown: string; full: string } | null {
+  if (outputs.length === 0) return null;
+  const labels = outputs.map((entry) => entry.artifact?.title ?? entry.label);
+  const extra = labels.length - MAX_STAGE_OUTPUT_LABELS_SHOWN;
+  const shown = extra > 0 ? `${labels.slice(0, MAX_STAGE_OUTPUT_LABELS_SHOWN).join(", ")} +${extra} more` : labels.join(", ");
+  return { shown, full: labels.join(", ") };
 }
 
 export default function ProcessingLabPage() {
@@ -1938,8 +1949,12 @@ export default function ProcessingLabPage() {
     [allArtifacts, canonicalSelectedStageId, stageSemantic, workspaceDetail]
   );
   const stageSubstagePlan = useMemo(
-    () => resolveStageSubstagePlan(canonicalSelectedStageId, stageSemantic, selectedPipeline, workspaceDetail, allArtifacts, takeArtifacts),
-    [allArtifacts, canonicalSelectedStageId, selectedPipeline, stageSemantic, takeArtifacts, workspaceDetail],
+    // resolveStageSubstagePlan re-canonicalizes internally from the raw stage id alone (matching
+    // processing-unit `stage_id` values); passing the label-aware `canonicalSelectedStageId` here
+    // double-canonicalizes it (e.g. "input" -> "load_heightmap" -> unmatched) and silently empties
+    // the plan for stages whose id+label combination hits an early-return branch, like "input".
+    () => resolveStageSubstagePlan(selectedStage?.id ?? selectedStageId, stageSemantic, selectedPipeline, workspaceDetail, allArtifacts, takeArtifacts),
+    [allArtifacts, selectedStage?.id, selectedStageId, selectedPipeline, stageSemantic, takeArtifacts, workspaceDetail],
   );
   const artifactRelevanceById = useMemo(() => {
     const entries: Record<string, { relevance: ArtifactRelevance; reason?: string }> = {};
@@ -2714,6 +2729,14 @@ export default function ProcessingLabPage() {
       const executionStage = detail?.result?.pipeline_execution?.stages?.find((item) => item.stage_id === canonical || item.stage_id === stage.id) ?? null;
       const status = String(executionStage?.status ?? (detail?.result ? "idle" : "pending"));
       const durationMs = executionStage?.duration_ms ?? stageTimingMs(detail?.result, canonical);
+      // Processing-unit `stage_id` values are raw backend ids (e.g. "input"), not the label-aware
+      // `canonical` above used for semantic-view/execution-stage lookups -- resolve the stage's own
+      // declared output contract against its raw stage_id instead.
+      const stageUnits = processingUnitsForStage(selectedPipeline, detail, canonicalStageId(stage.id));
+      const stageRoot = rootProcessingUnit(stageUnits);
+      const outputs = stageRoot
+        ? resolveProcessingUnitArtifactRefs(detail, stageRoot, artifactsForStage(detail, stage.id), takeArtifacts).outputs
+        : [];
       return {
         id: stage.id,
         canonical,
@@ -2723,9 +2746,10 @@ export default function ProcessingLabPage() {
         durationMs,
         selected: stage.id === selectedStageId,
         warningCount: Array.isArray(executionStage?.warnings) ? executionStage.warnings.length : 0,
+        outputs,
       };
     }),
-    [detail?.result, selectedPipeline?.stages, selectedStageId]
+    [detail, selectedPipeline, selectedStageId, takeArtifacts]
   );
   const selectedView = stageSemantic.views.find((item) => item.id === activeTab) ?? stageSemantic.views[0] ?? null;
   const tuneModeActive = studioMode === "tune";
@@ -4987,25 +5011,33 @@ export default function ProcessingLabPage() {
           <strong>{selectedStage ? compactStageLabel(selectedStage.id, prettyStageLabel(selectedStage.id, selectedStage.display_name)) : "Pipeline"}</strong>
         </div>
         <div className="studio-stage-rail-list">
-          {stageNavigator.map((stage) => (
-            <button
-              key={stage.id}
-              type="button"
-              className={`studio-stage-rail-row ${stage.selected ? "active" : ""} status-${stage.status}`}
-              onClick={() => selectStage(stage.id)}
-              title={stage.label}
-            >
-              <span className="studio-stage-rail-status" aria-hidden>{stage.status === "completed" ? "✓" : stage.status === "failed" || stage.status === "error" ? "!" : "•"}</span>
-              <span className="studio-stage-rail-copy">
-                <strong>{stage.shortLabel}</strong>
-                <small>{stage.label}</small>
-              </span>
-              <span className="studio-stage-rail-meta">
-                <small>{stage.durationMs == null ? "—" : `${stage.durationMs.toFixed(0)} ms`}</small>
-                {stage.warningCount > 0 && <small className="warning-badge">{stage.warningCount}</small>}
-              </span>
-            </button>
-          ))}
+          {stageNavigator.map((stage) => {
+            const outputSummary = summarizeStageOutputs(stage.outputs);
+            return (
+              <button
+                key={stage.id}
+                type="button"
+                className={`studio-stage-rail-row ${stage.selected ? "active" : ""} status-${stage.status}`}
+                onClick={() => selectStage(stage.id)}
+                title={stage.label}
+              >
+                <span className="studio-stage-rail-status" aria-hidden>{stage.status === "completed" ? "✓" : stage.status === "failed" || stage.status === "error" ? "!" : "•"}</span>
+                <span className="studio-stage-rail-copy">
+                  <strong>{stage.shortLabel}</strong>
+                  <small>{stage.label}</small>
+                  {outputSummary && (
+                    <small className="studio-stage-rail-output" title={`Output: ${outputSummary.full}`}>
+                      → {outputSummary.shown}
+                    </small>
+                  )}
+                </span>
+                <span className="studio-stage-rail-meta">
+                  <small>{stage.durationMs == null ? "—" : `${stage.durationMs.toFixed(0)} ms`}</small>
+                  {stage.warningCount > 0 && <small className="warning-badge">{stage.warningCount}</small>}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </aside>
 

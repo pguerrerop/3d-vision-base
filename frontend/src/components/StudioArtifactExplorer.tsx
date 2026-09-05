@@ -14,6 +14,8 @@ import { inferColorMapTFromRgb, scalarToRgb } from "./colormap";
 import HeightLegend from "./HeightLegend";
 import { assertSemanticMatch, resolveHeightArtifact, resolveHeightColorMapping, toHeightLegendSemantic, type HeightColorMapping } from "./heightSemantics";
 import { shouldUseBinaryMaskRenderer } from "./binaryMaskArtifacts";
+import { isIdMaskArtifact } from "./idMaskArtifacts";
+import IdMaskRenderer from "./IdMaskRenderer";
 import type { StudioArtifactViewState } from "./studioViewState";
 import { artifactRelevanceLabel, artifactRelevanceTone, type ArtifactRelevance } from "./referenceArtifactRelevance";
 type HeightRange = { min: number; max: number; unit: string };
@@ -217,9 +219,13 @@ export default function StudioArtifactExplorer({
     ?? `${takeId ?? "take"}:${previewTarget?.artifact_id ?? selected.artifact_id}:${previewTarget?.path ?? selected.path ?? "preview"}`
   );
   const selectedOverlayId = selected.kind === "overlay" ? selected.artifact_id : null;
+  const useIdMaskRenderer = useMemo(
+    () => isIdMaskArtifact(selected),
+    [selected],
+  );
   const useBinaryMaskRenderer = useMemo(
-    () => shouldUseBinaryMaskRenderer(selected, artifacts),
-    [selected, artifacts],
+    () => !useIdMaskRenderer && shouldUseBinaryMaskRenderer(selected, artifacts),
+    [selected, artifacts, useIdMaskRenderer],
   );
   const morphDebug = artifacts.find((item) => item.artifact_id === "morphology_debug_json");
   const morphMetrics = artifacts.find((item) => item.artifact_id === "morphology_metrics");
@@ -931,7 +937,17 @@ export default function StudioArtifactExplorer({
             openUrl={previewTarget?.path ? `${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(previewCacheKey)}` : null}
           />
         )}
-        {!useBinaryMaskRenderer && (selected.kind === "image" || selected.kind === "overlay") && previewTarget?.path && takeId && (
+        {useIdMaskRenderer && previewTarget?.path && takeId && (
+          <div className={`height-image-wrap viewport-${viewState.viewportMode}`}>
+            <div className="overlay-frame">
+              <IdMaskRenderer
+                src={`${fileUrl(takeId, previewTarget.path)}?t=${encodeURIComponent(previewCacheKey)}`}
+                alt={previewTarget.title}
+              />
+            </div>
+          </div>
+        )}
+        {!useBinaryMaskRenderer && !useIdMaskRenderer && (selected.kind === "image" || selected.kind === "overlay") && previewTarget?.path && takeId && (
           <div className={`height-image-wrap viewport-${viewState.viewportMode}`}>
             <ProjectionArtifactViewer
               title={previewTarget.title}

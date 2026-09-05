@@ -4979,12 +4979,14 @@ tbody tr:hover {
   overflow: auto;
 }
 
-.height-image-wrap.viewport-natural .overlay-frame img {
+.height-image-wrap.viewport-natural .overlay-frame img,
+.height-image-wrap.viewport-natural .overlay-frame canvas {
   max-height: none;
 }
 
 .height-image-wrap.viewport-fit-width .overlay-frame,
-.height-image-wrap.viewport-fit-width .overlay-frame img {
+.height-image-wrap.viewport-fit-width .overlay-frame img,
+.height-image-wrap.viewport-fit-width .overlay-frame canvas {
   width: 100%;
 }
 
@@ -4994,7 +4996,8 @@ tbody tr:hover {
   justify-content: center;
 }
 
-.height-image-wrap.viewport-fit-height .overlay-frame img {
+.height-image-wrap.viewport-fit-height .overlay-frame img,
+.height-image-wrap.viewport-fit-height .overlay-frame canvas {
   max-height: 72vh;
   max-width: none;
 }
@@ -5278,7 +5281,8 @@ tbody tr:hover {
   cursor: crosshair;
 }
 
-.overlay-frame img {
+.overlay-frame img,
+.overlay-frame canvas {
   display: block;
   height: auto;
   object-fit: contain;
@@ -10153,7 +10157,8 @@ th {
   width: 100%;
 }
 
-.walkthrough-artifact-chip img {
+.walkthrough-artifact-chip img,
+.walkthrough-artifact-chip canvas {
   display: block;
   height: 130px;
   object-fit: contain;
@@ -10280,16 +10285,19 @@ th {
 }
 
 .walkthrough-lightbox-visual.viewport-fit-width .overlay-frame,
-.walkthrough-lightbox-visual.viewport-fit-width .overlay-frame img {
+.walkthrough-lightbox-visual.viewport-fit-width .overlay-frame img,
+.walkthrough-lightbox-visual.viewport-fit-width .overlay-frame canvas {
   width: 100%;
 }
 
 .walkthrough-lightbox-visual.viewport-fit-height .overlay-frame,
-.walkthrough-lightbox-visual.viewport-fit-height .overlay-frame img {
+.walkthrough-lightbox-visual.viewport-fit-height .overlay-frame img,
+.walkthrough-lightbox-visual.viewport-fit-height .overlay-frame canvas {
   height: 100%;
 }
 
-.walkthrough-lightbox-visual.viewport-natural .overlay-frame img {
+.walkthrough-lightbox-visual.viewport-natural .overlay-frame img,
+.walkthrough-lightbox-visual.viewport-natural .overlay-frame canvas {
   max-height: none;
   max-width: none;
 }

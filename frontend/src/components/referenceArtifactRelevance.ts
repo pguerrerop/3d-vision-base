@@ -429,7 +429,7 @@ export function preferredDetectArtifactsForView(
   if (viewId === "height_aware_connectivity_rejected_edges") return byIds(["height_aware_connectivity_rejected_edges", "height_aware_connectivity_debug"]);
   if (viewId === "height_borders") return byIds(["height_border_strength", "height_border_cut_mask", "height_border_split_debug"]);
   if (viewId === "height_border_fragments") return byIds(["height_border_fragments_overlay", "height_border_fragments_mask", "height_border_fragments_id_mask", "fragment_merge_debug"]);
-  if (viewId === "height_split_blobs") return byIds(["height_split_blob_fragments_overlay", "height_split_blob_fragments_mask", "height_split_blob_id_mask", "height_split_debug", "height_consistent_blob_summary"]);
+  if (viewId === "height_split_blobs") return byIds(["height_split_blob_fragments_overlay", "height_split_blob_fragments_mask", "height_split_blob_fragments_pre_merge_mask", "height_split_blob_id_mask", "height_split_debug", "height_consistent_blob_summary"]);
   if (viewId === "blob_clusters") return byIds(["blob_cluster_score_table", "blob_height_clusters", "blob_cluster_selection_debug"]);
   if (viewId === "blob_cluster_scores") return byIds(["blob_cluster_score_table", "blob_cluster_selection_debug", "blob_height_clusters"]);
   if (viewId === "selection_bridge") return byIds(["blob_height_clusters", "blob_cluster_selection_debug", "blob_cluster_score_table"]);

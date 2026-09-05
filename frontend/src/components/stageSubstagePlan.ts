@@ -88,11 +88,20 @@ function categoryForUnitRole(role: string | undefined, present: boolean, unitAct
   return "active";
 }
 
-function ioRoleForUnitRole(role: string | undefined, feedsInto: string[] | undefined): ArtifactIoRole | undefined {
+function ioRoleForUnitRole(role: string | undefined, feedsInto: string[] | undefined, isDeclaredOutput: boolean): ArtifactIoRole | undefined {
+  // A unit's own declared `outputs` contract is the ground truth for "this is what this step
+  // hands off" -- it wins over `role`, which sometimes marks a stage-root's own output artifacts
+  // as role="input"/"diagnostic" to describe the *kind* of data (raw capture, informational JSON)
+  // rather than whether it's consumed from elsewhere.
+  if (isDeclaredOutput) return "output";
   if (role === "input") return "input";
   if (role === "diagnostic" && (feedsInto?.length ?? 0) > 0) return "output";
   if (role === "final") return "output";
   return undefined;
+}
+
+function unitOutputArtifactIds(unit: ProcessingUnitDefinition): Set<string> {
+  return new Set(unit.outputs.map((entry) => entry.artifact_id).filter((id): id is string => Boolean(id)));
 }
 
 function primaryRoleForView(unit: ProcessingUnitDefinition, viewId: string): string | undefined {
@@ -121,6 +130,7 @@ const BLOB_CLUSTER_ONLY_ARTIFACTS = new Set([
   "height_border_fragments_id_mask",
   "height_split_blob_fragments_overlay",
   "height_split_blob_fragments_mask",
+  "height_split_blob_fragments_pre_merge_mask",
   "height_split_blob_id_mask",
   "height_split_debug",
   "blob_cluster_score_table",
@@ -155,6 +165,7 @@ const HEIGHT_BORDER_ONLY_ARTIFACTS = new Set([
 const HEIGHT_HISTOGRAM_ONLY_ARTIFACTS = new Set([
   "height_split_blob_fragments_overlay",
   "height_split_blob_fragments_mask",
+  "height_split_blob_fragments_pre_merge_mask",
   "height_split_blob_id_mask",
   "height_split_debug",
   "height_consistent_blob_summary",
@@ -211,6 +222,7 @@ function detectSubstagePlanFromUnits(
   const runState = resolveDetectReferenceRunState(detail, stageArtifacts, null);
   const substages: ResolvedStageSubstage[] = children.map((unit) => {
     const unitActive = detectUnitActiveByApplicableArtifact(unit, presentArtifactIds, runState);
+    const declaredOutputIds = unitOutputArtifactIds(unit);
     const supportingArtifacts = unit.artifacts.map((artifact) => {
       const found = stageArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
         ?? takeArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
@@ -221,7 +233,7 @@ function detectSubstagePlanFromUnits(
         artifact: found,
         category: inactiveForStrategy ? "inactive_strategy" : categoryForUnitRole(artifact.role, Boolean(found), unitActive),
         reason: inactiveForStrategy ? INACTIVE_ARTIFACT_REASON : (unitActive ? (artifact.description ?? unit.description) : INACTIVE_UNIT_REASON),
-        ioRole: ioRoleForUnitRole(artifact.role, artifact.feeds_into),
+        ioRole: ioRoleForUnitRole(artifact.role, artifact.feeds_into, declaredOutputIds.has(artifact.artifact_id)),
       } as ResolvedSubstageArtifact;
     });
     return {
@@ -283,6 +295,7 @@ function genericSubstagePlanFromUnits(
   if (!root) return null;
   const children = childProcessingUnits(units, root.id);
   const substages: ResolvedStageSubstage[] = children.map((unit) => {
+    const declaredOutputIds = unitOutputArtifactIds(unit);
     const supportingArtifacts = unit.artifacts.map((artifact) => {
       const found = stageArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
         ?? takeArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
@@ -292,7 +305,7 @@ function genericSubstagePlanFromUnits(
         artifact: found,
         category: categoryForUnitRole(artifact.role, Boolean(found), true),
         reason: artifact.description ?? unit.description,
-        ioRole: ioRoleForUnitRole(artifact.role, artifact.feeds_into),
+        ioRole: ioRoleForUnitRole(artifact.role, artifact.feeds_into, declaredOutputIds.has(artifact.artifact_id)),
       } as ResolvedSubstageArtifact;
     });
     return {

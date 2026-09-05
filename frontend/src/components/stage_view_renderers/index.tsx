@@ -277,10 +277,11 @@ const renderers: Record<string, (props: RendererProps) => ReactElement> = {
       if (props.view.id === "height_split_blobs") {
         return artifact.artifact_id === "height_split_blob_fragments_overlay"
           || artifact.artifact_id === "height_split_blob_fragments_mask"
+          || artifact.artifact_id === "height_split_blob_fragments_pre_merge_mask"
           || artifact.artifact_id === "height_split_blob_id_mask"
           || artifact.artifact_id === "height_split_debug"
           || artifact.artifact_id === "height_consistent_blob_summary"
-          || /height_split_blob_fragments_overlay|height_split_blob_fragments_mask|height_split_blob_id_mask|height_split_debug|height_consistent_blob_summary/i.test(String(artifact.path ?? ""));
+          || /height_split_blob_fragments_overlay|height_split_blob_fragments_mask|height_split_blob_fragments_pre_merge_mask|height_split_blob_id_mask|height_split_debug|height_consistent_blob_summary/i.test(String(artifact.path ?? ""));
       }
       if (props.view.id === "blob_clusters") {
         return artifact.artifact_id === "blob_height_clusters"

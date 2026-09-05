@@ -1,5 +1,5 @@
 import type { PipelineInfo, PipelineStageInfo, ProcessingUnitDefinition, TakeDetail } from "../api/client.js";
-import { processingUnitsForPipeline, processingUnitsForStage, resolveProcessingUnitArtifactRefs, rootProcessingUnit } from "./processingUnitModel.js";
+import { processingUnitsForPipeline, processingUnitsForStage, rootProcessingUnit } from "./processingUnitModel.js";
 import {
   blobComponentModeLabel,
   blobSplitMethodLabel,
@@ -615,17 +615,32 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
 
     const substages: WalkthroughSubstage[] = [];
     const root = rootProcessingUnit(units);
+    // Resolved the same way as `rootArtifacts` below (stageArtifacts/takeArtifacts only, no
+    // source-binding fallback) so a given artifact's presence agrees between the outputs
+    // summary and the stage-overview artifact grid instead of contradicting it.
     const outputs: WalkthroughOutput[] = root
-      ? resolveProcessingUnitArtifactRefs(detail, root, stageArtifacts, takeArtifacts).outputs.map((ref) => ({
-          id: ref.id,
-          label: ref.label,
-          artifactId: ref.artifactId,
-          present: ref.present,
-          artifact: ref.artifact,
-        }))
+      ? root.outputs.map((entry) => {
+          const found = entry.artifact_id
+            ? stageArtifacts.find((item) => item.artifact_id === entry.artifact_id)
+              ?? takeArtifacts.find((item) => item.artifact_id === entry.artifact_id)
+              ?? null
+            : null;
+          return {
+            id: entry.id,
+            label: entry.label,
+            artifactId: entry.artifact_id ?? null,
+            present: Boolean(found),
+            artifact: found,
+          };
+        })
       : [];
     if (root) {
       const presentIds = new Set(stageArtifacts.map((item) => item.artifact_id).concat(takeArtifacts.map((item) => item.artifact_id)));
+      // A unit's own declared `outputs` contract outranks its artifacts' `role` -- a stage root
+      // often tags its own deliverables role="input"/"diagnostic" to describe the *kind* of data
+      // (raw capture, informational JSON) rather than whether it's consumed from elsewhere, which
+      // would otherwise show the stage's real output(s) tagged IN instead of OUT.
+      const rootOutputArtifactIds = new Set(root.outputs.map((entry) => entry.artifact_id).filter((id): id is string => Boolean(id)));
       const rootArtifacts: WalkthroughArtifact[] = root.artifacts.map((artifact) => {
         const found = stageArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
           ?? takeArtifacts.find((item) => item.artifact_id === artifact.artifact_id)
@@ -635,7 +650,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
           label: artifact.label,
           relevance: found ? (artifact.role === "diagnostic" ? "debug" : "active") : "missing",
           reason: artifact.description ?? undefined,
-          ioRole: resolveIoRole(artifact.role, root.id, artifact.artifact_id),
+          ioRole: rootOutputArtifactIds.has(artifact.artifact_id) ? "output" : resolveIoRole(artifact.role, root.id, artifact.artifact_id),
           artifact: found,
           feedsInto: resolveFeedsInto(artifact.feeds_into),
         };
@@ -650,6 +665,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
 
     for (const resolved of resolution.substages) {
       const unit = units.find((item) => item.id === resolved.unitId);
+      const unitOutputArtifactIds = new Set((unit?.outputs ?? []).map((entry) => entry.artifact_id).filter((id): id is string => Boolean(id)));
       const artifacts: WalkthroughArtifact[] = resolved.supportingArtifacts.map((entry) => {
         const declared = unit?.artifacts.find((a) => a.artifact_id === entry.artifactId);
         return {
@@ -657,7 +673,9 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
           label: entry.artifact?.title ?? entry.artifactId,
           relevance: entry.category,
           reason: entry.reason,
-          ioRole: unit && declared ? resolveIoRole(declared.role, unit.id, declared.artifact_id) : entry.ioRole,
+          ioRole: unitOutputArtifactIds.has(entry.artifactId)
+            ? "output"
+            : (unit && declared ? resolveIoRole(declared.role, unit.id, declared.artifact_id) : entry.ioRole),
           artifact: entry.artifact,
           feedsInto: resolveFeedsInto(declared?.feeds_into),
         };

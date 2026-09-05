@@ -1771,6 +1771,7 @@ class DetectBeltPlaneStage:
                     border_cut_mask = np.asarray(fragment_result.get("height_border_cut_mask"), dtype=bool)
                     border_fragment_labels = np.asarray(fragment_result.get("height_border_fragment_labels"), dtype=np.int32)
                     border_fragment_mask = np.asarray(fragment_result.get("height_border_fragment_mask"), dtype=bool)
+                    fragment_mask_pre_merge = np.asarray(fragment_result.get("fragment_mask_pre_merge"), dtype=bool)
                     merge_debug_rows = list(fragment_result.get("merge_debug") or [])
                     clusters = _cluster_low_gradient_blobs_by_height(
                         fragment_rows,
@@ -2040,6 +2041,10 @@ class DetectBeltPlaneStage:
                     cv2.imwrite(str(output_dir / "height_split_blob_fragments_overlay.png"), fragment_overlay)
                     cv2.imwrite(str(output_dir / "height_split_blob_fragments_mask.png"), ((fragment_labels > 0).astype(np.uint8) * 255))
                     cv2.imwrite(str(output_dir / "height_split_blob_id_mask.png"), (fragment_labels % 255).astype(np.uint8))
+                    # Snapshot of what "Blob splitting" itself produced, before "Fragment merge" runs
+                    # and overwrites height_split_blob_fragments_mask with the merged result -- without
+                    # this, the pre-merge state is never observable in a processed take.
+                    cv2.imwrite(str(output_dir / "height_split_blob_fragments_pre_merge_mask.png"), (fragment_mask_pre_merge.astype(np.uint8) * 255))
                     cv2.imwrite(str(output_dir / "selected_blob_cluster_mask.png"), (candidate_mask.astype(np.uint8) * 255))
                     cv2.imwrite(str(output_dir / "selected_blob_cluster_pre_refine_mask.png"), (selected_pre_refine_mask.astype(np.uint8) * 255))
                     cv2.imwrite(str(output_dir / "selected_blob_cluster_refined_mask.png"), (selected_refined_mask.astype(np.uint8) * 255))
@@ -3589,7 +3594,7 @@ class DetectBeltPlaneStage:
             status="skipped" if background_detection_strategy != "low_gradient_blob_height_clusters" else "completed",
             parameters={"blob_split_method": str(self.blob_split_method)},
             input_artifacts=["low_gradient_blob_id_mask"],
-            output_artifacts=["height_border_fragments_mask", "height_split_blob_fragments_mask", "height_split_debug"],
+            output_artifacts=["height_border_fragments_mask", "height_split_blob_fragments_pre_merge_mask", "height_split_debug"],
             metrics={"fragment_count": int(len(fragment_rows)), "border_cut_pixels": int(np.count_nonzero(border_cut_mask))},
         )
         _runtime_trace_mask_unit(
@@ -3599,8 +3604,8 @@ class DetectBeltPlaneStage:
             parent_id="detect_belt_plane",
             status="skipped" if background_detection_strategy != "low_gradient_blob_height_clusters" else "completed",
             parameters={"blob_split_merge_weak_boundaries": bool(self.blob_split_merge_weak_boundaries)},
-            input_artifacts=["height_split_blob_fragments_mask"],
-            output_artifacts=["fragment_merge_debug"],
+            input_artifacts=["height_split_blob_fragments_pre_merge_mask"],
+            output_artifacts=["fragment_merge_debug", "height_split_blob_fragments_mask"],
             metrics={"merged_fragment_count": int(len(fragment_rows))},
         )
         _runtime_trace_mask_unit(
@@ -4721,6 +4726,16 @@ class DetectBeltPlaneStage:
             kind="image",
             title="Height-split blob fragments mask",
             path="height_split_blob_fragments_mask.png",
+            mime_type="image/png",
+            preview_available=True,
+            metadata={"source": "native_pipeline", "producer": self.name},
+        )
+        context.add_processing_artifact(
+            artifact_id="height_split_blob_fragments_pre_merge_mask",
+            stage_id="detect_belt_plane",
+            kind="image",
+            title="Height-split blob fragments (pre-merge)",
+            path="height_split_blob_fragments_pre_merge_mask.png",
             mime_type="image/png",
             preview_available=True,
             metadata={"source": "native_pipeline", "producer": self.name},
@@ -10969,7 +10984,7 @@ def _height_border_split_fragment_masks(
 ) -> dict[str, Any]:
     mask = blob_mask & valid_mask
     if not np.any(mask):
-        return {"split": False, "reason": "empty_blob_mask", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
+        return {"split": False, "reason": "empty_blob_mask", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_mask_pre_merge": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
     ys, xs = np.where(mask)
     pad = max(2, int(max(smoothing_kernel, dilate_kernel, close_kernel)))
     y0 = max(0, int(np.min(ys)) - pad)
@@ -11003,7 +11018,7 @@ def _height_border_split_fragment_masks(
     local_strength = np.where(local_valid, local_strength, 0.0)
     strength_vals = local_strength[local_mask]
     if strength_vals.size == 0:
-        return {"split": False, "reason": "no_strength_inside_blob", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
+        return {"split": False, "reason": "no_strength_inside_blob", "fragment_masks": [mask], "strength_map": np.zeros_like(z, dtype=np.float32), "cut_mask": np.zeros_like(mask, dtype=bool), "fragment_mask": mask.copy(), "fragment_mask_pre_merge": mask.copy(), "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32), "merge_debug": []}
     threshold_mode_normalized = str(threshold_mode or "percentile").strip().lower()
     if threshold_mode_normalized == "fixed":
         threshold_mm = float(min_delta_mm)
@@ -11037,6 +11052,7 @@ def _height_border_split_fragment_masks(
             "strength_map": strength_map,
             "cut_mask": cut_mask,
             "fragment_mask": mask.copy(),
+            "fragment_mask_pre_merge": mask.copy(),
             "fragment_labels": np.zeros_like(blob_mask, dtype=np.int32),
             "threshold_mm": threshold_mm,
             "edge_candidate_pixels": edge_candidate_pixels,
@@ -11053,6 +11069,13 @@ def _height_border_split_fragment_masks(
         global_mask = np.zeros_like(mask, dtype=bool)
         global_mask[y0:y1, x0:x1] = component
         fragment_masks_global.append(global_mask & mask)
+    # Snapshot the pre-merge fragment coverage before weak-boundary merging (below) reassigns
+    # fragment_masks_global -- this is what "Blob splitting" actually produced, as opposed to what
+    # "Fragment merge" leaves behind under the same fragment_labels/height_split_blob_fragments_mask
+    # artifact once merged.
+    fragment_mask_pre_merge = np.zeros_like(mask, dtype=bool)
+    for component in fragment_masks_global:
+        fragment_mask_pre_merge |= component
     merge_debug: list[dict[str, Any]] = []
     merge_count = 0
     if merge_weak_boundaries:
@@ -11090,6 +11113,7 @@ def _height_border_split_fragment_masks(
         "strength_map": strength_map,
         "cut_mask": cut_mask,
         "fragment_mask": fragment_mask,
+        "fragment_mask_pre_merge": fragment_mask_pre_merge,
         "fragment_labels": fragment_labels,
         "threshold_mm": threshold_mm,
         "edge_candidate_pixels": edge_candidate_pixels,
@@ -11155,6 +11179,7 @@ def _split_low_gradient_blob_candidates_by_height(
     strength_map = np.zeros_like(z, dtype=np.float32)
     cut_mask = np.zeros_like(labels, dtype=bool)
     border_fragment_mask = np.zeros_like(labels, dtype=bool)
+    fragment_mask_pre_merge = np.zeros_like(labels, dtype=bool)
     method = _normalize_blob_split_method(split_enabled, split_method)
     eligible_blob_count = 0
     height_border_split_blob_count = 0
@@ -11298,6 +11323,7 @@ def _split_low_gradient_blob_candidates_by_height(
             )
             strength_map = np.maximum(strength_map, np.asarray(border_result.get("strength_map"), dtype=np.float32))
             cut_mask |= np.asarray(border_result.get("cut_mask"), dtype=bool)
+            fragment_mask_pre_merge |= np.asarray(border_result.get("fragment_mask_pre_merge"), dtype=bool)
             if border_result.get("split"):
                 height_border_split_blob_count += 1
                 current_masks = [np.asarray(mask, dtype=bool) for mask in (border_result.get("fragment_masks") or []) if np.any(mask)]
@@ -11433,6 +11459,7 @@ def _split_low_gradient_blob_candidates_by_height(
         "height_border_cut_mask": cut_mask,
         "height_border_fragment_labels": border_fragment_labels,
         "height_border_fragment_mask": border_fragment_mask,
+        "fragment_mask_pre_merge": fragment_mask_pre_merge,
         "merge_debug": merge_debug_rows,
         "warnings": warnings,
     }

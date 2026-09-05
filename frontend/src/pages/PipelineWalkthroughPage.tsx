@@ -7,6 +7,8 @@ import {
   shouldUseBinaryMaskRenderer,
 } from "../components/binaryMaskArtifacts";
 import { artifactRelevanceLabel, artifactRelevanceTone } from "../components/referenceArtifactRelevance";
+import IdMaskRenderer from "../components/IdMaskRenderer";
+import { isIdMaskArtifact } from "../components/idMaskArtifacts";
 import { sourceArtifactsForTake } from "../components/stage_sources";
 import { stageSemanticDefinition } from "../components/stageSemantics";
 import { preferredViewportModeForArtifact, type ViewportMode } from "../components/studioViewState";
@@ -217,6 +219,7 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
     [selectedArtifact, state?.src, takeId],
   );
   const useBinaryMaskView = Boolean(selectedArtifact && shouldUseBinaryMaskRenderer(selectedArtifact, allArtifacts));
+  const useIdMaskView = Boolean(selectedArtifact && isIdMaskArtifact(selectedArtifact));
   const blobSetData = useMemo(
     () => (selectedArtifact && stageSemanticDefinition(selectedArtifact.stage_id).category === "geometry"
       ? normalizeBlobDetectionArtifacts(stageArtifacts)
@@ -326,6 +329,10 @@ function Lightbox({ state, detail, takeId, onClose }: { state: LightboxState; de
                     onSelectCandidate={setSelectedBlobId}
                     onHoverCandidate={setHoveredBlobId}
                   />
+                ) : useIdMaskView ? (
+                  <div className="overlay-frame">
+                    <IdMaskRenderer src={previewUrl ?? ""} alt={state.label} />
+                  </div>
                 ) : useBinaryMaskView ? (
                   <BinaryMaskRenderer
                     artifact={selectedArtifact}
@@ -450,11 +457,12 @@ function ArtifactChip({ takeId, entry, tuneHref, onOpen }: { takeId: string; ent
   // at full contrast; the USED badge alone is enough to convey their role.
   const isDeemphasized = entry.relevance === "inactive_strategy" || entry.relevance === "legacy";
   const image = entry.artifact?.kind === "image" && entry.artifact.path ? fileUrl(takeId, entry.artifact.path) : null;
+  const isIdMask = Boolean(entry.artifact && isIdMaskArtifact(entry.artifact));
   return (
     <div className={`walkthrough-artifact-chip${isDeemphasized ? " deemphasized" : ""}`} title={entry.reason ?? undefined}>
       {image ? (
         <button type="button" className="walkthrough-artifact-chip-image-button" onClick={() => onOpen({ src: image, label: entry.label, artifact: entry, tuneHref })}>
-          <img src={image} alt={entry.label} loading="lazy" />
+          {isIdMask ? <IdMaskRenderer src={image} alt={entry.label} /> : <img src={image} alt={entry.label} loading="lazy" />}
         </button>
       ) : null}
       <div className="walkthrough-artifact-chip-label">

@@ -308,10 +308,14 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
             outputs=[
                 ProcessingUnitOutput(id="selected_support", label="Selected reference support", artifact_id="selected_reference_support_mask", kind="mask"),
                 ProcessingUnitOutput(id="reference_model", label="Reference model", artifact_id="belt_plane", kind="json"),
+                ProcessingUnitOutput(id="suppression_mask", label="Reference suppression mask", artifact_id="reference_suppression_mask", kind="mask", description="Consumed by remove_belt_segment_objects to suppress reference-surface pixels."),
+                ProcessingUnitOutput(id="raw_preview", label="Raw heightmap preview", artifact_id="raw_heightmap_preview", kind="image", description="Consumed by normalize_heights_to_plane."),
             ],
             artifacts=[
                 _artifact(root_id, "selected_reference_support_mask", "Final selected support", role="final", description="Selected support after refinement and stripe suppression."),
                 _artifact(root_id, "belt_plane", "Reference model", kind="json", role="final", renderer="json", description="Resolved belt/reference surface model."),
+                _artifact(root_id, "reference_suppression_mask", "Reference suppression mask", role="final", description="Handed to remove_belt_segment_objects to suppress reference-surface pixels."),
+                _artifact(root_id, "raw_heightmap_preview", "Raw heightmap preview", role="final", description="Handed to normalize_heights_to_plane."),
                 _artifact(root_id, "plane_fit_debug", "Plane-fit debug", kind="json", role="diagnostic", renderer="json"),
             ],
             parameters=[
@@ -719,7 +723,11 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
             order=70,
             description="Split mixed-height support components into height-consistent fragments.",
             inputs=[ProcessingUnitInput(id="components", label="Blob components", artifact_id="low_gradient_blob_id_mask", kind="mask")],
-            outputs=[ProcessingUnitOutput(id="fragments", label="Split fragments", artifact_id="height_split_blob_fragments_mask", kind="mask")],
+            # artifact_id renamed from height_split_blob_fragments_mask: that name is now
+            # fragment_merge's own output (the merged result) -- this substage only ever writes the
+            # pre-merge state, under its own distinct artifact_id, so the two states aren't collapsed
+            # into a single overwritten file.
+            outputs=[ProcessingUnitOutput(id="fragments", label="Split fragments (pre-merge)", artifact_id="height_split_blob_fragments_pre_merge_mask", kind="mask")],
             artifacts=[
                 _artifact("detect_belt_plane.blob_splitting", "height_border_strength", "Height-border strength", role="diagnostic", feeds_into=["height_border_fragments_mask"]),
                 _artifact("detect_belt_plane.blob_splitting", "height_border_cut_mask", "Height-border cut mask", role="diagnostic", feeds_into=["height_border_fragments_mask"]),
@@ -727,23 +735,23 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
                 _artifact("detect_belt_plane.blob_splitting", "height_border_fragments_overlay", "Height-border fragments overlay", role="intermediate"),
                 _artifact("detect_belt_plane.blob_splitting", "height_border_fragments_mask", "Height-border fragments mask", role="intermediate"),
                 _artifact("detect_belt_plane.blob_splitting", "height_split_blob_fragments_overlay", "Height-split blob overlay", role="intermediate"),
-                _artifact("detect_belt_plane.blob_splitting", "height_split_blob_fragments_mask", "Height-split blob mask", role="intermediate"),
+                _artifact("detect_belt_plane.blob_splitting", "height_split_blob_fragments_pre_merge_mask", "Height-split blob mask (pre-merge)", role="final"),
                 _artifact("detect_belt_plane.blob_splitting", "height_split_debug", "Height-split debug", kind="json", role="diagnostic", renderer="json"),
             ],
             parameters=[
-                _parameter(fields, "blob_split_by_height_enabled", affects=["height_border_fragments_mask", "height_split_blob_fragments_mask"], tuning_hint="Disable only when splitting destroys a valid continuous belt support."),
-                _parameter(fields, "blob_split_method", affects=["height_split_blob_fragments_mask"], tuning_hint="Use height borders first when object-vs-belt boundaries are spatially visible."),
-                _parameter(fields, "blob_split_min_height_range_mm", affects=["height_split_blob_fragments_mask"], tuning_hint="Lower this if subtle but real mixed-height support never gets split."),
-                _parameter(fields, "blob_split_min_pixels", affects=["height_split_blob_fragments_mask"], tuning_hint="Lower this if valid narrow fragments are ignored before splitting."),
-                _parameter(fields, "blob_split_gap_mm", affects=["height_split_blob_fragments_mask"], tuning_hint="Raise the gap only when histogram splitting under-separates clear height modes."),
-                _parameter(fields, "blob_split_mode", affects=["height_split_blob_fragments_mask"]),
+                _parameter(fields, "blob_split_by_height_enabled", affects=["height_border_fragments_mask", "height_split_blob_fragments_pre_merge_mask"], tuning_hint="Disable only when splitting destroys a valid continuous belt support."),
+                _parameter(fields, "blob_split_method", affects=["height_split_blob_fragments_pre_merge_mask"], tuning_hint="Use height borders first when object-vs-belt boundaries are spatially visible."),
+                _parameter(fields, "blob_split_min_height_range_mm", affects=["height_split_blob_fragments_pre_merge_mask"], tuning_hint="Lower this if subtle but real mixed-height support never gets split."),
+                _parameter(fields, "blob_split_min_pixels", affects=["height_split_blob_fragments_pre_merge_mask"], tuning_hint="Lower this if valid narrow fragments are ignored before splitting."),
+                _parameter(fields, "blob_split_gap_mm", affects=["height_split_blob_fragments_pre_merge_mask"], tuning_hint="Raise the gap only when histogram splitting under-separates clear height modes."),
+                _parameter(fields, "blob_split_mode", affects=["height_split_blob_fragments_pre_merge_mask"]),
                 _parameter(fields, "blob_split_hist_bins", affects=["height_split_debug"]),
                 _parameter(fields, "blob_split_min_band_fraction", affects=["height_split_debug"]),
                 _parameter(fields, "blob_split_min_band_pixels", affects=["height_split_debug"]),
-                _parameter(fields, "blob_split_merge_gap_mm", affects=["height_split_blob_fragments_mask"]),
-                _parameter(fields, "blob_split_refine_morphology", affects=["height_split_blob_fragments_mask"]),
-                _parameter(fields, "blob_split_open_kernel", affects=["height_split_blob_fragments_mask"]),
-                _parameter(fields, "blob_split_close_kernel", affects=["height_split_blob_fragments_mask"]),
+                _parameter(fields, "blob_split_merge_gap_mm", affects=["height_split_blob_fragments_pre_merge_mask"]),
+                _parameter(fields, "blob_split_refine_morphology", affects=["height_split_blob_fragments_pre_merge_mask"]),
+                _parameter(fields, "blob_split_open_kernel", affects=["height_split_blob_fragments_pre_merge_mask"]),
+                _parameter(fields, "blob_split_close_kernel", affects=["height_split_blob_fragments_pre_merge_mask"]),
                 _parameter(fields, "blob_split_height_border_enabled", affects=["height_border_strength", "height_border_cut_mask"]),
                 _parameter(fields, "blob_split_height_border_mode", affects=["height_border_strength"]),
                 _parameter(fields, "blob_split_height_border_smoothing_kernel", affects=["height_border_strength"]),
@@ -753,13 +761,13 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
                 _parameter(fields, "blob_split_height_border_dilate_kernel", affects=["height_border_cut_mask"]),
                 _parameter(fields, "blob_split_height_border_close_kernel", affects=["height_border_cut_mask"]),
                 _parameter(fields, "blob_split_height_border_min_length_px", affects=["height_border_cut_mask"]),
-                _parameter(fields, "blob_split_min_fragment_area_px", affects=["height_split_blob_fragments_mask"], tuning_hint="Raise this only after checking that valid belt slivers are not being discarded."),
+                _parameter(fields, "blob_split_min_fragment_area_px", affects=["height_split_blob_fragments_pre_merge_mask"], tuning_hint="Raise this only after checking that valid belt slivers are not being discarded."),
             ],
             diagnostics=["height_border_split_debug", "height_split_debug"],
             views=[
                 _view("height_borders", "Height borders", ["height_border_strength", "height_border_cut_mask"]),
                 _view("height_border_fragments", "Height-border fragments", ["height_border_fragments_overlay", "height_border_fragments_mask"]),
-                _view("height_split_blobs", "Height-split blobs", ["height_split_blob_fragments_overlay", "height_split_blob_fragments_mask"]),
+                _view("height_split_blobs", "Height-split blobs (pre-merge)", ["height_split_blob_fragments_overlay", "height_split_blob_fragments_pre_merge_mask"]),
             ],
             default_view="height_split_blobs",
             help_markdown="This unit explains where the blob strategy cuts mixed-height support into fragments that can later be merged or clustered.",
@@ -821,9 +829,12 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
             category="fragment_merge",
             order=80,
             description="Reconnect weakly split fragments that still look like one belt support region.",
-            inputs=[ProcessingUnitInput(id="split_fragments", label="Split fragments", artifact_id="height_split_blob_fragments_mask", kind="mask")],
+            inputs=[ProcessingUnitInput(id="split_fragments", label="Split fragments (pre-merge)", artifact_id="height_split_blob_fragments_pre_merge_mask", kind="mask")],
             outputs=[ProcessingUnitOutput(id="merged_fragments", label="Merged fragments", artifact_id="height_split_blob_fragments_mask", kind="mask")],
-            artifacts=[_artifact("detect_belt_plane.fragment_merge", "fragment_merge_debug", "Fragment-merge debug", kind="json", role="diagnostic", renderer="json")],
+            artifacts=[
+                _artifact("detect_belt_plane.fragment_merge", "height_split_blob_fragments_mask", "Merged fragments", role="final", description="Post-merge fragment mask; overwrites the pre-merge state under its own canonical artifact_id."),
+                _artifact("detect_belt_plane.fragment_merge", "fragment_merge_debug", "Fragment-merge debug", kind="json", role="diagnostic", renderer="json"),
+            ],
             parameters=[
                 _parameter(fields, "blob_split_merge_weak_boundaries", affects=["height_split_blob_fragments_mask"], tuning_hint="Disable only when fragment rescue repeatedly merges obvious objects into belt support."),
                 _parameter(fields, "blob_split_merge_max_median_z_gap_mm", affects=["height_split_blob_fragments_mask"]),
@@ -859,7 +870,12 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
             category="support_refinement",
             order=90,
             description="Trim the selected logical support cluster into the fit-support mask used downstream.",
-            inputs=[ProcessingUnitInput(id="selected_cluster", label="Selected blob cluster", artifact_id="selected_blob_cluster_pre_refine_mask", kind="mask")],
+            # inputs=[] (not a formal ProcessingUnitInput): this previously declared
+            # selected_blob_cluster_pre_refine_mask as an input, but that artifact is written by this
+            # same refinement step itself (an audit-trail snapshot alongside
+            # selected_blob_cluster_refined_mask), not received from an earlier substage -- no unit in
+            # the pipeline declares producing it.
+            inputs=[],
             outputs=[ProcessingUnitOutput(id="refined_support", label="Refined support", artifact_id="selected_blob_cluster_refined_mask", kind="mask")],
             artifacts=[
                 _artifact("detect_belt_plane.candidate_support_refinement", "selected_blob_cluster_mask", "Selected blob cluster", role="intermediate"),
@@ -1275,15 +1291,20 @@ def input_processing_units() -> list[ProcessingUnitDefinition]:
             outputs=[
                 ProcessingUnitOutput(id="height_preview", label="Height preview", artifact_id="source_heightmap_preview", kind="image"),
                 ProcessingUnitOutput(id="metadata", label="Source metadata", artifact_id="source_json", kind="json"),
+                ProcessingUnitOutput(id="valid_mask", label="Valid sensor mask", artifact_id="valid_mask", kind="mask", description="Consumed by detect_belt_plane to constrain reference-surface search to sensor-valid pixels."),
             ],
             artifacts=[
                 _artifact(root_id, "source_heightmap_preview", "Source height preview", role="input"),
-                _artifact(root_id, "raw_heightmap_preview", "Raw heightmap preview", role="input"),
                 _artifact(root_id, "source_json", "Source JSON", kind="json", role="diagnostic", renderer="json"),
+                _artifact(root_id, "valid_mask", "Valid sensor mask", role="final", description="Handed to detect_belt_plane to constrain reference-surface search."),
             ],
             views=[
-                _view("height_preview", "Height preview", ["source_heightmap_preview", "raw_heightmap_preview"]),
-                _view("heightmap", "Heightmap (raw)", ["raw_heightmap_preview", "source_heightmap_preview"]),
+                # raw_heightmap_preview is intentionally not referenced here: despite living under
+                # this stage's contract historically, it's actually written by DetectBeltPlaneStage
+                # (stage_id="detect_belt_plane") at runtime, not by LoadHeightmapCaptureStage -- see
+                # input.raw_heightmap below and detect_belt_plane.input, where it's really produced.
+                _view("height_preview", "Height preview", ["source_heightmap_preview"]),
+                _view("heightmap", "Heightmap (raw)", ["source_heightmap_preview"]),
                 _view("json", "JSON", ["source_json"], renderer_type="json"),
             ],
             default_view="height_preview",
@@ -1311,15 +1332,18 @@ def input_processing_units() -> list[ProcessingUnitDefinition]:
             stage_id="input",
             category="input",
             order=20,
-            description="Raw heightmap preview handed to Detect Reference and normalization.",
-            outputs=[ProcessingUnitOutput(id="raw_preview", label="Raw heightmap preview", artifact_id="raw_heightmap_preview", kind="image")],
+            description="Decoded height preview from the raw capture.",
+            # raw_heightmap_preview is deliberately not declared here -- it's written later by
+            # DetectBeltPlaneStage (stage_id="detect_belt_plane"), not by this stage's own code, so
+            # it belongs to detect_belt_plane.input instead of being misattributed as this substage's
+            # output.
+            outputs=[ProcessingUnitOutput(id="height_preview", label="Source height preview", artifact_id="source_heightmap_preview", kind="image")],
             artifacts=[
-                _artifact("input.raw_heightmap", "raw_heightmap_preview", "Raw heightmap preview", role="input"),
-                _artifact("input.raw_heightmap", "source_heightmap_preview", "Source height preview", role="input", source_artifact_id="raw_heightmap_preview"),
+                _artifact("input.raw_heightmap", "source_heightmap_preview", "Source height preview", role="input"),
             ],
             views=[
-                _view("height_preview", "Height preview", ["source_heightmap_preview", "raw_heightmap_preview"]),
-                _view("heightmap", "Heightmap (raw)", ["raw_heightmap_preview", "source_heightmap_preview"]),
+                _view("height_preview", "Height preview", ["source_heightmap_preview"]),
+                _view("heightmap", "Heightmap (raw)", ["source_heightmap_preview"]),
             ],
             default_view="height_preview",
         ),
@@ -1333,7 +1357,7 @@ def input_processing_units() -> list[ProcessingUnitDefinition]:
             order=25,
             description="Sensor-valid pixels available to downstream reference detection and normalization.",
             outputs=[ProcessingUnitOutput(id="valid_mask", label="Valid sensor mask", artifact_id="valid_mask", kind="mask")],
-            artifacts=[_artifact("input.valid_mask", "valid_mask", "Valid sensor mask", role="input")],
+            artifacts=[_artifact("input.valid_mask", "valid_mask", "Valid sensor mask", role="final")],
             views=[_view("valid_mask", "Valid mask", ["valid_mask"])],
             default_view="valid_mask",
         ),
@@ -1421,8 +1445,10 @@ def normalize_processing_units() -> list[ProcessingUnitDefinition]:
             category="normalization",
             order=110,
             description="Consumes the selected reference model and raw source frame.",
+            # No `outputs` here: this substage only receives belt_plane from detect_belt_plane, it
+            # doesn't produce it -- it previously re-declared it as its own output too, which made the
+            # IN/OUT badge falsely claim this stage also produces the reference model.
             inputs=[ProcessingUnitInput(id="belt_plane", label="Reference model", artifact_id="belt_plane", kind="json")],
-            outputs=[ProcessingUnitOutput(id="reference_model", label="Reference surface model", artifact_id="belt_plane", kind="json")],
             artifacts=[_artifact("normalize_heights_to_plane.reference_model_input", "belt_plane", "Reference surface model", kind="json", role="input", renderer="json")],
             views=[_view("reference_surface", "Reference surface model", ["belt_plane"], renderer_type="json")],
             default_view="reference_surface",
@@ -1519,7 +1545,12 @@ def segmentation_processing_units(stage_parameter_schema: Mapping[str, Any]) -> 
             ],
             outputs=[
                 ProcessingUnitOutput(id="final_mask", label="Final object mask", artifact_id="final_object_mask", kind="mask"),
-                ProcessingUnitOutput(id="connected_components", label="Connected components overlay", artifact_id="connected_components_overlay", kind="overlay"),
+                # `connected_components` (plain JSON) is genuinely produced here, by
+                # ExtractConnectedComponentsStage (tagged stage_id="remove_belt_segment_objects" at
+                # runtime) -- geometry.connected_component_extraction only *consumes* it downstream,
+                # despite previously (incorrectly) re-declaring it as its own output too.
+                ProcessingUnitOutput(id="components", label="Connected components", artifact_id="connected_components", kind="json"),
+                ProcessingUnitOutput(id="components_overlay", label="Connected components overlay", artifact_id="connected_components_overlay", kind="overlay"),
             ],
             artifacts=[
                 _artifact(root_id, "foreground_before_plane_suppression", "Foreground before reference suppression", role="diagnostic"),
@@ -1528,6 +1559,7 @@ def segmentation_processing_units(stage_parameter_schema: Mapping[str, Any]) -> 
                 _artifact(root_id, "plane_suppressed_mask", "Reference-suppressed mask", role="diagnostic"),
                 _artifact(root_id, "cleaned_object_mask", "Cleaned object mask", role="diagnostic"),
                 _artifact(root_id, "final_object_mask", "Final object mask", role="final"),
+                _artifact(root_id, "connected_components", "Connected components", kind="json", role="final", renderer="json"),
                 _artifact(root_id, "connected_components_overlay", "Connected components overlay", kind="overlay", role="final", renderer="overlay"),
                 _artifact(root_id, "segmentation_debug", "Segmentation debug", kind="json", role="diagnostic", renderer="json"),
             ],
@@ -1705,10 +1737,12 @@ def segmentation_processing_units(stage_parameter_schema: Mapping[str, Any]) -> 
             description="Final object mask and component-level preparation for geometry.",
             outputs=[
                 ProcessingUnitOutput(id="final_mask", label="Final object mask", artifact_id="final_object_mask", kind="mask"),
+                ProcessingUnitOutput(id="components", label="Connected components", artifact_id="connected_components", kind="json"),
                 ProcessingUnitOutput(id="components_overlay", label="Connected components overlay", artifact_id="connected_components_overlay", kind="overlay"),
             ],
             artifacts=[
                 _artifact("remove_belt_segment_objects.connected_component_preparation", "final_object_mask", "Final object mask", role="final"),
+                _artifact("remove_belt_segment_objects.connected_component_preparation", "connected_components", "Connected components", kind="json", role="final", renderer="json"),
                 _artifact("remove_belt_segment_objects.connected_component_preparation", "connected_components_overlay", "Connected components overlay", kind="overlay", role="final", renderer="overlay"),
                 _artifact("remove_belt_segment_objects.connected_component_preparation", "segmentation_debug", "Segmentation debug", kind="json", role="diagnostic", renderer="json"),
             ],
@@ -1770,7 +1804,10 @@ def geometry_processing_units() -> list[ProcessingUnitDefinition]:
             category="geometry",
             order=310,
             description="Consumes segmentation connected components for downstream contour and ellipse work.",
-            outputs=[ProcessingUnitOutput(id="components", label="Connected components", artifact_id="connected_components", kind="json")],
+            # No `outputs` here: this substage only consumes connected_components (produced by
+            # remove_belt_segment_objects.connected_component_preparation), it doesn't produce it --
+            # it previously re-declared it as its own output too, misattributing the real producer.
+            inputs=[ProcessingUnitInput(id="components", label="Connected components", artifact_id="connected_components", kind="json")],
             artifacts=[
                 _artifact("geometry.connected_component_extraction", "connected_components", "Connected components", kind="json", role="input", renderer="json"),
                 _artifact("geometry.connected_component_extraction", "connected_components_overlay", "Connected components overlay", kind="overlay", role="diagnostic", renderer="overlay"),

@@ -36,6 +36,7 @@ const DETECT_REFERENCE_BACKFILL: Record<string, ArtifactContractBackfill> = {
   height_aware_connectivity_rejected_edges: { substage_id: "height_aware_connectivity", display_label: "Rejected Z-connections", order_index: 4, semantic_type: "rejected_connectivity_edges", role: "diagnostic" },
   height_border_strength: { substage_id: "height_border_detection", display_label: "Height-border strength", order_index: 5, semantic_type: "height_border_strength", role: "diagnostic" },
   height_border_fragments_mask: { substage_id: "blob_splitting", display_label: "Height-border fragments", order_index: 6, semantic_type: "height_border_fragments_mask", role: "logical_support" },
+  height_split_blob_fragments_pre_merge_mask: { substage_id: "blob_splitting", display_label: "Pre-merge fragments", order_index: 6, semantic_type: "height_split_fragments_pre_merge_mask", role: "logical_support" },
   height_split_blob_fragments_mask: { substage_id: "fragment_merge", display_label: "Post-merge fragments", order_index: 7, semantic_type: "height_split_fragments_mask", role: "logical_support" },
   blob_height_clusters: { substage_id: "height_clustering", display_label: "Height clusters", order_index: 8, semantic_type: "height_clusters", role: "diagnostic" },
   selected_blob_cluster_pre_refine_mask: { substage_id: "candidate_support_refinement", display_label: "Selected cluster pre-refine", order_index: 9, semantic_type: "selected_cluster_pre_refine", role: "logical_support" },
