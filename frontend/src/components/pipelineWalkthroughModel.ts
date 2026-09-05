@@ -1,5 +1,5 @@
 import type { PipelineInfo, PipelineStageInfo, ProcessingUnitDefinition, TakeDetail } from "../api/client.js";
-import { processingUnitsForPipeline, processingUnitsForStage, rootProcessingUnit } from "./processingUnitModel.js";
+import { processingUnitsForPipeline, processingUnitsForStage, resolveProcessingUnitArtifactRefs, rootProcessingUnit } from "./processingUnitModel.js";
 import {
   blobComponentModeLabel,
   blobSplitMethodLabel,
@@ -73,6 +73,16 @@ export type WalkthroughParameterGroup = {
 
 export type WalkthroughTuningHint = { condition: string; actions: string[] };
 
+// The stage's own declared deliverable(s) -- from the root processing unit's `outputs` contract,
+// not derived from per-artifact ioRole tags (which also fire for intra-stage substage handoffs).
+export type WalkthroughOutput = {
+  id: string;
+  label: string;
+  artifactId: string | null;
+  present: boolean;
+  artifact: StudioArtifact | null;
+};
+
 export type WalkthroughSubstage = {
   unitId: string;
   substageId: string;
@@ -92,6 +102,7 @@ export type WalkthroughStage = {
   label: string;
   description?: string;
   strategySummary?: Array<{ label: string; value: string }>;
+  outputs: WalkthroughOutput[];
   substages: WalkthroughSubstage[];
 };
 
@@ -597,10 +608,22 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
     const semantic = stageSemanticDefinition(canonical);
     const stageArtifacts = artifactsForStage(detail, stage.id);
     const resolution = resolveStageSubstagePlan(stage.id, semantic, pipeline, detail, stageArtifacts, takeArtifacts);
-    const units = processingUnitsForStage(pipeline, detail, canonical);
+    // Processing-unit `stage_id` values are raw backend ids (e.g. "input"), not the label-aware
+    // canonical used for semantic-view lookup (e.g. "load_heightmap") -- match resolveStageSubstagePlan's
+    // own single-arg canonicalization here, or the "input" stage's root unit (and thus its outputs) never resolves.
+    const units = processingUnitsForStage(pipeline, detail, canonicalStageId(stage.id));
 
     const substages: WalkthroughSubstage[] = [];
     const root = rootProcessingUnit(units);
+    const outputs: WalkthroughOutput[] = root
+      ? resolveProcessingUnitArtifactRefs(detail, root, stageArtifacts, takeArtifacts).outputs.map((ref) => ({
+          id: ref.id,
+          label: ref.label,
+          artifactId: ref.artifactId,
+          present: ref.present,
+          artifact: ref.artifact,
+        }))
+      : [];
     if (root) {
       const presentIds = new Set(stageArtifacts.map((item) => item.artifact_id).concat(takeArtifacts.map((item) => item.artifact_id)));
       const rootArtifacts: WalkthroughArtifact[] = root.artifacts.map((artifact) => {
@@ -663,6 +686,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
       label: stage.display_name,
       description: stage.description,
       strategySummary: strategySummaryForStage(stage.id, detail, stageArtifacts),
+      outputs,
       substages,
     };
   });

@@ -2739,6 +2739,11 @@ input[type="text"] {
   overflow: hidden;
 }
 
+.studio-stage-rail-copy small.studio-stage-rail-output {
+  color: #1f4b99;
+  font-weight: 700;
+}
+
 .studio-stage-rail-meta {
   align-items: end;
   display: grid;
@@ -9978,6 +9983,39 @@ th {
 .walkthrough-stage h2 {
   font-size: 18px;
   margin: 0 0 4px;
+}
+
+.walkthrough-stage-outputs {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+
+.walkthrough-stage-outputs-label {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.walkthrough-stage-output-chip {
+  background: #eaf2ff;
+  border: 1px solid #c4d8f8;
+  border-radius: 999px;
+  color: #1f4b99;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 10px;
+}
+
+.walkthrough-stage-output-chip.missing {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: #94a3b8;
+  text-decoration: line-through;
 }
 
 .walkthrough-strategy-summary {

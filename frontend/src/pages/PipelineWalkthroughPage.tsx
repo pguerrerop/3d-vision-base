@@ -611,6 +611,20 @@ function StageSection({
     <section className="walkthrough-stage">
       <h2>{stage.label}</h2>
       {stage.description ? <p className="walkthrough-muted">{stage.description}</p> : null}
+      {stage.outputs.length > 0 ? (
+        <div className="walkthrough-stage-outputs" aria-label="This stage's output(s)">
+          <span className="walkthrough-stage-outputs-label">{stage.outputs.length > 1 ? "Outputs" : "Output"}</span>
+          {stage.outputs.map((output) => (
+            <span
+              key={output.id}
+              className={`walkthrough-stage-output-chip${output.present ? "" : " missing"}`}
+              title={output.present ? output.label : `${output.label} — not produced for this run`}
+            >
+              {output.artifact?.title ?? output.label}
+            </span>
+          ))}
+        </div>
+      ) : null}
       {stage.strategySummary?.length ? (
         <div className="walkthrough-strategy-summary" aria-label="Selected strategy for this run">
           {stage.strategySummary.map((entry) => (
