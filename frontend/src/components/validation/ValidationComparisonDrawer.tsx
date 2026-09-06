@@ -105,7 +105,7 @@ export default function ValidationComparisonDrawer({
         <table>
           <tbody>
             <tr>
-              <th scope="row">Suite</th>
+              <th scope="row">Regression suite</th>
               <td>{suite.name}</td>
               <th scope="row">Execution</th>
               <td>{execution.id}</td>

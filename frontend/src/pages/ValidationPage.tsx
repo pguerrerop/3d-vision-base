@@ -186,7 +186,7 @@ export default function ValidationPage() {
       <section className="control-panel-section">
         <div className="control-panel-button-row">
           <label>
-            Suite{" "}
+            Regression suite{" "}
             <select value={suiteId} onChange={(event) => void selectSuite(event.target.value)}>
               {suites.map((item) => (
                 <option key={item.id} value={item.id}>
@@ -197,29 +197,29 @@ export default function ValidationPage() {
           </label>
           <input
             value={newName}
-            placeholder="New suite name"
+            placeholder="New regression suite name"
             onChange={(event) => setNewName(event.target.value)}
           />
           <button type="button" onClick={() => void create()}>
-            Create suite
+            Create regression suite
           </button>
           <button
             type="button"
             disabled={!suite || suite.status === "archived"}
             onClick={() => void run()}
           >
-            Run suite
+            Run regression suite
           </button>
           <button type="button" disabled={!suite} onClick={() => void lifecycle("duplicate")}>
             Duplicate
           </button>
           {suite?.status === "archived" ? (
             <button type="button" onClick={() => void lifecycle("restore")}>
-              Restore suite
+              Restore regression suite
             </button>
           ) : (
             <button type="button" disabled={!suite} onClick={() => void lifecycle("archive")}>
-              Archive suite
+              Archive regression suite
             </button>
           )}
         </div>
