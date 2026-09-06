@@ -1254,12 +1254,19 @@ export default function ProcessingLabPage() {
       setTakesOffset(page.next_offset ?? page.offset + page.items.length);
       setTakesHasMore(Boolean(page.has_more));
       if (!append) {
-        const nextTakeId = resolveNextSelectedTakeId({
-          currentSelectedTakeId: selectedTakeIdRef.current,
-          availableTakeIds: page.items.map((take) => take.take_id),
-          preferredTakeId: studioDeepLink.take_id ?? page.items[0]?.take_id ?? null,
-        }) ?? "";
-        setSelectedTakeId(nextTakeId);
+        // A take deep-linked into the workbench loads independently via api.take()
+        // regardless of list membership — don't let this session-scoped page (capped
+        // at 50 takes) silently swap it for an unrelated one just because the linked
+        // take is older than the page's window.
+        const deepLinkedTakeActive = Boolean(studioDeepLink.take_id) && selectedTakeIdRef.current === studioDeepLink.take_id;
+        if (!deepLinkedTakeActive) {
+          const nextTakeId = resolveNextSelectedTakeId({
+            currentSelectedTakeId: selectedTakeIdRef.current,
+            availableTakeIds: page.items.map((take) => take.take_id),
+            preferredTakeId: studioDeepLink.take_id ?? page.items[0]?.take_id ?? null,
+          }) ?? "";
+          setSelectedTakeId(nextTakeId);
+        }
       }
     } finally {
       if (takesRequestIdRef.current === requestId) {
