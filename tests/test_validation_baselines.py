@@ -1181,3 +1181,91 @@ def test_stage_summary_route_matches_the_service_method(tmp_path: Path) -> None:
     execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
 
     assert routes.stage_summary(execution["id"], store=store) == store.stage_summary(execution["id"])
+
+
+# --------------------------------------------------------------------------
+# Stage trend: the same aggregation lined up across a suite's recent executions
+# --------------------------------------------------------------------------
+
+def test_stage_trend_aligns_points_to_executions_and_leaves_real_gaps(tmp_path: Path) -> None:
+    """A (stage, comparator) that only exists from a later execution onward must
+    show as a gap in the earlier positions, never as a fabricated zero."""
+    store, source, mask_baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [mask_baseline["id"]]})
+
+    exec1 = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    # A second case, a different stage and comparator, added only after exec1.
+    raster_source = tmp_path / "raster.npy"
+    np.save(raster_source, np.array([[1.0, 2.0]], dtype=np.float32))
+    resolved = {
+        "artifact_root": tmp_path,
+        "artifacts": [{"artifact_id": "final_object_mask", "stage_id": "measurement", "processing_unit_id": "measurement", "kind": "image", "path": raster_source.name}],
+        "result_payload": {"processing_pipeline": {"processing_units": []}, "recipe_snapshot": {}},
+        "stage_params": {}, "recipe_id": None,
+    }
+    store._resolve = lambda **_: resolved  # type: ignore[method-assign]
+    raster_baseline = store.create_baselines({"take_id": "take_raster", "pipeline_id": PIPELINE, "run_id": "run_1", "approval_scope": "artifact", "stage_id": "measurement", "artifact_id": "final_object_mask", "comparison_policy": {"comparator": "numeric_raster"}})["baselines"][0]
+    store.add_case(suite["id"], {"baseline_ids": [raster_baseline["id"]]})
+
+    exec2 = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    exec3 = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    trend = store.stage_trend(suite["id"], limit=5)
+    assert [e["execution_id"] for e in trend["executions"]] == [exec1["id"], exec2["id"], exec3["id"]]
+
+    mask_stage = next(s for s in trend["stages"] if s["stage_id"] == "detect_belt_plane")
+    mask_series = next(c for c in mask_stage["comparators"] if c["comparator"] == "binary_mask")
+    assert all(point is not None for point in mask_series["points"]), "present in every execution"
+
+    raster_stage = next(s for s in trend["stages"] if s["stage_id"] == "measurement")
+    raster_series = next(c for c in raster_stage["comparators"] if c["comparator"] == "numeric_raster")
+    assert raster_series["points"][0] is None, "the case did not exist yet at exec1"
+    assert raster_series["points"][1] is not None and raster_series["points"][2] is not None
+
+
+def test_stage_trend_limit_keeps_only_the_most_recent_executions(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    executions = [store.execute_suite(suite["id"], {"candidate_run_id": "run_1"}) for _ in range(4)]
+
+    trend = store.stage_trend(suite["id"], limit=2)
+    assert [e["execution_id"] for e in trend["executions"]] == [x["id"] for x in executions[-2:]]
+
+
+def test_stage_trend_tolerates_a_non_positive_limit_without_returning_everything_unbounded(tmp_path: Path) -> None:
+    """list[-0:] is the whole list in Python -- a real footgun for a limit of 0."""
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    executions = [store.execute_suite(suite["id"], {"candidate_run_id": "run_1"}) for _ in range(3)]
+
+    trend = store.stage_trend(suite["id"], limit=0)
+    assert len(trend["executions"]) == 1
+    assert trend["executions"][0]["execution_id"] == executions[-1]["id"]
+
+
+def test_stage_trend_still_lists_every_registered_stage_with_no_data_across_the_window(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    trend = store.stage_trend(suite["id"])
+    stage_ids = {s["stage_id"] for s in trend["stages"]}
+    assert len(stage_ids) > 1
+    untouched = [s for s in trend["stages"] if s["stage_id"] != "detect_belt_plane"]
+    assert untouched and all(s["comparators"] == [] for s in untouched)
+
+
+def test_stage_trend_route_matches_the_service_method(tmp_path: Path) -> None:
+    from vision_3d_acquisition.api import validation as routes
+
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    assert routes.stage_trend(suite["id"], limit=3, store=store) == store.stage_trend(suite["id"], limit=3)

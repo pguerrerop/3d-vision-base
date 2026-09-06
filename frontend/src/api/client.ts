@@ -2406,6 +2406,11 @@ export interface ValidationNumericFieldSummary { count: number; mean: number; me
 export interface ValidationStageComparatorSummary { comparator: string; count: number; status_counts: Record<string, number>; metrics: Record<string, ValidationNumericFieldSummary>; }
 export interface ValidationStageSummaryEntry { stage_id: string; label: string; comparators: ValidationStageComparatorSummary[]; }
 export interface ValidationStageSummary { execution_id: string; stages: ValidationStageSummaryEntry[]; }
+/** One execution's point for a (stage, comparator) series, or null for a genuine gap -- that comparator produced nothing in that execution. */
+export type ValidationStageTrendPoint = { count: number; status_counts: Record<string, number>; metrics: Record<string, ValidationNumericFieldSummary>; } | null;
+export interface ValidationStageTrendSeries { comparator: string; points: ValidationStageTrendPoint[]; }
+export interface ValidationStageTrendStageEntry { stage_id: string; label: string; comparators: ValidationStageTrendSeries[]; }
+export interface ValidationStageTrend { suite_id: string; executions: Array<{ execution_id: string; created_at?: string | null }>; stages: ValidationStageTrendStageEntry[]; }
 
 export interface ValidationExecution {
   id: string; suite_id: string; pipeline_id: string; status: string; candidate_run_id: string;
@@ -2541,6 +2546,7 @@ export const api = {
   validationBaseline: (baselineId: string) => request<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}`),
   validationMatrix: (executionId: string) => request<{ execution_id: string; columns: Array<{ id:string; label:string; stage_id:string; order:number }>; rows: Array<{ case_id:string; take_id:string; overall_status:string; cells:Array<{ column_id:string; status:string; comparison_ids:Array<string | null>; first_divergence:boolean; artifact_id?:string | null }> }> }>(`/api/validation/executions/${encodeURIComponent(executionId)}/matrix`),
   validationStageSummary: (executionId: string) => request<ValidationStageSummary>(`/api/validation/executions/${encodeURIComponent(executionId)}/stage-summary`),
+  validationStageTrend: (suiteId: string, limit = 5) => request<ValidationStageTrend>(`/api/validation/suites/${encodeURIComponent(suiteId)}/stage-trend?limit=${encodeURIComponent(String(limit))}`),
   runValidationSuite: (suiteId: string, candidateRunId = "latest") => post<ValidationExecution>(`/api/validation/suites/${encodeURIComponent(suiteId)}/execute`, { candidate_run_id: candidateRunId }),
   health: () => request<HealthResponse>("/api/health"),
   state: () => request<RuntimeState>("/api/state"),

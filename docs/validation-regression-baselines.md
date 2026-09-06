@@ -86,6 +86,16 @@ Fields are never pooled across comparators — an IoU and an MAE mean nothing av
 
 `GET /api/validation/executions/{id}/stage-summary` exposes it; the workspace renders it as a "Stage summary" panel below the matrix.
 
+## Stage trend
+
+A single execution's stage summary can still hide a slow slide: mean IoU at 0.97, then 0.96, then 0.95, never once crossing a pass/fail line on any individual case. `stage_trend(suite_id, limit=5)` lines up `stage_summary()` across a suite's most recent executions so that slide becomes visible, keyed the same way -- `(stage_id, comparator)` -- and never pooling an IoU with an MAE.
+
+Computed on demand, not persisted: one `stage_summary()` call per execution in the window, no new storage. A suite whose history grows long enough that this is visibly slow to compute is the signal to reconsider persisting a rollup at write time instead; nothing about this shipped version requires or rules out that change.
+
+A `(stage, comparator)` pair absent from a given execution -- no case exercised it that run, or a baseline's comparator was reconfigured afterward -- is a real gap and is reported as one (`null`), never backfilled as a zero. `limit` is clamped to at least 1 (Python's `list[-0:]` is the whole list, not an empty one, and 0 would otherwise silently mean "everything").
+
+`GET /api/validation/suites/{id}/stage-trend?limit=5` exposes it; the workspace renders a "Stage trend" panel next to the stage summary, one table per stage with data, one column per execution.
+
 ## Operations
 
 The CLI is intentionally usable in CI. Twenty-one commands cover the governance family: suite lifecycle (`list-suites`, `inspect-suite`, `update-suite`, `duplicate-suite`, `archive-suite`, `restore-suite`, `coverage`), cases (`add-case`, `update-case`, `remove-case`), baselines (`baseline-history`, `activate-baseline`, `deactivate-baseline`, `compare`, `promote-comparison`), and execution (`run-suite`, `list-executions`, `inspect-execution`, `rebuild-indexes`, `verify-integrity`, `smoke`). All emit JSON.
@@ -102,9 +112,11 @@ The API answers refusals with a status code and a plain message, not typed error
 
 ## Current limitations
 
+Stage summary and stage trend both read through the same registry-derived stage list `matrix()` uses, so an artifact whose `stage_id` is not one the pipeline's own contract registers is invisible to all three, the same way `matrix()` already omitted it before either existed.
+
 `coverage()` and `_case_baselines()` were fixed to resolve each case's active mode/pinned/allowed_versions setting rather than iterating raw `baseline_ids`. Two related things were true before this: coverage double-counted a case pinned to an inactive version, and active mode could return the same resolved baseline twice when `baseline_ids` held more than one version of the same family — which `execute_suite()` would then compare against redundantly. Both are covered by tests now.
 
-- Stage summary rolls up numbers within one execution; nothing yet tracks a stage's aggregate across successive executions, so a slow drift that never crosses one execution's own pass/fail line is still invisible run over run. It reads through the same registry-derived stage list `matrix()` uses, so an artifact whose `stage_id` is not one the pipeline's own contract registers is invisible to both, the same way `matrix()` already omits it.
+- Stage trend labels each execution column by its date to a day's precision; several executions run within the same day (or the same minute, as in development) render identical column headers with nothing to disambiguate them beyond hovering the underlying execution id.
 - Promotion has no UI. The backend, the client binding and the impact summary are all in place.
 - Studio has mark-as-reference and compare-with-reference. Add-to-suite and deep links into `/validation` are not built.
 - Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so a `&comparison=` deep link would carry a baseline id.

@@ -1291,8 +1291,11 @@ class ValidationService:
         )
         return {"deleted": case_id}
 
-    def list_executions(self) -> list[dict[str, Any]]:
-        return self._items("executions")
+    def list_executions(self, *, suite_id: str | None = None) -> list[dict[str, Any]]:
+        rows = self._items("executions")
+        if suite_id is not None:
+            rows = [row for row in rows if row.get("suite_id") == suite_id]
+        return rows
 
     def rebuild_indexes(self) -> dict[str, int]:
         """Rebuild disposable indexes from canonical immutable records."""
@@ -1584,6 +1587,84 @@ class ValidationService:
                 }
             )
         return {"execution_id": execution_id, "stages": stages}
+
+    def stage_trend(self, suite_id: str, *, limit: int = 5) -> dict[str, Any]:
+        """How each stage's aggregate is moving across a suite's recent executions.
+
+        A single execution's stage_summary can look fine while still being part
+        of a slow slide -- mean IoU at 0.97, then 0.96, then 0.95, never once
+        crossing a pass/fail line. This lines up stage_summary() across the
+        suite's last ``limit`` executions so that slide is visible.
+
+        Computed on demand, not persisted: one stage_summary() call per
+        execution in the window, no new storage. If a suite's history grows
+        long enough that this is visibly slow to compute, that is the signal
+        to persist a rollup at write time instead -- nothing here requires or
+        rules out that change.
+
+        A (stage, comparator) pair absent from a given execution -- no case in
+        the suite exercised it that run, or the comparator was reconfigured
+        after that baseline was approved -- is a real gap and is reported as
+        one (``None``), never backfilled as a zero.
+        """
+        limit = max(1, int(limit))
+        executions = sorted(
+            self.list_executions(suite_id=suite_id),
+            key=lambda row: str(row.get("created_at") or ""),
+        )[-limit:]
+
+        per_execution = [
+            {
+                "execution_id": str(row["id"]),
+                "created_at": row.get("created_at"),
+                "summary": self.stage_summary(str(row["id"])),
+            }
+            for row in executions
+        ]
+
+        stage_order: list[str] = []
+        stage_labels: dict[str, str] = {}
+        points_by_key: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+        for entry in per_execution:
+            for stage in entry["summary"]["stages"]:
+                if stage["stage_id"] not in stage_order:
+                    stage_order.append(stage["stage_id"])
+                    stage_labels[stage["stage_id"]] = stage["label"]
+                for bucket in stage["comparators"]:
+                    key = (stage["stage_id"], bucket["comparator"])
+                    points_by_key.setdefault(key, {})[entry["execution_id"]] = {
+                        "count": bucket["count"],
+                        "status_counts": bucket["status_counts"],
+                        "metrics": bucket["metrics"],
+                    }
+
+        stages = []
+        for stage_id in stage_order:
+            comparators = []
+            for (bucket_stage, comparator), points in points_by_key.items():
+                if bucket_stage != stage_id:
+                    continue
+                comparators.append(
+                    {
+                        "comparator": comparator,
+                        "points": [
+                            points.get(entry["execution_id"]) for entry in per_execution
+                        ],
+                    }
+                )
+            comparators.sort(key=lambda c: str(c["comparator"]))
+            stages.append(
+                {"stage_id": stage_id, "label": stage_labels[stage_id], "comparators": comparators}
+            )
+
+        return {
+            "suite_id": suite_id,
+            "executions": [
+                {"execution_id": e["execution_id"], "created_at": e["created_at"]}
+                for e in per_execution
+            ],
+            "stages": stages,
+        }
 
     def baseline_history(self, **filters: Any) -> list[dict[str, Any]]:
         rows = []
