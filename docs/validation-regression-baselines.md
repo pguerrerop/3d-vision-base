@@ -74,6 +74,12 @@ The response describes state *after* the promotion: `previous_active_baseline` i
 
 The comparison drawer exposes this as "Promote candidate". Confirming shows the current and expected version, the candidate run, the comparison status, the carry-forward and activate-now checkboxes, an optional reviewer and notes, and the same impact list `resolution_impact()` would report for the source baseline — computed before the new version exists, since impact is matched by artifact identity rather than by baseline instance. The outcome panel distinguishes a genuine creation ("Created baseline vN.") from a reused promotion ("This candidate was already promoted as baseline vN. No new version was created.") so a retry never reads like a fresh success; when the result is inactive, it offers an "Activate baseline" button straight into the existing history drawer.
 
+## Studio integration
+
+Studio's "Mark as reference" already creates a baseline; "Add to regression suite" (next to it, gated on that baseline existing) is the other half — it puts the take into a suite without leaving Studio. Picking an existing suite or naming a new one calls `add_case()` with the just-approved baseline. `add_case()` itself has no dedupe — two calls for the same take create two cases — so Studio checks the target suite's existing cases by `take_id` first: a suite that already tracks this take reports the existing case rather than creating a sibling one. A brand-new suite skips the check, since it cannot already have a case.
+
+Either way the outcome links straight into `/validation` at the suite (and case, if the case already existed or was just created), via a `validationDeepLink` parallel to Studio's own `studioDeepLink`. The Validation page reads `suite_id`, `execution_id`, `case_id` and `comparison_id` (a baseline id, per the comparisons-have-no-identifier note below) from the URL once on load: a linked suite wins over "most recently viewed", a linked execution wins over "latest", and a linked case+comparison auto-opens the comparison drawer exactly once, guarded the same way Studio's own run-id deep link is.
+
 ## Current versus historical state
 
 The case table describes present governance. A selected historical execution reports the versions it actually used, the version it matched, its original statuses and its original first divergence. Editing a case or activating a baseline afterwards does not alter any of it — executions are written once and never revisited.
@@ -119,8 +125,8 @@ Stage summary and stage trend both read through the same registry-derived stage 
 `coverage()` and `_case_baselines()` were fixed to resolve each case's active mode/pinned/allowed_versions setting rather than iterating raw `baseline_ids`. Two related things were true before this: coverage double-counted a case pinned to an inactive version, and active mode could return the same resolved baseline twice when `baseline_ids` held more than one version of the same family — which `execute_suite()` would then compare against redundantly. Both are covered by tests now.
 
 - Stage trend labels each execution column by its date to a day's precision; several executions run within the same day (or the same minute, as in development) render identical column headers with nothing to disambiguate them beyond hovering the underlying execution id.
-- Studio has mark-as-reference and compare-with-reference. Add-to-suite and deep links into `/validation` are not built.
-- Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so a `&comparison=` deep link would carry a baseline id.
+- The Studio-side duplicate-case check is per suite, by `take_id` only. The same take can still end up with a separate case in each of several suites (by design — a take can belong to more than one suite), and two same-named suites are not disambiguated in the picker beyond their id.
+- Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so the `comparison_id` a validation deep link carries is a baseline id, not an independent comparison id.
 - `execute_suite` accepts archived suites. Case mutation is blocked on them; running is not, on the grounds that an execution does not mutate the suite.
 - Four routes have no client binding: single-baseline read, execution progress polling, integrity and index rebuild. The last two are exposed by the CLI.
-- Frontend coverage is model-level. `validationCaseModel`, `validationHistoryModel`, `validationComparisonModel`, `validationStageSummaryModel` and `validationPromotionModel` are tested; the panel, drawer and detail-view components are not.
+- Frontend coverage is model-level. `validationCaseModel`, `validationHistoryModel`, `validationComparisonModel`, `validationStageSummaryModel`, `validationPromotionModel`, `validationDeepLink` and `addToSuiteModel` are tested; the panel, drawer and detail-view components are not.
