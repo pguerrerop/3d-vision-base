@@ -40,6 +40,9 @@ export type WalkthroughArtifact = {
   relevance: ArtifactRelevance;
   reason?: string;
   ioRole?: ArtifactIoRole;
+  // Declared contract kind (falls back to the resolved artifact's own kind) -- needed to tell a
+  // missing json-kind artifact from a missing image one, since `artifact` is null either way.
+  kind?: string;
   artifact: StudioArtifact | null;
   // Populated only for role="diagnostic" artifacts whose underlying data is verified (by reading
   // the pipeline source, not inferred) to determine another artifact's value -- as opposed to a
@@ -651,6 +654,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
           relevance: found ? (artifact.role === "diagnostic" ? "debug" : "active") : "missing",
           reason: artifact.description ?? undefined,
           ioRole: rootOutputArtifactIds.has(artifact.artifact_id) ? "output" : resolveIoRole(artifact.role, root.id, artifact.artifact_id),
+          kind: found?.kind ?? artifact.kind,
           artifact: found,
           feedsInto: resolveFeedsInto(artifact.feeds_into),
         };
@@ -676,6 +680,7 @@ export function buildPipelineWalkthrough(pipeline: PipelineInfo | null, detail: 
           ioRole: unitOutputArtifactIds.has(entry.artifactId)
             ? "output"
             : (unit && declared ? resolveIoRole(declared.role, unit.id, declared.artifact_id) : entry.ioRole),
+          kind: entry.artifact?.kind ?? declared?.kind,
           artifact: entry.artifact,
           feedsInto: resolveFeedsInto(declared?.feeds_into),
         };

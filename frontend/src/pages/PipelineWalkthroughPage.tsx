@@ -519,6 +519,88 @@ function ParameterGroupBlock({ group }: { group: WalkthroughParameterGroup }) {
   );
 }
 
+// JSON artifacts often wrap their real payload under one key (e.g. feature_vector.json is
+// {"features": {...}}) -- unwrap that one level so the table shows the actual fields instead of a
+// single "features: 34 fields" row.
+function jsonPreviewEntries(data: unknown): Array<[string, unknown]> | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const obj = data as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length === 1) {
+    const only = obj[keys[0]];
+    if (only && typeof only === "object" && !Array.isArray(only) && Object.keys(only as object).length > 0) {
+      return jsonPreviewEntries(only);
+    }
+  }
+  return keys.map((key) => [key, obj[key]]);
+}
+
+function formatJsonPreviewValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number") return String(Math.round(value * 10000) / 10000);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "none";
+    if (value.every((item) => item === null || typeof item !== "object")) return value.map(formatJsonPreviewValue).join(", ");
+    return `${value.length} item${value.length === 1 ? "" : "s"}`;
+  }
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return keys.length === 0 ? "none" : `${keys.length} field${keys.length === 1 ? "" : "s"}`;
+  }
+  return String(value);
+}
+
+function JsonArtifactResult({ takeId, artifact }: { takeId: string; artifact: StudioArtifact }) {
+  const [data, setData] = useState<unknown>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    setData(undefined);
+    if (!artifact.path) {
+      setData(null);
+      return;
+    }
+    fetch(fileUrl(takeId, artifact.path))
+      .then((response) => {
+        if (!response.ok) throw new Error(String(response.status));
+        return response.json();
+      })
+      .then((json) => {
+        if (!cancelled) setData(json);
+      })
+      .catch(() => {
+        if (!cancelled) setData(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [takeId, artifact.path]);
+
+  if (data === undefined) return <small className="walkthrough-muted">Loading…</small>;
+  if (data === null) return <small className="walkthrough-muted">Could not load this file.</small>;
+  const entries = jsonPreviewEntries(data);
+  if (!entries || entries.length === 0) return <small className="walkthrough-muted">Empty.</small>;
+  return (
+    <>
+      <table className="walkthrough-json-result-table">
+        <tbody>
+          {entries.map(([key, value]) => (
+            <tr key={key}>
+              <td>{key.replace(/_/g, " ")}</td>
+              <td>{formatJsonPreviewValue(value)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <details className="walkthrough-json-raw">
+        <summary>Raw JSON</summary>
+        <pre>{JSON.stringify(data, null, 2)}</pre>
+      </details>
+    </>
+  );
+}
+
 function SubstageBlock({
   takeId,
   pipelineId,
@@ -537,6 +619,10 @@ function SubstageBlock({
   const hasParams = substage.parameterGroups.length > 0 || substage.ungroupedParameters.length > 0;
   const tuneHref = buildStudioDeepLink({ take_id: takeId, pipeline_id: pipelineId, unit_id: substage.unitId, tab: "tune" });
   const HeadingTag = isOverview ? "h3" : "h4";
+  // JSON-kind artifacts never had a thumbnail in the image grid (just an empty box) -- pull them
+  // into their own "Results" section instead, where their actual computed values can be shown.
+  const imageArtifacts = substage.artifacts.filter((entry) => entry.kind !== "json");
+  const jsonArtifacts = substage.artifacts.filter((entry) => entry.kind === "json");
   return (
     <div className={`walkthrough-substage${isOverview ? " overview" : ""}${isDeemphasized ? " deemphasized" : ""}`}>
       <header>
@@ -550,9 +636,9 @@ function SubstageBlock({
         {substage.description ? <p className="walkthrough-muted">{substage.description}</p> : null}
       </header>
 
-      {substage.artifacts.length > 0 ? (
+      {imageArtifacts.length > 0 ? (
         <div className="walkthrough-artifact-grid">
-          {substage.artifacts.map((entry) => {
+          {imageArtifacts.map((entry) => {
             const artifactTuneHref = buildStudioDeepLink({
               take_id: takeId,
               pipeline_id: pipelineId,
@@ -560,6 +646,25 @@ function SubstageBlock({
               tab: "tune",
             });
             return <ArtifactChip key={entry.artifactId} takeId={takeId} entry={entry} tuneHref={artifactTuneHref} onOpen={onOpenImage} />;
+          })}
+        </div>
+      ) : null}
+
+      {jsonArtifacts.length > 0 ? (
+        <div className="walkthrough-json-results" aria-label={`${substage.label} results`}>
+          <p className="walkthrough-substage-group-label">Results</p>
+          {jsonArtifacts.map((entry) => {
+            const jsonDeemphasized = entry.relevance === "inactive_strategy" || entry.relevance === "legacy";
+            return (
+              <div key={entry.artifactId} className={`walkthrough-json-result${jsonDeemphasized ? " deemphasized" : ""}`} title={entry.reason ?? undefined}>
+                <div className="walkthrough-json-result-label">
+                  <span>{entry.label}</span>
+                  <IoRoleTag ioRole={entry.ioRole} feedsInto={entry.feedsInto} />
+                  <RelevanceBadge relevance={entry.relevance} feedsInto={entry.feedsInto} />
+                </div>
+                {entry.artifact ? <JsonArtifactResult takeId={takeId} artifact={entry.artifact} /> : <small className="walkthrough-muted">Not produced for this run.</small>}
+              </div>
+            );
           })}
         </div>
       ) : null}
@@ -579,15 +684,15 @@ function SubstageBlock({
       )}
 
       {substage.downstreamEffects.length > 0 ? (
-        <div className="walkthrough-effects">
-          <strong>Downstream effects</strong>
+        <details className="walkthrough-effects">
+          <summary>Downstream effects</summary>
           <ul>{substage.downstreamEffects.map((effect) => <li key={effect}>{effect}</li>)}</ul>
-        </div>
+        </details>
       ) : null}
 
       {substage.tuningHints.length > 0 ? (
-        <div className="walkthrough-tuning-hints">
-          <strong>What to tune</strong>
+        <details className="walkthrough-tuning-hints">
+          <summary>What to tune</summary>
           <ul>
             {substage.tuningHints.map((hint) => (
               <li key={hint.condition}>
@@ -595,7 +700,7 @@ function SubstageBlock({
               </li>
             ))}
           </ul>
-        </div>
+        </details>
       ) : null}
     </div>
   );
@@ -708,6 +813,28 @@ export default function PipelineWalkthroughPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // CSS alone can't reliably force a native <details> open across browsers, so printing (which
+  // otherwise shows the full report regardless of on-screen collapse state) needs a direct nudge
+  // for the "Downstream effects" / "What to tune" / "Raw JSON" disclosures specifically.
+  useEffect(() => {
+    let openedByPrint: HTMLDetailsElement[] = [];
+    const handleBeforePrint = () => {
+      const all = Array.from(document.querySelectorAll<HTMLDetailsElement>("details.walkthrough-effects, details.walkthrough-tuning-hints, details.walkthrough-json-raw"));
+      openedByPrint = all.filter((el) => !el.open);
+      openedByPrint.forEach((el) => { el.open = true; });
+    };
+    const handleAfterPrint = () => {
+      openedByPrint.forEach((el) => { el.open = false; });
+      openedByPrint = [];
+    };
+    window.addEventListener("beforeprint", handleBeforePrint);
+    window.addEventListener("afterprint", handleAfterPrint);
+    return () => {
+      window.removeEventListener("beforeprint", handleBeforePrint);
+      window.removeEventListener("afterprint", handleAfterPrint);
+    };
+  }, []);
 
   if (loading) return <main className="page-pad"><div className="empty-state">Loading walkthrough…</div></main>;
   if (error) return <main className="page-pad"><div className="empty-state">{error}</div></main>;
