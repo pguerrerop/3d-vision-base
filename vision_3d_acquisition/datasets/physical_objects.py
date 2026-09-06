@@ -116,11 +116,23 @@ class PhysicalObjectRegistry:
         return synced
 
     def object_takes(self, dataset_id: str, physical_object_id: str) -> list[dict[str, Any]]:
+        from vision_3d_acquisition.api.filesystem import get_take_summary
+
         rows: list[dict[str, Any]] = []
         for sid, take_id, payload in self.dataset_service.iter_dataset_takes(dataset_id):
             if str(payload.get("physical_object_id") or "") != physical_object_id:
                 continue
-            rows.append({"session_id": sid, "take_id": take_id, "metadata": payload})
+            metadata = dict(payload)
+            if not metadata.get("thumbnail_path"):
+                # take_metadata only carries labeling fields, not file references, so
+                # thumbnails have to come from the on-disk take summary instead.
+                try:
+                    summary = get_take_summary(self.settings, take_id, include_acquisition_processing_status=False)
+                    if summary.thumbnail_path:
+                        metadata["thumbnail_path"] = summary.thumbnail_path
+                except Exception:
+                    pass
+            rows.append({"session_id": sid, "take_id": take_id, "metadata": metadata})
         rows.sort(key=lambda item: str((item.get("metadata") or {}).get("created_at") or ""))
         return rows
 

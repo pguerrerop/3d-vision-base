@@ -55,6 +55,7 @@ from vision_3d_acquisition.api.filesystem import (
 from vision_3d_acquisition.api.dataset_session_exports import DatasetSessionExportService
 from vision_3d_acquisition.datasets import DatasetService
 from vision_3d_acquisition.datasets.physical_objects import PhysicalObjectRegistry
+from vision_3d_acquisition.datasets import label_taxonomy
 from vision_3d_acquisition.datasets.label_corrections import correct_physical_object_label
 from vision_3d_acquisition.storage import db
 from vision_3d_acquisition.api.histogram import load_or_compute_histogram, resolve_source_image_path
@@ -638,6 +639,14 @@ class PhysicalObjectLabelCorrectionRequest(BaseModel):
     raw_label: str | None = None
     actor: str = "studio"
     reason: str | None = None
+
+
+class LabelTaxonomyUpsertRequest(BaseModel):
+    normalized_class: str
+    superclass: str
+    is_uncertain: bool = False
+    notes: str | None = None
+    updated_by: str = "studio"
 
 
 class MLEvaluateRequest(BaseModel):
@@ -2478,6 +2487,24 @@ def correct_physical_object_label_endpoint(physical_object_id: str, payload: Phy
         return correct_physical_object_label(data_dir=settings.data_dir, physical_object_id=physical_object_id, **payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=404 if "not found" in str(exc) else 422, detail=str(exc)) from exc
+
+
+@app.get("/api/label-taxonomy")
+def list_label_taxonomy_endpoint(query: str | None = None, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    conn = db.catalog_for_process(settings.data_dir)
+    return {"entries": label_taxonomy.list_entries(conn, query)}
+
+
+@app.post("/api/label-taxonomy")
+def upsert_label_taxonomy_endpoint(payload: LabelTaxonomyUpsertRequest, settings: ApiSettings = Depends(get_settings)) -> dict[str, Any]:
+    conn = db.catalog_for_process(settings.data_dir)
+    try:
+        return label_taxonomy.upsert_entry(
+            conn, normalized_class=payload.normalized_class, superclass=payload.superclass,
+            is_uncertain=payload.is_uncertain, notes=payload.notes, updated_by=payload.updated_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/physical-objects/reconcile")

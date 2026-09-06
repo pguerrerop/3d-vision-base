@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { api, type DatasetSummary, type PhysicalObjectSummary } from "../../api/client";
+import { useEffect, useMemo, useState } from "react";
+import { api, type DatasetSummary, type LabelTaxonomyEntry, type PhysicalObjectSummary } from "../../api/client";
 import EntityDetailDrawer from "./EntityDetailDrawer";
 import EntityStatisticsGrid from "./EntityStatisticsGrid";
 import PhysicalObjectTakeGallery from "./PhysicalObjectTakeGallery";
@@ -15,17 +15,24 @@ type Props = {
 
 export default function PhysicalObjectDetailDrawer({ open, physicalObject, dataset, onClose, onSelectSession, onLabelCorrected }: Props) {
   const [takes, setTakes] = useState<Array<{ session_id: string; take_id: string; metadata: Record<string, unknown> }>>([]);
+  const [takesLoading, setTakesLoading] = useState(false);
   const [repeatability, setRepeatability] = useState<Record<string, unknown> | null>(null);
   const [labelDraft, setLabelDraft] = useState("");
   const [superclassDraft, setSuperclassDraft] = useState("");
   const [reason, setReason] = useState("");
   const [savingCorrection, setSavingCorrection] = useState(false);
   const [correctionMessage, setCorrectionMessage] = useState("");
+  const [taxonomy, setTaxonomy] = useState<LabelTaxonomyEntry[]>([]);
 
   useEffect(() => {
     if (!open || !physicalObject) return;
-    void api.physicalObjectTakes(physicalObject.physical_object_id, physicalObject.dataset_id).then((payload) => setTakes(payload.takes || [])).catch(() => setTakes([]));
+    setTakesLoading(true);
+    void api.physicalObjectTakes(physicalObject.physical_object_id, physicalObject.dataset_id)
+      .then((payload) => setTakes(payload.takes || []))
+      .catch(() => setTakes([]))
+      .finally(() => setTakesLoading(false));
     void api.physicalObjectRepeatability(physicalObject.physical_object_id, physicalObject.dataset_id).then((payload) => setRepeatability(payload)).catch(() => setRepeatability(null));
+    void api.labelTaxonomy().then((payload) => setTaxonomy(payload.entries || [])).catch(() => setTaxonomy([]));
   }, [open, physicalObject]);
 
   useEffect(() => {
@@ -34,6 +41,15 @@ export default function PhysicalObjectDetailDrawer({ open, physicalObject, datas
     setReason("");
     setCorrectionMessage("");
   }, [physicalObject?.physical_object_id]);
+
+  const matchedTaxonomyEntry = useMemo(
+    () => taxonomy.find((entry) => entry.normalized_class === labelDraft.trim()) || null,
+    [taxonomy, labelDraft],
+  );
+
+  useEffect(() => {
+    if (matchedTaxonomyEntry) setSuperclassDraft(matchedTaxonomyEntry.superclass);
+  }, [matchedTaxonomyEntry]);
 
   async function saveCorrection() {
     if (!physicalObject || !labelDraft.trim()) return;
@@ -47,6 +63,7 @@ export default function PhysicalObjectDetailDrawer({ open, physicalObject, datas
         reason: reason.trim() || null,
       });
       setCorrectionMessage(`Correction ${result.id} applied to ${result.affected_take_ids.length} takes and ${result.affected_ml_set_ids.length} ML sets.`);
+      void api.labelTaxonomy().then((payload) => setTaxonomy(payload.entries || [])).catch(() => undefined);
       onLabelCorrected?.();
     } catch (error) {
       setCorrectionMessage(error instanceof Error ? error.message : "Label correction failed.");
@@ -80,12 +97,44 @@ export default function PhysicalObjectDetailDrawer({ open, physicalObject, datas
       <section className="entity-section">
         <h4>Correct canonical label</h4>
         <small>This updates the physical object, every linked take and its ML-set memberships in one audited database transaction.</small>
-        <label className="field-label">Normalized class<input value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} /></label>
-        <label className="field-label">Superclass<input value={superclassDraft} onChange={(event) => setSuperclassDraft(event.target.value)} /></label>
+        <label className="field-label">
+          Normalized class
+          <input value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} list="label-taxonomy-classes" placeholder="type to search known classes…" />
+          <datalist id="label-taxonomy-classes">
+            {taxonomy.map((entry) => (
+              <option key={entry.normalized_class} value={entry.normalized_class}>{entry.superclass}</option>
+            ))}
+          </datalist>
+        </label>
+        <label className="field-label">
+          Superclass
+          <input
+            value={superclassDraft}
+            onChange={(event) => setSuperclassDraft(event.target.value)}
+            disabled={Boolean(matchedTaxonomyEntry)}
+            list="label-taxonomy-superclasses"
+          />
+          <datalist id="label-taxonomy-superclasses">
+            {Array.from(new Set(taxonomy.map((entry) => entry.superclass))).map((sc) => <option key={sc} value={sc} />)}
+          </datalist>
+        </label>
+        <small>
+          {labelDraft.trim() === ""
+            ? null
+            : matchedTaxonomyEntry
+              ? `Known class — superclass locked to ${matchedTaxonomyEntry.superclass} from label_taxonomy.${matchedTaxonomyEntry.is_uncertain ? " (flagged as an inherently uncertain class.)" : ""}`
+              : "New class — not in label_taxonomy yet. Set a superclass above to register it as part of this correction."}
+        </small>
         <label className="field-label">Reason<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="e.g. cadena → SCRAP_METAL" /></label>
         <button type="button" disabled={savingCorrection || !labelDraft.trim()} onClick={() => void saveCorrection()}>{savingCorrection ? "Saving…" : "Apply audited correction"}</button>
         {correctionMessage ? <small>{correctionMessage}</small> : null}
       </section>
+      <PhysicalObjectTakeGallery
+        takes={takes}
+        loading={takesLoading}
+        datasetId={physicalObject?.dataset_id}
+        physicalObjectId={physicalObject?.physical_object_id}
+      />
       <section className="entity-section">
         <h4>Identity</h4>
         <EntityStatisticsGrid rows={[
@@ -112,7 +161,6 @@ export default function PhysicalObjectDetailDrawer({ open, physicalObject, datas
           ))}
         </div>
       </section>
-      <PhysicalObjectTakeGallery takes={takes} />
       <section className="entity-section">
         <h4>Repeatability Metrics</h4>
         {!repeatability ? <small>No repeatability summary yet.</small> : (

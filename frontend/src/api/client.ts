@@ -1257,6 +1257,15 @@ export interface PhysicalObjectSummary {
   updated_at?: string | null;
 }
 
+export interface LabelTaxonomyEntry {
+  normalized_class: string;
+  superclass: string;
+  is_uncertain: boolean;
+  notes?: string | null;
+  updated_at: string;
+  updated_by?: string | null;
+}
+
 export interface DatasetSessionDetailSummary {
   total_takes: number;
   reviewed: number;
@@ -2703,6 +2712,10 @@ export const api = {
     request<Record<string, unknown>>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/repeatability?dataset_id=${encodeURIComponent(datasetId)}`),
   correctPhysicalObjectLabel: (physicalObjectId: string, payload: { dataset_id: string; normalized_class: string; superclass?: string | null; raw_label?: string | null; actor?: string; reason?: string | null }) =>
     post<{ id: string; affected_take_ids: string[]; affected_ml_set_ids: string[] }>(`/api/physical-objects/${encodeURIComponent(physicalObjectId)}/label-corrections`, payload),
+  labelTaxonomy: (query?: string) =>
+    request<{ entries: LabelTaxonomyEntry[] }>(`/api/label-taxonomy${query ? `?query=${encodeURIComponent(query)}` : ""}`),
+  upsertLabelTaxonomyEntry: (payload: { normalized_class: string; superclass: string; is_uncertain?: boolean; notes?: string | null; updated_by?: string }) =>
+    post<LabelTaxonomyEntry>("/api/label-taxonomy", payload),
   featureAnalyticsFeatures: (params: FeatureAnalyticsQuery & { feature_selection?: string[] }) => {
     const qs = featureAnalyticsQueryToSearchParams(params);
     return request<FeatureAnalyticsFeaturesResponse>(`/api/feature-analytics/features${qs.toString() ? `?${qs.toString()}` : ""}`);

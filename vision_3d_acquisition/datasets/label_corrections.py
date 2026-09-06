@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 from typing import Any
 
+from vision_3d_acquisition.datasets import label_taxonomy
 from vision_3d_acquisition.datasets.service import DatasetService
 from vision_3d_acquisition.storage import db
 
@@ -26,6 +27,29 @@ def correct_physical_object_label(*, data_dir: Path, dataset_id: str, physical_o
         raise ValueError("normalized_class is required")
 
     conn = db.catalog_for_process(data_dir)
+
+    normalized_class = normalized_class.strip()
+    superclass = superclass.strip() if superclass else None
+    taxonomy_entry = label_taxonomy.get_entry(conn, normalized_class)
+    if taxonomy_entry is not None:
+        if superclass and superclass != taxonomy_entry["superclass"]:
+            raise ValueError(
+                f"normalized_class '{normalized_class}' is registered as {taxonomy_entry['superclass']} in "
+                f"label_taxonomy, not {superclass}. Fix the class name, or update the taxonomy entry explicitly "
+                "if the pairing itself is wrong."
+            )
+        superclass = taxonomy_entry["superclass"]
+    else:
+        if not superclass:
+            raise ValueError(
+                f"normalized_class '{normalized_class}' is not in label_taxonomy yet — provide a superclass "
+                "to register it as a new class."
+            )
+        label_taxonomy.upsert_entry(
+            conn, normalized_class=normalized_class, superclass=superclass,
+            updated_by=actor or "studio", notes=f"Auto-registered while correcting {physical_object_id}",
+        )
+
     now = _now()
     affected_takes: list[str] = []
     affected_sets: list[str] = []

@@ -129,6 +129,13 @@ function formatObjectFacetLabel(option: NonNullable<MLSetReviewFacetsResponse["o
 }
 
 export default function DatasetsPage() {
+  const deepLink = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      datasetId: params.get("dataset_id")?.trim() || "",
+      physicalObjectId: params.get("physical_object_id")?.trim() || "",
+    };
+  }, []);
   const [datasets, setDatasets] = useState<DatasetSummary[]>([]);
   const [sessions, setSessions] = useState<DatasetSessionSummary[]>([]);
   const [datasetLabelSummary, setDatasetLabelSummary] = useState<DatasetLabelSummary | null>(null);
@@ -140,13 +147,13 @@ export default function DatasetsPage() {
   const [pagedTakes, setPagedTakes] = useState<TakeSummary[]>([]);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
-  const [selectedDataset, setSelectedDataset] = useState("");
+  const [selectedDataset, setSelectedDataset] = useState(() => deepLink.datasetId);
   const [selectedSession, setSelectedSession] = useState("");
   const [sessionDrawerId, setSessionDrawerId] = useState("");
   const [selectedSessionDetailSummary, setSelectedSessionDetailSummary] = useState<DatasetSessionDetailSummary | null>(null);
   const [selectedTakeId, setSelectedTakeId] = useState("");
   const [selectedObjectId, setSelectedObjectId] = useState("");
-  const [selectedPhysicalObjectId, setSelectedPhysicalObjectId] = useState("");
+  const [selectedPhysicalObjectId, setSelectedPhysicalObjectId] = useState(() => deepLink.physicalObjectId);
   const [selectedMlSetId, setSelectedMlSetId] = useState("");
   const [activeMlSetScope, setActiveMlSetScope] = useState<MlSetScopeState | null>(null);
   const [mlSetScopedView, setMlSetScopedView] = useState<MlSetScopedView>("takes");
@@ -222,6 +229,13 @@ export default function DatasetsPage() {
       if (!selectedDataset && items[0]?.id) setSelectedDataset(items[0].id);
     }).catch((err: unknown) => setError(err instanceof Error ? err.message : "Failed to load datasets"));
   }, [selectedDataset]);
+
+  useEffect(() => {
+    if (!deepLink.datasetId || !deepLink.physicalObjectId || selectedDataset !== deepLink.datasetId) return;
+    if (!physicalObjects.some((item) => item.physical_object_id === deepLink.physicalObjectId)) return;
+    setActiveTab("physical_objects");
+    setSelectedPhysicalObjectId(deepLink.physicalObjectId);
+  }, [deepLink.datasetId, deepLink.physicalObjectId, physicalObjects, selectedDataset]);
 
   useEffect(() => {
     try {
@@ -391,7 +405,9 @@ export default function DatasetsPage() {
     setSelectionScope("visible");
     setSelectedTakeId("");
     setSelectedObjectId("");
-    setSelectedPhysicalObjectId("");
+    setSelectedPhysicalObjectId(
+      selectedDataset === deepLink.datasetId ? deepLink.physicalObjectId : "",
+    );
     setSelectedObjectGroupId("");
     setDetail(null);
   }, [
@@ -415,6 +431,8 @@ export default function DatasetsPage() {
     mlSetMembershipStatusFilter,
     mlSetSplitFilter,
     mlSetSessionFilter,
+    deepLink.datasetId,
+    deepLink.physicalObjectId,
   ]);
 
   useEffect(() => {
