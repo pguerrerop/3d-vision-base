@@ -551,7 +551,12 @@ function formatJsonPreviewValue(value: unknown): string {
   return String(value);
 }
 
-function JsonArtifactResult({ takeId, artifact }: { takeId: string; artifact: StudioArtifact }) {
+// Number of key/value rows shown in the collapsed summary line, so the reader gets a sense of the
+// result without expanding it (expanding still shows every field in the full table below).
+const JSON_RESULT_PREVIEW_ROWS = 2;
+
+function JsonArtifactResult({ takeId, entry, deemphasized }: { takeId: string; entry: WalkthroughArtifact; deemphasized: boolean }) {
+  const artifact = entry.artifact as StudioArtifact;
   const [data, setData] = useState<unknown>(undefined);
 
   useEffect(() => {
@@ -577,27 +582,48 @@ function JsonArtifactResult({ takeId, artifact }: { takeId: string; artifact: St
     };
   }, [takeId, artifact.path]);
 
-  if (data === undefined) return <small className="walkthrough-muted">Loading…</small>;
-  if (data === null) return <small className="walkthrough-muted">Could not load this file.</small>;
-  const entries = jsonPreviewEntries(data);
-  if (!entries || entries.length === 0) return <small className="walkthrough-muted">Empty.</small>;
+  const entries = data && data !== null ? jsonPreviewEntries(data) : null;
+  const previewText =
+    data === undefined
+      ? "Loading…"
+      : data === null
+        ? "Could not load this file."
+        : !entries || entries.length === 0
+          ? "Empty."
+          : entries
+              .slice(0, JSON_RESULT_PREVIEW_ROWS)
+              .map(([key, value]) => `${key.replace(/_/g, " ")}: ${formatJsonPreviewValue(value)}`)
+              .join("  ·  ") + (entries.length > JSON_RESULT_PREVIEW_ROWS ? "  ·  …" : "");
+
   return (
-    <>
-      <table className="walkthrough-json-result-table">
-        <tbody>
-          {entries.map(([key, value]) => (
-            <tr key={key}>
-              <td>{key.replace(/_/g, " ")}</td>
-              <td>{formatJsonPreviewValue(value)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <details className="walkthrough-json-raw">
-        <summary>Raw JSON</summary>
-        <pre>{JSON.stringify(data, null, 2)}</pre>
-      </details>
-    </>
+    <details className={`walkthrough-json-result${deemphasized ? " deemphasized" : ""}`} title={entry.reason ?? undefined}>
+      <summary className="walkthrough-json-result-summary">
+        <span className="walkthrough-json-result-label">
+          <span>{entry.label}</span>
+          <IoRoleTag ioRole={entry.ioRole} feedsInto={entry.feedsInto} />
+          <RelevanceBadge relevance={entry.relevance} feedsInto={entry.feedsInto} />
+        </span>
+        <span className="walkthrough-json-result-preview">{previewText}</span>
+      </summary>
+      {entries && entries.length > 0 ? (
+        <div className="walkthrough-json-result-body">
+          <table className="walkthrough-json-result-table">
+            <tbody>
+              {entries.map(([key, value]) => (
+                <tr key={key}>
+                  <td>{key.replace(/_/g, " ")}</td>
+                  <td>{formatJsonPreviewValue(value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <details className="walkthrough-json-raw">
+            <summary>Raw JSON</summary>
+            <pre>{JSON.stringify(data, null, 2)}</pre>
+          </details>
+        </div>
+      ) : null}
+    </details>
   );
 }
 
@@ -655,16 +681,19 @@ function SubstageBlock({
           <p className="walkthrough-substage-group-label">Results</p>
           {jsonArtifacts.map((entry) => {
             const jsonDeemphasized = entry.relevance === "inactive_strategy" || entry.relevance === "legacy";
-            return (
-              <div key={entry.artifactId} className={`walkthrough-json-result${jsonDeemphasized ? " deemphasized" : ""}`} title={entry.reason ?? undefined}>
-                <div className="walkthrough-json-result-label">
-                  <span>{entry.label}</span>
-                  <IoRoleTag ioRole={entry.ioRole} feedsInto={entry.feedsInto} />
-                  <RelevanceBadge relevance={entry.relevance} feedsInto={entry.feedsInto} />
+            if (!entry.artifact) {
+              return (
+                <div key={entry.artifactId} className={`walkthrough-json-result-empty${jsonDeemphasized ? " deemphasized" : ""}`} title={entry.reason ?? undefined}>
+                  <div className="walkthrough-json-result-label">
+                    <span>{entry.label}</span>
+                    <IoRoleTag ioRole={entry.ioRole} feedsInto={entry.feedsInto} />
+                    <RelevanceBadge relevance={entry.relevance} feedsInto={entry.feedsInto} />
+                  </div>
+                  <small className="walkthrough-muted">Not produced for this run.</small>
                 </div>
-                {entry.artifact ? <JsonArtifactResult takeId={takeId} artifact={entry.artifact} /> : <small className="walkthrough-muted">Not produced for this run.</small>}
-              </div>
-            );
+              );
+            }
+            return <JsonArtifactResult key={entry.artifactId} takeId={takeId} entry={entry} deemphasized={jsonDeemphasized} />;
           })}
         </div>
       ) : null}
@@ -816,11 +845,15 @@ export default function PipelineWalkthroughPage() {
 
   // CSS alone can't reliably force a native <details> open across browsers, so printing (which
   // otherwise shows the full report regardless of on-screen collapse state) needs a direct nudge
-  // for the "Downstream effects" / "What to tune" / "Raw JSON" disclosures specifically.
+  // for the "Downstream effects" / "What to tune" / JSON result / "Raw JSON" disclosures specifically.
   useEffect(() => {
     let openedByPrint: HTMLDetailsElement[] = [];
     const handleBeforePrint = () => {
-      const all = Array.from(document.querySelectorAll<HTMLDetailsElement>("details.walkthrough-effects, details.walkthrough-tuning-hints, details.walkthrough-json-raw"));
+      const all = Array.from(
+        document.querySelectorAll<HTMLDetailsElement>(
+          "details.walkthrough-effects, details.walkthrough-tuning-hints, details.walkthrough-json-result, details.walkthrough-json-raw",
+        ),
+      );
       openedByPrint = all.filter((el) => !el.open);
       openedByPrint.forEach((el) => { el.open = true; });
     };
