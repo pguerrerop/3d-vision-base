@@ -927,14 +927,15 @@ def detect_reference_processing_units(stage_parameter_schema: Mapping[str, Any])
             inputs=[ProcessingUnitInput(id="refined_support", label="Refined support", artifact_id="selected_blob_cluster_refined_mask", kind="mask", required=False)],
             outputs=[
                 ProcessingUnitOutput(id="stripe_filtered_support", label="Stripe-filtered support", artifact_id="stripe_filtered_reference_support_mask", kind="mask"),
-                ProcessingUnitOutput(id="selected_support", label="Selected support", artifact_id="selected_reference_support_mask", kind="mask"),
             ],
             artifacts=[
                 _artifact("detect_belt_plane.stripe_filter", "selected_blob_cluster_refined_mask", "Pre-stripe support", role="input"),
                 _artifact("detect_belt_plane.stripe_filter", "belt_bg_mask", "Belt background mask", role="intermediate"),
                 _artifact("detect_belt_plane.stripe_filter", "belt_base_mask", "Belt base mask", role="intermediate"),
+                # selected_reference_support_mask is NOT produced here despite the "stripe_filtered_support"
+                # view falling back to it below -- the real producer is detect_belt_plane.final_support (see
+                # its own output_artifacts in the runtime trace); this substage only feeds that stage.
                 _artifact("detect_belt_plane.stripe_filter", "stripe_filtered_reference_support_mask", "Stripe-filtered support", role="final"),
-                _artifact("detect_belt_plane.stripe_filter", "selected_reference_support_mask", "Selected support after stripe suppression", role="final"),
                 _artifact("detect_belt_plane.stripe_filter", "belt_stripes_mask", "Belt stripes mask", role="diagnostic", feeds_into=["surface_suppression_mask", "final_object_mask"]),
                 _artifact("detect_belt_plane.stripe_filter", "unknown_low_gradient_mask", "Unknown low-gradient mask", role="diagnostic"),
                 _artifact("detect_belt_plane.stripe_filter", "surface_suppression_mask", "Surface suppression mask", role="diagnostic", feeds_into=["object_search_domain_mask", "final_object_mask"]),
