@@ -5,12 +5,19 @@ import {
   type ValidationComparisonResult,
   type ValidationExecution,
   type ValidationExecutionCase,
+  type ValidationPromotionResponse,
+  type ValidationResolutionImpact,
   type ValidationSuiteCase,
   type ValidationSuiteDetail,
 } from "../../api/client";
 import { buildStudioDeepLink } from "../../studioDeepLink";
 import { validationStatus, type ValidationStatus } from "./validationStatus";
 import { describeApiError } from "./validationCaseModel";
+import {
+  describePromotionOutcome,
+  expectedNextVersion,
+  summarisePromotionImpact,
+} from "./validationPromotionModel";
 import ValidationBaselineHistoryDrawer from "./ValidationBaselineHistoryDrawer";
 import ValidationMaskDetail from "./ValidationMaskDetail";
 import ValidationRasterDetail from "./ValidationRasterDetail";
@@ -47,12 +54,23 @@ export default function ValidationComparisonDrawer({
   const [baseline, setBaseline] = useState<ValidationBaseline | null>(null);
   const [error, setError] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [promoting, setPromoting] = useState(false);
+  const [carryForwardPolicy, setCarryForwardPolicy] = useState(true);
+  const [activateNow, setActivateNow] = useState(false);
+  const [notes, setNotes] = useState("");
+  const [reviewedBy, setReviewedBy] = useState("");
+  const [impact, setImpact] = useState<ValidationResolutionImpact | null>(null);
+  const [promotionBusy, setPromotionBusy] = useState(false);
+  const [promotionResult, setPromotionResult] = useState<ValidationPromotionResponse | null>(null);
 
   const comparison = comparisons[selected];
   const baselineId = comparison?.baseline_ref.baseline_id ?? null;
 
   useEffect(() => {
     setBaseline(null);
+    setPromoting(false);
+    setPromotionResult(null);
+    setImpact(null);
     if (!baselineId) return;
     let cancelled = false;
     api
@@ -72,6 +90,39 @@ export default function ValidationComparisonDrawer({
 
   const suiteCase = suite.cases.find((item) => item.id === executionCase.case_id);
   const status = badge(comparison.status);
+
+  const openPromotion = () => {
+    setPromoting(true);
+    setImpact(null);
+    if (baselineId) {
+      api
+        .validationBaselineImpact(baselineId)
+        .then((result) => setImpact(result))
+        .catch((caught: unknown) => setError(describeApiError(caught)));
+    }
+  };
+
+  const confirmPromotion = async () => {
+    if (!baselineId) return;
+    setPromotionBusy(true);
+    setError("");
+    try {
+      const result = await api.promoteValidationComparison(execution.id, baselineId, {
+        case_id: executionCase.case_id,
+        activate: activateNow,
+        carry_forward_policy: carryForwardPolicy,
+        reviewed_by: reviewedBy.trim() || undefined,
+        notes: notes.trim() || undefined,
+      });
+      setPromotionResult(result);
+      setPromoting(false);
+      await onChanged();
+    } catch (caught: unknown) {
+      setError(describeApiError(caught));
+    } finally {
+      setPromotionBusy(false);
+    }
+  };
 
   return (
     <div className="control-panel-section" role="dialog" aria-label="Comparison detail">
@@ -227,7 +278,125 @@ export default function ValidationComparisonDrawer({
             Open baseline history
           </button>
         ) : null}
+        {baselineId && !promoting && !promotionResult ? (
+          <button type="button" onClick={openPromotion}>
+            Promote candidate
+          </button>
+        ) : null}
       </div>
+
+      {promoting && baseline ? (
+        <div className="control-panel-section" role="alertdialog" aria-label="Confirm promotion">
+          <h4>Promote candidate as new baseline?</h4>
+          <div className="table-wrap">
+            <table>
+              <tbody>
+                <tr>
+                  <th scope="row">Current version</th>
+                  <td>v{baseline.version}</td>
+                  <th scope="row">Expected next version</th>
+                  <td>v{expectedNextVersion(baseline)}</td>
+                </tr>
+                <tr>
+                  <th scope="row">Candidate run</th>
+                  <td>{execution.candidate_run_id}</td>
+                  <th scope="row">Comparison status</th>
+                  <td>{status.label}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            <small>
+              The candidate artifact is re-resolved and re-checksummed at promotion time; if it no
+              longer matches what this comparison ran against, promotion is refused rather than
+              recording provenance that disagrees with the file.
+            </small>
+          </p>
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={carryForwardPolicy}
+              onChange={(event) => setCarryForwardPolicy(event.target.checked)}
+            />
+            Carry forward this baseline&apos;s comparison policy
+          </label>
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={activateNow}
+              onChange={(event) => setActivateNow(event.target.checked)}
+            />
+            Activate immediately
+          </label>
+          <label>
+            Reviewer
+            <input value={reviewedBy} onChange={(event) => setReviewedBy(event.target.value)} />
+          </label>
+          <label>
+            Notes
+            <input value={notes} onChange={(event) => setNotes(event.target.value)} />
+          </label>
+          <p>
+            <small>Impact</small>
+          </p>
+          {impact ? (
+            <ul>
+              {summarisePromotionImpact(impact, activateNow).map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+              {!summarisePromotionImpact(impact, activateNow).length ? (
+                <li>No case references this artifact yet.</li>
+              ) : null}
+            </ul>
+          ) : (
+            <p>
+              <small>Checking which cases this would affect…</small>
+            </p>
+          )}
+          <div className="control-panel-button-row">
+            <button
+              type="button"
+              disabled={promotionBusy || !impact}
+              onClick={() => void confirmPromotion()}
+            >
+              Promote candidate
+            </button>
+            <button type="button" onClick={() => setPromoting(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {promotionResult ? (
+        <div className="control-panel-section" role="status" aria-label="Promotion result">
+          {(() => {
+            const outcome = describePromotionOutcome(promotionResult);
+            return (
+              <>
+                <h4>{outcome.headline}</h4>
+                <p>{outcome.detail}</p>
+                <ul>
+                  {summarisePromotionImpact(
+                    promotionResult.affected_case_resolution,
+                    promotionResult.baseline.status === "active",
+                  ).map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+                {outcome.needsActivation ? (
+                  <div className="control-panel-button-row">
+                    <button type="button" onClick={() => setHistoryOpen(true)}>
+                      Activate baseline
+                    </button>
+                  </div>
+                ) : null}
+              </>
+            );
+          })()}
+        </div>
+      ) : null}
 
       {historyOpen && suiteCase ? (
         <ValidationBaselineHistoryDrawer
