@@ -1023,3 +1023,161 @@ def test_file_route_serves_diff_artifacts_and_rejects_traversal(tmp_path: Path) 
 
     with pytest.raises(HTTPException):
         routes.get_file("baselines/does_not_exist.png", store=store)
+
+
+# --------------------------------------------------------------------------
+# Stage summary: quantitative rollups across a sample, per stage and comparator
+# --------------------------------------------------------------------------
+
+def test_stage_summary_aggregates_a_known_metric_correctly(tmp_path: Path) -> None:
+    """Three cases at one stage, one known IoU each: mean/median/min/max/p95 must
+    match what those three numbers actually produce, not an approximation."""
+    store, source, base1 = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [base1["id"]]})
+
+    # Two more cases, same stage and comparator, different takes.
+    for take_id, source_path in (("take_2", tmp_path / "c2.png"), ("take_3", tmp_path / "c3.png")):
+        Image.fromarray(_V1).save(source_path)
+        resolved = {
+            "artifact_root": tmp_path,
+            "artifacts": [{"artifact_id": "final_object_mask", "stage_id": "detect_belt_plane", "processing_unit_id": "detect_belt_plane", "kind": "image", "path": source_path.name}],
+            "result_payload": {"processing_pipeline": {"processing_units": []}, "recipe_snapshot": {}},
+            "stage_params": {}, "recipe_id": None,
+        }
+        store._resolve = lambda **_: resolved  # type: ignore[method-assign]
+        baseline = store.create_baselines({"take_id": take_id, "pipeline_id": PIPELINE, "run_id": "run_1", "approval_scope": "artifact", "stage_id": "detect_belt_plane", "artifact_id": "final_object_mask"})["baselines"][0]
+        store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    exec_path = store.root / "executions" / execution["id"] / "execution.json"
+
+    # Overwrite with three exact, hand-picked IoU values so the statistics are
+    # verifiable by hand rather than by re-deriving them from pixels.
+    record = json.loads(exec_path.read_text())
+    known = [1.0, 0.9, 0.5]
+    for case, iou in zip(record["cases"], known):
+        case["comparisons"][0]["metrics"]["iou"] = iou
+    exec_path.write_text(json.dumps(record))
+
+    summary = store.stage_summary(execution["id"])
+    stage = next(s for s in summary["stages"] if s["stage_id"] == "detect_belt_plane")
+    bucket = next(c for c in stage["comparators"] if c["comparator"] == "binary_mask")
+    iou_stats = bucket["metrics"]["iou"]
+
+    assert bucket["count"] == 3
+    assert iou_stats["count"] == 3
+    assert iou_stats["mean"] == pytest.approx(sum(known) / 3)
+    assert iou_stats["median"] == pytest.approx(0.9)
+    assert iou_stats["min"] == pytest.approx(0.5)
+    assert iou_stats["max"] == pytest.approx(1.0)
+    assert iou_stats["p95"] == pytest.approx(float(__import__("numpy").percentile(known, 95)))
+
+
+def test_stage_summary_never_pools_different_comparators_at_the_same_stage(tmp_path: Path) -> None:
+    """A mask's IoU and a raster's MAE must never be averaged together."""
+    store, source, mask_baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [mask_baseline["id"]]})
+
+    raster_source = tmp_path / "raster.npy"
+    import numpy as np
+    np.save(raster_source, np.array([[1.0, 2.0]], dtype=np.float32))
+    resolved = {
+        "artifact_root": tmp_path,
+        "artifacts": [{"artifact_id": "final_object_mask", "stage_id": "detect_belt_plane", "processing_unit_id": "detect_belt_plane", "kind": "image", "path": raster_source.name}],
+        "result_payload": {"processing_pipeline": {"processing_units": []}, "recipe_snapshot": {}},
+        "stage_params": {}, "recipe_id": None,
+    }
+    store._resolve = lambda **_: resolved  # type: ignore[method-assign]
+    raster_baseline = store.create_baselines({"take_id": "take_raster", "pipeline_id": PIPELINE, "run_id": "run_1", "approval_scope": "artifact", "stage_id": "detect_belt_plane", "artifact_id": "final_object_mask", "comparison_policy": {"comparator": "numeric_raster"}})["baselines"][0]
+    store.add_case(suite["id"], {"baseline_ids": [raster_baseline["id"]]})
+
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    summary = store.stage_summary(execution["id"])
+    stage = next(s for s in summary["stages"] if s["stage_id"] == "detect_belt_plane")
+    comparators = {c["comparator"] for c in stage["comparators"]}
+
+    assert comparators == {"binary_mask", "numeric_raster"}
+    mask_bucket = next(c for c in stage["comparators"] if c["comparator"] == "binary_mask")
+    raster_bucket = next(c for c in stage["comparators"] if c["comparator"] == "numeric_raster")
+    assert mask_bucket["count"] == 1 and raster_bucket["count"] == 1
+    assert "mae" not in mask_bucket["metrics"]
+    assert "iou" not in raster_bucket["metrics"]
+
+
+def test_stage_summary_excludes_disabled_cases_and_shows_stages_with_no_data(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]], "enabled": False})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    summary = store.stage_summary(execution["id"])
+    stage = next(s for s in summary["stages"] if s["stage_id"] == "detect_belt_plane")
+    assert stage["comparators"] == [], "the only case is disabled, so this stage has no data"
+
+    # Every registered stage still appears, not just the ones with comparisons.
+    stage_ids = {s["stage_id"] for s in summary["stages"]}
+    assert len(stage_ids) > 1
+    assert all(s["comparators"] == [] for s in summary["stages"] if s["stage_id"] != "detect_belt_plane")
+
+
+def test_stage_summary_counts_regressions_alongside_the_numbers(tmp_path: Path) -> None:
+    store, source, baseline = _real_stage_fixture(tmp_path)  # candidate already diverges from the baseline
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+    assert execution["cases"][0]["status"] == "regression"
+
+    summary = store.stage_summary(execution["id"])
+    stage = next(s for s in summary["stages"] if s["stage_id"] == baseline["stage_id"])
+    bucket = stage["comparators"][0]
+    assert bucket["status_counts"] == {"regression": 1}
+
+
+def test_stage_summary_treats_a_boolean_metric_as_a_pass_fraction(tmp_path: Path) -> None:
+    """json_fields reports {"equal": bool}; averaging that across cases is exactly
+    the fraction that passed, which is the whole point of a boolean metric."""
+    store = ValidationService(_settings(tmp_path))
+    left, right = tmp_path / "l.json", tmp_path / "r.json"
+    left.write_text(json.dumps({"a": 1}))
+    right.write_text(json.dumps({"a": 1}))
+    base = {"id": "b", "version": 1, "comparison_policy": {}}
+    equal = store._json_compare(left, right, base, {"artifact_id": "x"}, "json_fields")
+    assert equal["metrics"] == {"equal": True}
+    unequal = {**equal, "metrics": {"equal": False}}
+
+    for comparison in (equal, unequal):
+        comparison["baseline_ref"] = {"baseline_id": "b1"}
+    store.get_baseline = lambda _id: {"stage_id": "classification"}  # type: ignore[method-assign]
+
+    execution_id = "execution_synthetic"
+    execution = {
+        "id": execution_id,
+        "cases": [
+            {"case_id": "c1", "comparisons": [equal]},
+            {"case_id": "c2", "comparisons": [unequal]},
+            {"case_id": "c3", "comparisons": [equal]},
+        ],
+    }
+    exec_path = store.root / "executions" / execution_id / "execution.json"
+    exec_path.parent.mkdir(parents=True)
+    exec_path.write_text(json.dumps(execution))
+
+    summary = store.stage_summary(execution_id)
+    stage = next(s for s in summary["stages"] if s["stage_id"] == "classification")
+    bucket = stage["comparators"][0]
+    # Two of three passed: the mean of {1, 0, 1} is the pass fraction, 2/3.
+    assert bucket["metrics"]["equal"]["mean"] == pytest.approx(2 / 3)
+    assert bucket["metrics"]["equal"]["count"] == 3
+
+
+def test_stage_summary_route_matches_the_service_method(tmp_path: Path) -> None:
+    from vision_3d_acquisition.api import validation as routes
+
+    store, source, baseline = _real_stage_fixture(tmp_path)
+    suite = store.create_suite({"name": "s", "pipeline_id": PIPELINE})
+    store.add_case(suite["id"], {"baseline_ids": [baseline["id"]]})
+    execution = store.execute_suite(suite["id"], {"candidate_run_id": "run_1"})
+
+    assert routes.stage_summary(execution["id"], store=store) == store.stage_summary(execution["id"])

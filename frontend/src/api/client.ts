@@ -2402,6 +2402,11 @@ export interface ValidationExecutionCase {
   comparisons?: ValidationComparisonResult[]; matched_baseline_id?: string | null; first_failing_stage?: string | null;
   first_divergence?: { take_id: string; stage_id?: string | null; processing_unit_id?: string | null; substage_id?: string | null; view_id?: string | null; artifact_id?: string | null; status: string; summary: string } | null;
 }
+export interface ValidationNumericFieldSummary { count: number; mean: number; median: number; p95: number; min: number; max: number; }
+export interface ValidationStageComparatorSummary { comparator: string; count: number; status_counts: Record<string, number>; metrics: Record<string, ValidationNumericFieldSummary>; }
+export interface ValidationStageSummaryEntry { stage_id: string; label: string; comparators: ValidationStageComparatorSummary[]; }
+export interface ValidationStageSummary { execution_id: string; stages: ValidationStageSummaryEntry[]; }
+
 export interface ValidationExecution {
   id: string; suite_id: string; pipeline_id: string; status: string; candidate_run_id: string;
   created_at?: string; started_at?: string; completed_at?: string; cases: ValidationExecutionCase[];
@@ -2535,6 +2540,7 @@ export const api = {
   validationExecution: (executionId: string) => request<ValidationExecution>(`/api/validation/executions/${encodeURIComponent(executionId)}`),
   validationBaseline: (baselineId: string) => request<ValidationBaseline>(`/api/validation/baselines/${encodeURIComponent(baselineId)}`),
   validationMatrix: (executionId: string) => request<{ execution_id: string; columns: Array<{ id:string; label:string; stage_id:string; order:number }>; rows: Array<{ case_id:string; take_id:string; overall_status:string; cells:Array<{ column_id:string; status:string; comparison_ids:Array<string | null>; first_divergence:boolean; artifact_id?:string | null }> }> }>(`/api/validation/executions/${encodeURIComponent(executionId)}/matrix`),
+  validationStageSummary: (executionId: string) => request<ValidationStageSummary>(`/api/validation/executions/${encodeURIComponent(executionId)}/stage-summary`),
   runValidationSuite: (suiteId: string, candidateRunId = "latest") => post<ValidationExecution>(`/api/validation/suites/${encodeURIComponent(suiteId)}/execute`, { candidate_run_id: candidateRunId }),
   health: () => request<HealthResponse>("/api/health"),
   state: () => request<RuntimeState>("/api/state"),

@@ -1380,16 +1380,20 @@ class ValidationService:
             raise KeyError(eid)
         return value
 
-    def matrix(self, execution_id: str) -> dict[str, Any]:
-        execution = self.get_execution(execution_id)
-        pipeline = str(execution.get("pipeline_id") or "")
+    @staticmethod
+    def _stage_order_for_pipeline(pipeline: str) -> list[str]:
+        """The pipeline's own stage order, or a fixed fallback if the registry has none.
+
+        Shared by matrix() and stage_summary() so the two can never disagree about
+        which stages exist or in what order.
+        """
         try:
             from vision_3d_acquisition.pipelines.registry import list_processing_unit_definitions
 
             units = list_processing_unit_definitions(pipeline)
         except Exception:
             units = []
-        stage_order = []
+        stage_order: list[str] = []
         for unit in sorted(
             [x for x in units if isinstance(x, dict)],
             key=lambda x: (int(x.get("order", 0)), str(x.get("id", ""))),
@@ -1408,6 +1412,42 @@ class ValidationService:
                 "classification",
                 "overlay",
             ]
+        return stage_order
+
+    def _stage_tagged_comparisons(
+        self, execution: Mapping[str, Any]
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """Every comparison in an execution as (case_id, stage_id, comparison).
+
+        get_baseline() reads baseline.json from disk; a naive per-cell lookup calls
+        it once per (case, column, comparison), hundreds of redundant reads of the
+        same handful of baselines for a suite with even a modest number of cases.
+        A comparison's baseline is fixed, so each is fetched exactly once here.
+        Callers group this flat list however they need it: matrix() groups by
+        (case, stage); stage_summary() groups by (stage, comparator).
+        """
+        baseline_cache: dict[str, dict[str, Any]] = {}
+
+        def _cached_baseline(baseline_id: str) -> dict[str, Any]:
+            if baseline_id not in baseline_cache:
+                baseline_cache[baseline_id] = self.get_baseline(baseline_id) or {}
+            return baseline_cache[baseline_id]
+
+        tagged: list[tuple[str, str, dict[str, Any]]] = []
+        for case in execution.get("cases") or []:
+            case_id = str(case.get("case_id") or "")
+            for comparison in case.get("comparisons") or []:
+                if not isinstance(comparison, dict):
+                    continue
+                baseline_id = str((comparison.get("baseline_ref") or {}).get("baseline_id") or "")
+                stage_id = str(_cached_baseline(baseline_id).get("stage_id"))
+                tagged.append((case_id, stage_id, comparison))
+        return tagged
+
+    def matrix(self, execution_id: str) -> dict[str, Any]:
+        execution = self.get_execution(execution_id)
+        pipeline = str(execution.get("pipeline_id") or "")
+        stage_order = self._stage_order_for_pipeline(pipeline)
         columns = [
             {
                 "id": stage,
@@ -1417,26 +1457,13 @@ class ValidationService:
             }
             for index, stage in enumerate(stage_order)
         ]
-        # get_baseline() reads baseline.json from disk. The naive version of this
-        # loop called it once per (case, column, comparison) -- for a suite with
-        # even a modest number of cases that is hundreds of redundant reads of
-        # the same handful of baselines. A comparison's baseline is fixed, so
-        # fetch each one exactly once and group by stage_id instead.
-        baseline_cache: dict[str, dict[str, Any]] = {}
-
-        def _cached_baseline(baseline_id: str) -> dict[str, Any]:
-            if baseline_id not in baseline_cache:
-                baseline_cache[baseline_id] = self.get_baseline(baseline_id) or {}
-            return baseline_cache[baseline_id]
-
+        by_case_stage: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for case_id, stage_id, comparison in self._stage_tagged_comparisons(execution):
+            by_case_stage.setdefault(case_id, {}).setdefault(stage_id, []).append(comparison)
         rows = []
         for case in execution.get("cases") or []:
-            comparisons = [x for x in case.get("comparisons") or [] if isinstance(x, dict)]
-            by_stage: dict[str, list[dict[str, Any]]] = {}
-            for comparison in comparisons:
-                baseline_id = str((comparison.get("baseline_ref") or {}).get("baseline_id") or "")
-                stage_id = _cached_baseline(baseline_id).get("stage_id")
-                by_stage.setdefault(str(stage_id), []).append(comparison)
+            case_id = str(case.get("case_id") or "")
+            by_stage = by_case_stage.get(case_id, {})
             cells = []
             for column in columns:
                 matches = by_stage.get(column["stage_id"], [])
@@ -1481,6 +1508,82 @@ class ValidationService:
                 }
             )
         return {"execution_id": execution_id, "columns": columns, "rows": rows}
+
+    @staticmethod
+    def _numeric_field_summary(values: list[float]) -> dict[str, Any]:
+        array = np.asarray(values, dtype=float)
+        return {
+            "count": int(array.size),
+            "mean": float(np.mean(array)),
+            "median": float(np.median(array)),
+            "p95": float(np.percentile(array, 95)),
+            "min": float(np.min(array)),
+            "max": float(np.max(array)),
+        }
+
+    def stage_summary(self, execution_id: str) -> dict[str, Any]:
+        """Per-stage, per-comparator statistics across every case in one execution.
+
+        A stage regression can be invisible one comparison at a time -- a mask
+        that is still individually "pass" but whose IoU is trending down across
+        the sample only shows up once the numbers are looked at together. This
+        answers "how is this stage doing across the whole suite", not "did this
+        one case pass".
+
+        Numeric fields are discovered rather than named explicitly: every key
+        in a comparator's ``metrics`` whose value is a number (booleans count,
+        since a comparator like json_fields reports {"equal": bool} and the
+        mean of that is exactly the pass fraction) is summarised on its own.
+        Nothing here assumes what fields a comparator emits, so a future
+        comparator is summarised automatically rather than silently ignored.
+        Metric fields are never averaged *across* comparators -- an IoU and an
+        MAE mean nothing pooled together -- so grouping is by
+        (stage_id, comparator), not by stage alone.
+        """
+        execution = self.get_execution(execution_id)
+        pipeline = str(execution.get("pipeline_id") or "")
+        stage_order = self._stage_order_for_pipeline(pipeline)
+
+        buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for _case_id, stage_id, comparison in self._stage_tagged_comparisons(execution):
+            comparator = str(comparison.get("comparator") or "unknown")
+            buckets.setdefault((stage_id, comparator), []).append(comparison)
+
+        stages = []
+        for stage_id in stage_order:
+            comparators = []
+            for (bucket_stage, comparator), comparisons in buckets.items():
+                if bucket_stage != stage_id:
+                    continue
+                status_counts: dict[str, int] = {}
+                for comparison in comparisons:
+                    status = str(comparison.get("status"))
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                field_values: dict[str, list[float]] = {}
+                for comparison in comparisons:
+                    for key, value in (comparison.get("metrics") or {}).items():
+                        if isinstance(value, bool) or isinstance(value, (int, float)):
+                            field_values.setdefault(key, []).append(float(value))
+                metrics = {
+                    key: self._numeric_field_summary(values) for key, values in field_values.items()
+                }
+                comparators.append(
+                    {
+                        "comparator": comparator,
+                        "count": len(comparisons),
+                        "status_counts": status_counts,
+                        "metrics": metrics,
+                    }
+                )
+            comparators.sort(key=lambda c: str(c["comparator"]))
+            stages.append(
+                {
+                    "stage_id": stage_id,
+                    "label": stage_id.replace("_", " ").title(),
+                    "comparators": comparators,
+                }
+            )
+        return {"execution_id": execution_id, "stages": stages}
 
     def baseline_history(self, **filters: Any) -> list[dict[str, Any]]:
         rows = []

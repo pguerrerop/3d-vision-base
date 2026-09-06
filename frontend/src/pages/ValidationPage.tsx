@@ -9,6 +9,7 @@ import {
 import { validationStatus, type ValidationStatus } from "../components/validation/validationStatus";
 import ValidationCasePanel from "../components/validation/ValidationCasePanel";
 import ValidationComparisonDrawer from "../components/validation/ValidationComparisonDrawer";
+import ValidationStageSummaryPanel from "../components/validation/ValidationStageSummaryPanel";
 
 type Matrix = Awaited<ReturnType<typeof api.validationMatrix>>;
 
@@ -347,6 +348,7 @@ export default function ValidationPage() {
           </div>
         )}
       </section>
+      <ValidationStageSummaryPanel executionId={executionId || null} />
       {selectedCell && executionDetail && suite
         ? (() => {
             const executionCase = executionDetail.cases.find(
