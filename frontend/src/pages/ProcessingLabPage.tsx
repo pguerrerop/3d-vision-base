@@ -79,6 +79,8 @@ import type { HoverInspectionSample } from "../components/hoverInspectionModel";
 import { buildCapturePayload, captureDisabledReason, nextSelectedTakeAfterCapture } from "../components/captureWorkflowModel";
 import { resolveNextSelectedTakeId } from "../components/takeSelectionModel";
 import { buildStudioDeepLink, graphWorkspaceEnabled, parseStudioDeepLink, type StudioDeepLinkParams } from "../studioDeepLink";
+import { buildValidationDeepLink } from "../validationDeepLink";
+import { eligibleSuitesForPipeline, findExistingCaseForTake } from "../components/validation/addToSuiteModel";
 import {
   availableBinaryMaskViewModes,
   defaultBinaryMaskViewMode,
@@ -1051,6 +1053,14 @@ export default function ProcessingLabPage() {
   const [detail, setDetail] = useState<TakeDetail | null>(null);
   const [artifactBaseline, setArtifactBaseline] = useState<ValidationBaseline | null>(null);
   const [validationMessage, setValidationMessage] = useState<string | null>(null);
+  const [addToSuiteOpen, setAddToSuiteOpen] = useState(false);
+  const [addToSuiteBusy, setAddToSuiteBusy] = useState(false);
+  const [addToSuiteChoices, setAddToSuiteChoices] = useState<
+    Array<{ id: string; name: string; pipeline_id: string; status: string }>
+  >([]);
+  const [addToSuiteId, setAddToSuiteId] = useState("");
+  const [addToSuiteNewName, setAddToSuiteNewName] = useState("");
+  const [addToSuiteOutcome, setAddToSuiteOutcome] = useState<{ message: string; href: string } | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [pipelineRuns, setPipelineRuns] = useState<PipelineRunEntry[]>([]);
   const [pipelineRunsLoading, setPipelineRunsLoading] = useState(false);
@@ -4576,6 +4586,72 @@ export default function ProcessingLabPage() {
   const hasSubstagePlan = stageSubstagePlan.substages.length > 0;
   const hasSubstageRail = hasSubstagePlan && shellLayoutMode === "wide";
 
+  const openAddToSuite = () => {
+    if (!artifactBaseline) return;
+    setAddToSuiteOutcome(null);
+    setAddToSuiteNewName("");
+    setAddToSuiteOpen(true);
+    setValidationMessage("Loading regression suites…");
+    void api
+      .validationSuites()
+      .then((rows) => {
+        const choices = eligibleSuitesForPipeline(rows, artifactBaseline.pipeline_id);
+        setAddToSuiteChoices(choices);
+        setAddToSuiteId(choices[0]?.id ?? "");
+        setValidationMessage(null);
+      })
+      .catch((error: unknown) =>
+        setValidationMessage(error instanceof Error ? error.message : "Could not load regression suites."),
+      );
+  };
+
+  const addToRegressionSuite = async () => {
+    if (!artifactBaseline) return;
+    if (!addToSuiteId && !addToSuiteNewName.trim()) return;
+    setAddToSuiteBusy(true);
+    setValidationMessage(null);
+    try {
+      // create_suite() returns the bare suite record (no `cases`), unlike
+      // validationSuite()'s full detail -- a brand-new suite has none anyway,
+      // so only an existing suite needs the existing-case lookup at all.
+      let suiteId: string;
+      let suiteName: string;
+      let existing: ReturnType<typeof findExistingCaseForTake> = null;
+      if (addToSuiteId) {
+        const suite = await api.validationSuite(addToSuiteId);
+        suiteId = suite.id;
+        suiteName = suite.name;
+        existing = findExistingCaseForTake(suite.cases, artifactBaseline.take_id);
+      } else {
+        const created = await api.createValidationSuite({
+          name: addToSuiteNewName.trim(),
+          pipeline_id: artifactBaseline.pipeline_id,
+        });
+        suiteId = created.id;
+        suiteName = created.name;
+      }
+      if (existing) {
+        setAddToSuiteOutcome({
+          message: `${suiteName} already tracks this take (case ${existing.id}).`,
+          href: buildValidationDeepLink({ suite_id: suiteId, case_id: existing.id }),
+        });
+        return;
+      }
+      const created = await api.addValidationCase(suiteId, {
+        take_id: artifactBaseline.take_id,
+        baseline_ids: [artifactBaseline.id],
+      });
+      setAddToSuiteOutcome({
+        message: `Added to ${suiteName} as a new case.`,
+        href: buildValidationDeepLink({ suite_id: suiteId, case_id: created.id }),
+      });
+    } catch (error: unknown) {
+      setValidationMessage(error instanceof Error ? error.message : "Could not add to regression suite.");
+    } finally {
+      setAddToSuiteBusy(false);
+    }
+  };
+
   return (
     <main className={`studio-workspace studio-shell mode-${studioMode} ${panelWidthClass} shell-${shellLayoutMode} ${focusMode ? "focus-mode" : ""} ${rightPanelOverlay ? "right-panel-overlay-mode" : ""} ${leftRailVisible ? "left-rail-visible" : "left-rail-hidden"} ${hasSubstageRail ? "has-substage-rail" : ""} ${leftRailReallyCollapsed ? "left-rail-collapsed" : ""}`}>
       <header className="studio-context-bar">
@@ -6360,10 +6436,62 @@ export default function ProcessingLabPage() {
                   if (!artifactBaseline) return; setValidationMessage("Comparing with reference…");
                   void api.compareValidationBaseline(artifactBaseline.id, activeRunId ?? (detail?.result?.run_id as string | undefined) ?? "latest").then((result) => setValidationMessage(`${String(result.status)}: ${String(result.summary)}`)).catch((error: unknown) => setValidationMessage(error instanceof Error ? error.message : "Comparison failed."));
                 }}>Compare with reference</button>
+                <button type="button" disabled={!artifactBaseline} onClick={openAddToSuite}>Add to regression suite</button>
                 <button type="button" disabled={!focusedArtifact?.path} onClick={() => { void navigator.clipboard?.writeText(String(focusedArtifact?.path ?? "")); }}>Copy artifact path</button>
                 <button type="button" disabled title="Coming later">Compare with previous run</button>
                 <button type="button" disabled={!focusedArtifact?.path} title={focusedArtifact?.path ? "" : "No exportable artifact selected"}>Export selected artifact</button>
               </div>
+              {addToSuiteOpen && artifactBaseline ? (
+                <div role="dialog" aria-label="Add to regression suite">
+                  <span>Add reference v{artifactBaseline.version} to a regression suite</span>
+                  {addToSuiteOutcome ? (
+                    <div className="control-panel-button-row">
+                      <small>{addToSuiteOutcome.message}</small>
+                      <a href={addToSuiteOutcome.href}>Open in Validation</a>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAddToSuiteOpen(false);
+                          setAddToSuiteOutcome(null);
+                        }}
+                      >
+                        Close
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="control-panel-button-row">
+                      <label>
+                        Suite{" "}
+                        <select value={addToSuiteId} onChange={(event) => setAddToSuiteId(event.target.value)}>
+                          <option value="">— new suite —</option>
+                          {addToSuiteChoices.map((choice) => (
+                            <option key={choice.id} value={choice.id}>
+                              {choice.name} · {choice.status}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {!addToSuiteId ? (
+                        <input
+                          value={addToSuiteNewName}
+                          placeholder="New regression suite name"
+                          onChange={(event) => setAddToSuiteNewName(event.target.value)}
+                        />
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled={addToSuiteBusy || (!addToSuiteId && !addToSuiteNewName.trim())}
+                        onClick={() => void addToRegressionSuite()}
+                      >
+                        {addToSuiteBusy ? "Adding…" : "Add"}
+                      </button>
+                      <button type="button" onClick={() => setAddToSuiteOpen(false)}>
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : null}
             </section>
           </div>
         ) : (

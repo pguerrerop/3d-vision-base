@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type ValidationBaseline,
@@ -11,6 +11,7 @@ import ValidationCasePanel from "../components/validation/ValidationCasePanel";
 import ValidationComparisonDrawer from "../components/validation/ValidationComparisonDrawer";
 import ValidationStageSummaryPanel from "../components/validation/ValidationStageSummaryPanel";
 import ValidationStageTrendPanel from "../components/validation/ValidationStageTrendPanel";
+import { parseValidationDeepLink } from "../validationDeepLink";
 
 type Matrix = Awaited<ReturnType<typeof api.validationMatrix>>;
 
@@ -43,6 +44,14 @@ export default function ValidationPage() {
     comparisonIds: Array<string | null>;
   } | null>(null);
 
+  // Read once: a link from Studio or elsewhere names a suite/execution/case/comparison
+  // to land on directly, rather than the usual "most recent suite, latest execution".
+  const deepLink = useMemo(
+    () => parseValidationDeepLink(typeof window === "undefined" ? "" : window.location.search),
+    [],
+  );
+  const deepLinkComparisonAppliedRef = useRef(false);
+
   // Workspace state is parent-owned so every panel reads one consistent snapshot.
   const reloadSuite = async (id: string) => {
     if (!id) return;
@@ -58,7 +67,9 @@ export default function ValidationPage() {
   const refresh = async () => {
     const rows = await api.validationSuites();
     setSuites(rows);
-    const id = suiteId || rows[0]?.id || "";
+    const linkedSuiteId =
+      deepLink.suite_id && rows.some((row) => row.id === deepLink.suite_id) ? deepLink.suite_id : "";
+    const id = suiteId || linkedSuiteId || rows[0]?.id || "";
     setSuiteId(id);
     if (id) {
       const [detail, report, history] = await Promise.all([
@@ -69,7 +80,11 @@ export default function ValidationPage() {
       setSuite(detail);
       setCoverage(report.areas);
       setBaselines(await api.validationBaselines(undefined, detail.pipeline_id));
-      const latest = history.filter((x) => x.suite_id === id).at(-1);
+      const suiteHistory = history.filter((x) => x.suite_id === id);
+      const linked = deepLink.execution_id
+        ? suiteHistory.find((x) => String(x.id) === deepLink.execution_id)
+        : null;
+      const latest = linked ?? suiteHistory.at(-1);
       if (latest?.id) {
         const executionId = String(latest.id);
         setExecutionId(executionId);
@@ -80,6 +95,19 @@ export default function ValidationPage() {
         setMatrix(grid);
         setExecutionDetail(execution);
         setMatchedByCase(matchedFromExecution(execution));
+        if (
+          !deepLinkComparisonAppliedRef.current &&
+          deepLink.case_id &&
+          deepLink.comparison_id &&
+          execution.cases.some(
+            (item) =>
+              item.case_id === deepLink.case_id &&
+              (item.comparisons ?? []).some((c) => c.baseline_ref.baseline_id === deepLink.comparison_id),
+          )
+        ) {
+          deepLinkComparisonAppliedRef.current = true;
+          setSelectedCell({ caseId: deepLink.case_id, comparisonIds: [deepLink.comparison_id] });
+        }
       }
     }
   };
