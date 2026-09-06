@@ -72,6 +72,8 @@ Retrying the same promotion reuses the existing baseline and reports `already_pr
 
 The response describes state *after* the promotion: `previous_active_baseline` is re-read rather than reported as it was before, and `resulting_active_baseline` is the family's real active version, or null when none is active.
 
+The comparison drawer exposes this as "Promote candidate". Confirming shows the current and expected version, the candidate run, the comparison status, the carry-forward and activate-now checkboxes, an optional reviewer and notes, and the same impact list `resolution_impact()` would report for the source baseline — computed before the new version exists, since impact is matched by artifact identity rather than by baseline instance. The outcome panel distinguishes a genuine creation ("Created baseline vN.") from a reused promotion ("This candidate was already promoted as baseline vN. No new version was created.") so a retry never reads like a fresh success; when the result is inactive, it offers an "Activate baseline" button straight into the existing history drawer.
+
 ## Current versus historical state
 
 The case table describes present governance. A selected historical execution reports the versions it actually used, the version it matched, its original statuses and its original first divergence. Editing a case or activating a baseline afterwards does not alter any of it — executions are written once and never revisited.
@@ -117,9 +119,8 @@ Stage summary and stage trend both read through the same registry-derived stage 
 `coverage()` and `_case_baselines()` were fixed to resolve each case's active mode/pinned/allowed_versions setting rather than iterating raw `baseline_ids`. Two related things were true before this: coverage double-counted a case pinned to an inactive version, and active mode could return the same resolved baseline twice when `baseline_ids` held more than one version of the same family — which `execute_suite()` would then compare against redundantly. Both are covered by tests now.
 
 - Stage trend labels each execution column by its date to a day's precision; several executions run within the same day (or the same minute, as in development) render identical column headers with nothing to disambiguate them beyond hovering the underlying execution id.
-- Promotion has no UI. The backend, the client binding and the impact summary are all in place.
 - Studio has mark-as-reference and compare-with-reference. Add-to-suite and deep links into `/validation` are not built.
 - Comparisons carry no identifier of their own. `matrix()` reports `baseline_id` in `comparison_ids`, so a `&comparison=` deep link would carry a baseline id.
 - `execute_suite` accepts archived suites. Case mutation is blocked on them; running is not, on the grounds that an execution does not mutate the suite.
 - Four routes have no client binding: single-baseline read, execution progress polling, integrity and index rebuild. The last two are exposed by the CLI.
-- Frontend coverage is model-level. `validationCaseModel`, `validationHistoryModel`, `validationComparisonModel` and `validationStageSummaryModel` are tested; the panel, drawer and detail-view components are not.
+- Frontend coverage is model-level. `validationCaseModel`, `validationHistoryModel`, `validationComparisonModel`, `validationStageSummaryModel` and `validationPromotionModel` are tested; the panel, drawer and detail-view components are not.
