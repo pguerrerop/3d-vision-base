@@ -3589,8 +3589,19 @@ input[type="text"] {
   padding: 1px 6px;
   text-transform: uppercase;
   vertical-align: middle;
-  background: #eaf2ff;
-  color: #1f4b99;
+}
+
+.artifact-io-role-tag.role-input {
+  background: #eef2f7;
+  color: #64748b;
+}
+
+.artifact-io-role-tag.role-output {
+  background: #2f6fed;
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 7px;
 }
 
 .workspace-hover-status {
@@ -9984,9 +9995,41 @@ th {
   padding-top: 12px;
 }
 
+.walkthrough-stage.collapsed {
+  margin-bottom: 12px;
+}
+
+.walkthrough-stage-header {
+  align-items: center;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  margin: 0 0 4px;
+  padding: 0;
+  text-align: left;
+  width: 100%;
+}
+
 .walkthrough-stage h2 {
   font-size: 18px;
-  margin: 0 0 4px;
+  margin: 0;
+}
+
+.walkthrough-stage-chevron {
+  color: #64748b;
+  display: inline-block;
+  font-size: 12px;
+  transition: transform 0.15s ease;
+}
+
+.walkthrough-stage-chevron.collapsed {
+  transform: rotate(-90deg);
+}
+
+.walkthrough-stage-body.collapsed {
+  display: none;
 }
 
 .walkthrough-stage-outputs {
@@ -10676,5 +10719,17 @@ th {
 
   .walkthrough-stage {
     page-break-after: auto;
+  }
+
+  .walkthrough-stage-body.collapsed {
+    display: block;
+  }
+
+  .walkthrough-stage-chevron {
+    display: none;
+  }
+
+  .walkthrough-stage-header {
+    cursor: default;
   }
 }

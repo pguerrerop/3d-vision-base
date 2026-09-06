@@ -605,19 +605,26 @@ function StageSection({
   takeId,
   pipelineId,
   stage,
+  collapsed,
+  onToggleCollapsed,
   onOpenImage,
 }: {
   takeId: string;
   pipelineId: string;
   stage: WalkthroughStage;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   onOpenImage: (state: LightboxState) => void;
 }) {
   if (stage.substages.length === 0) return null;
   const overview = stage.substages.find((substage) => substage.substageId === "strategy_path") ?? null;
   const childSubstages = stage.substages.filter((substage) => substage.substageId !== "strategy_path");
   return (
-    <section className="walkthrough-stage">
-      <h2>{stage.label}</h2>
+    <section className={`walkthrough-stage${collapsed ? " collapsed" : ""}`}>
+      <button type="button" className="walkthrough-stage-header" onClick={onToggleCollapsed} aria-expanded={!collapsed}>
+        <span className={`walkthrough-stage-chevron${collapsed ? " collapsed" : ""}`} aria-hidden>▾</span>
+        <h2>{stage.label}</h2>
+      </button>
       {stage.description ? <p className="walkthrough-muted">{stage.description}</p> : null}
       {stage.outputs.length > 0 ? (
         <div className="walkthrough-stage-outputs" aria-label="This stage's output(s)">
@@ -653,14 +660,16 @@ function StageSection({
           onOpenImage={onOpenImage}
         />
       ) : null}
-      {childSubstages.length > 0 ? (
-        <div className="walkthrough-substage-group" aria-label={`${stage.label} substeps`}>
-          <p className="walkthrough-substage-group-label">Substeps</p>
-          {childSubstages.map((substage) => (
-            <SubstageBlock key={substage.unitId} takeId={takeId} pipelineId={pipelineId} substage={substage} onOpenImage={onOpenImage} />
-          ))}
-        </div>
-      ) : null}
+      <div className={`walkthrough-stage-body${collapsed ? " collapsed" : ""}`}>
+        {childSubstages.length > 0 ? (
+          <div className="walkthrough-substage-group" aria-label={`${stage.label} substeps`}>
+            <p className="walkthrough-substage-group-label">Substeps</p>
+            {childSubstages.map((substage) => (
+              <SubstageBlock key={substage.unitId} takeId={takeId} pipelineId={pipelineId} substage={substage} onOpenImage={onOpenImage} />
+            ))}
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -674,6 +683,7 @@ export default function PipelineWalkthroughPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [lightbox, setLightbox] = useState<LightboxState>(null);
+  const [collapsedStageIds, setCollapsedStageIds] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     if (!takeId || !pipelineId) {
@@ -703,6 +713,18 @@ export default function PipelineWalkthroughPage() {
   if (error) return <main className="page-pad"><div className="empty-state">{error}</div></main>;
 
   const stages = buildPipelineWalkthrough(pipeline, detail);
+  const allCollapsed = stages.length > 0 && stages.every((stage) => collapsedStageIds.has(stage.stageId));
+  const toggleSummaryMode = () => {
+    setCollapsedStageIds(allCollapsed ? new Set() : new Set(stages.map((stage) => stage.stageId)));
+  };
+  const toggleStageCollapsed = (stageId: string) => {
+    setCollapsedStageIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(stageId)) next.delete(stageId);
+      else next.add(stageId);
+      return next;
+    });
+  };
 
   return (
     <main className="page-pad walkthrough-page">
@@ -714,6 +736,7 @@ export default function PipelineWalkthroughPage() {
           </p>
         </div>
         <div className="walkthrough-header-actions">
+          <button type="button" onClick={toggleSummaryMode}>{allCollapsed ? "Expand all" : "Summary view"}</button>
           <a href={`/studio?take_id=${encodeURIComponent(takeId)}&pipeline_id=${encodeURIComponent(pipelineId)}`}>Back to Studio</a>
           <button type="button" onClick={() => window.print()}>Print</button>
         </div>
@@ -721,10 +744,19 @@ export default function PipelineWalkthroughPage() {
       <p className="walkthrough-legend">
         Steps and parameters that did not run for this particular take (a different strategy branch, or diagnostics-only
         output) are shown dimmed, with a badge explaining why — nothing is hidden, so this stays complete as a printed
-        reference. Click a thumbnail to view it full-size, or "Tune this step" to jump into the live editor.
+        reference. Click a thumbnail to view it full-size, or "Tune this step" to jump into the live editor. Click a
+        stage's header, or "Summary view", to collapse it down to just the header.
       </p>
       {stages.map((stage) => (
-        <StageSection key={stage.stageId} takeId={takeId} pipelineId={pipelineId} stage={stage} onOpenImage={setLightbox} />
+        <StageSection
+          key={stage.stageId}
+          takeId={takeId}
+          pipelineId={pipelineId}
+          stage={stage}
+          collapsed={collapsedStageIds.has(stage.stageId)}
+          onToggleCollapsed={() => toggleStageCollapsed(stage.stageId)}
+          onOpenImage={setLightbox}
+        />
       ))}
       <Lightbox detail={detail} state={lightbox} takeId={takeId} onClose={() => setLightbox(null)} />
     </main>
